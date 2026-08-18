@@ -986,7 +986,7 @@
       "backend_id": "parler-tts",
       "gguf": {
         "repo": "cstr/parler-tts-mini-v1.1-GGUF",
-        "revision": "534c5b0f8ad18fa4d927e1fe81047175836544c5",
+        "revision": "28d560d8d3a9a0ac0e603322094d306bdd5b573e",
         "file": "parler-tts-mini-v1.1-q8_0.gguf",
         "approx_size_mb": 1000
       },
