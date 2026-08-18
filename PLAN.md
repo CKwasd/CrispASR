@@ -7,6 +7,37 @@ Review PR #352 end to end, validate that its long-form routing and gap repair
 do not regress any language path, add targeted unit/live coverage where needed,
 and merge or improve the change after local/SSD validation.
 
+## OPEN 2026-08-18 — TQ2_0 has no Metal kernels: BitNet models are silent on GPU
+
+`vibevoice-asr-bitnet-*` (TQ2_0 LM weights) yields an EMPTY transcript on Metal:
+
+    ggml_metal_library_compile_pipeline: failed to compile pipeline:
+      base = 'kernel_mul_mm_tq2_0_f32'
+    Error: Function kernel_mul_mm_tq2_0_f32 was not found in the library
+
+`ggml/src/ggml-metal/ggml-metal.metal` contains ZERO occurrences of `tq2_0` — no
+`mul_mm`, no `mul_mv`, no dequant — and `ggml-metal-device.m` has no TQ2_0 entry
+either. The type is not supported at all, yet a pipeline for it is still
+requested, so it fails hard instead of falling back.
+
+Same clip, same build, only the backend differs:
+
+    ko-mic-cue-kept.wav   CPU (-ng) -> 내일 오전에 회의 자료 교육 보내주세요.
+                          Metal     -> (nothing; pipeline compile error)
+
+Impact: every Metal user of a TQ2_0 model gets silence. Ternary/BitNet GGUFs are
+what people reach for on laptops, so this is the wrong platform to be missing.
+
+Two questions before fixing: (a) why is a TQ2_0 matmul scheduled onto Metal when
+the device declares no support — a type absent from the support switch should
+route to CPU, so something is bypassing that; (b) whether the fix is a real
+`kernel_mul_mm_tq2_0_f32` (check upstream ggml first — it may already exist) or
+an explicit unsupported-declaration so the scheduler falls back cleanly. The
+second is small and unbreaks the platform immediately.
+
+Found while reproducing #369, and NOT that issue's cause: the reporter is on
+Windows CPU/Vulkan and sees wrong-language output, not silence.
+
 ## OPEN 2026-08-18 — stb_vorbis heap overflow on untrusted audio (security)
 
 Found incidentally by `linux-fuzz-smoke` on PR #371, which does not touch that
