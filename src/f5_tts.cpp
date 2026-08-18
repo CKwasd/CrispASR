@@ -132,6 +132,20 @@ struct f5_bench_stage {
 
 // ── Hyperparameters ──────────────────────────────────────────────
 
+// UTF-8 codepoint count (not byte count). The duration estimate derives a
+// speech rate from the reference transcript and applies it to the target text;
+// strlen() counts bytes, so non-ASCII scripts (Devanagari, CJK: 3 bytes/char)
+// inflate the estimated duration ~3x, which makes the ODE solve quadratically
+// longer and minutes long.
+static size_t utf8_len(const char* s) {
+    size_t n = 0;
+    for (; *s; ++s) {
+        if (((unsigned char)*s & 0xC0) != 0x80)
+            ++n;
+    }
+    return n;
+}
+
 struct f5_hparams {
     int dim = 1024;
     int depth = 22;
@@ -2385,9 +2399,9 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
         float ref_secs = (float)ref_T / mel_fps;
         ref_text_len = std::max(1, (int)(ref_secs * 13.0f));
     } else {
-        ref_text_len = (int)ref_text.size();
+        ref_text_len = (int)utf8_len(ref_text.c_str());
     }
-    int gen_text_len = (int)strlen(text);
+    int gen_text_len = (int)utf8_len(text);
     // Per-char speech rate derived from the reference (mel frames per char).
     // #294: the guard here must be ASYMMETRIC. Under-estimating the rate makes
     // `duration` too short and TRUNCATES the generated speech (drops the tail of
