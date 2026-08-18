@@ -4113,6 +4113,72 @@ catch_discover_tests(test-core-cross-attn
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-core-tts-voice-policy — per-request voice decisions (#371) ─────────
+# The server reuses one backend per session and passes voice= per request; a
+# backend that reads tts_voice only at init() serves the startup voice forever.
+# Pins apply/dedupe/builtin, and that a FAILED load must not dedupe its retry.
+add_executable(test-core-tts-voice-policy test-core-tts-voice-policy.cpp)
+target_include_directories(test-core-tts-voice-policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-core-tts-voice-policy PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-core-tts-voice-policy
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-core-diarize-tracks — speaker floor from pyannote local tracks ─────
+# #368: GMM/BIC collapses to k=1 on short inputs and merges speakers. The floor
+# comes from distinct local-track ids — distinct, NOT max+1, which would force a
+# split on sparse ids. Those two agree on dense input, so the sparse case is the
+# only one that can tell them apart.
+add_executable(test-core-diarize-tracks test-core-diarize-tracks.cpp)
+target_include_directories(test-core-diarize-tracks PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-core-diarize-tracks PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-core-diarize-tracks
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-core-utf8 — core/utf8.h codepoint counting ─────────────────────────
+# A byte count is not a character count outside ASCII, and the two were being
+# mixed: f5-tts multiplied a chars/sec rate by strlen() of the target, so
+# Devanagari came out ~3x too long. ASCII fixtures cannot catch that, which is
+# why these cases are deliberately non-ASCII.
+add_executable(test-core-utf8 test-core-utf8.cpp)
+target_include_directories(test-core-utf8 PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-core-utf8 PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-core-utf8
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
+# ─── test-kv-quant-roundtrip — CRISPASR_KV_QUANT cross-graph round-trip ──────
+# Writes a quantised KV cache with set_rows in one graph and reads it back with
+# view+cast in a LATER graph, for every supported KV dtype. Nothing covered the
+# quantised cache before; q8_0 on ark-asr silently produced an empty transcript.
+add_executable(test-kv-quant-roundtrip test-kv-quant-roundtrip.cpp)
+target_include_directories(test-kv-quant-roundtrip PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+    ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(test-kv-quant-roundtrip PRIVATE
+    Catch2::Catch2WithMain
+    ggml ggml-base crispasr_link_ggml_cpu
+)
+catch_discover_tests(test-kv-quant-roundtrip
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test-core-adaln — core/adaln.h AdaLN-Zero modulation (ggml graph) ────────
 add_executable(test-core-adaln test-core-adaln.cpp)
 target_include_directories(test-core-adaln PRIVATE
