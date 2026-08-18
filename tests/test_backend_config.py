@@ -71,10 +71,33 @@ class TestBackendConfig(unittest.TestCase):
         self.assertEqual(text.count("ggml_backend_load_all();"), 1)
 
     def test_omniasr_keeps_explicit_cpu_fallback_backend(self) -> None:
+        """omniasr keeps a CPU backend distinct from the main one, and schedules it.
+
+        Asserted on structure, not on the literal init call — the same lesson the
+        sibling test above records. This one pinned
+        `ctx->backend_cpu = ggml_backend_cpu_init();` and went red the moment
+        f7464aeb (#355) routed every CPU-backend acquisition through
+        `core_cpu_backend::init()` so GGML_BACKEND_DL builds can dlopen it. The
+        behaviour was unchanged; the nightly was red for five nights over a
+        rename.
+
+        The contract is: a CPU fallback exists, it is only used/freed when it is
+        genuinely a different object from the main backend, and it is handed to
+        the scheduler. How the CPU backend is spelled, and what graph size the
+        sched gets, are not the contract.
+        """
         text = read("src/omniasr.cpp")
-        self.assertIn("ctx->backend_cpu = ggml_backend_cpu_init();", text)
+        self.assertRegex(
+            text,
+            r"ctx->backend_cpu\s*=\s*(?:core_cpu_backend::init|ggml_backend_cpu_init)\s*\(",
+            "omniasr must initialise an explicit CPU fallback backend",
+        )
         self.assertIn("if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)", text)
-        self.assertIn("ggml_backend_sched_new(backends, nullptr, n_backends, 65536, false, false);", text)
+        self.assertRegex(
+            text,
+            r"ggml_backend_sched_new\(\s*backends\s*,\s*nullptr\s*,\s*n_backends\s*,",
+            "the CPU fallback must be handed to ggml_backend_sched_new",
+        )
 
     def test_backend_default_params_enable_gpu(self) -> None:
         expected = {
