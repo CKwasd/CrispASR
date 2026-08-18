@@ -142,7 +142,11 @@ def _block1d(x: "torch.Tensor", w: dict) -> "torch.Tensor":
     h = _rms_norm(x, w["ffn_norm"])                  # [B, C, T]
     h = h.permute(0, 2, 1)                            # [B, T, C]
     h = F.linear(h, w["ffn_up_w"], w["ffn_up_b"])    # [B, T, C_ffn]
-    h = F.silu(h)
+    # GELU, matching upstream: vibevoice/modular/modular_vibevoice_tokenizer.py
+    # class FFN uses ACT2FN["gelu"] between linear1 and linear2. This file had
+    # F.silu, which made every ConvNeXt stage look like the source of a large
+    # divergence and nearly got the (correct) ggml runtime "fixed" to match it.
+    h = F.gelu(h)
     h = F.linear(h, w["ffn_down_w"], w["ffn_down_b"])# [B, T, C]
     h = h.permute(0, 2, 1)                            # [B, C, T]
     if w["ffn_gamma"] is not None:
@@ -223,7 +227,8 @@ def _load_encoder_weights(state_dict: dict, prefix: str) -> dict:
     return weights
 
 
-def _run_encoder(audio24: "torch.Tensor", weights: dict, config: dict) -> "torch.Tensor":
+def _run_encoder(audio24: "torch.Tensor", weights: dict, config: dict, taps: dict = None,
+                 tap_prefix: str = "") -> "torch.Tensor":
     """Run one σ-VAE encoder.
 
     audio24: [1, T] float32 mono 24kHz PCM.
@@ -244,10 +249,17 @@ def _run_encoder(audio24: "torch.Tensor", weights: dict, config: dict) -> "torch
             ds_w, ds_b = weights["ds"][si]
             stride = enc_ratios[si - 1] if si > 0 else 1
             x = _causal_conv1d(x, ds_w, ds_b, stride=stride)
+        # Per-layer taps: the encoder OUTPUT alone cannot say which of the 7
+        # downsample layers or their blocks first diverges, and a cos 0.83 at
+        # the output is exactly the case where that matters (#369).
+        if taps is not None:
+            taps[f"{tap_prefix}enc_ds_{si}"] = x.squeeze(0).detach().cpu().numpy().T.copy()
 
         # ConvNeXt blocks for this stage
         for bw in weights["stages"][si]:
             x = _block1d(x, bw)
+        if taps is not None:
+            taps[f"{tap_prefix}enc_stage_{si}"] = x.squeeze(0).detach().cpu().numpy().T.copy()
 
     # Optional final norm (disable_last_norm=True in ASR model → skipped)
     if weights["norm"] is not None:
@@ -359,7 +371,7 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
 
         with torch.no_grad():
             # Acoustic encoder
-            at_mean = _run_encoder(speech_t, at_weights, at_cfg)  # [1, T', 64]
+            at_mean = _run_encoder(speech_t, at_weights, at_cfg, taps=out, tap_prefix="at_")  # [1, T', 64]
             if "at_enc_mean" in stages:
                 out["at_enc_mean"] = at_mean.squeeze(0).numpy()   # (T', 64)
             at_tokens = at_mean   # skip gaussian noise for reproducible diffs
@@ -367,7 +379,7 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
                 out["at_tokens"] = at_tokens.squeeze(0).numpy()
 
             # Semantic encoder
-            st_mean = _run_encoder(speech_t, st_weights, st_cfg)  # [1, T', 128]
+            st_mean = _run_encoder(speech_t, st_weights, st_cfg, taps=out, tap_prefix="st_")  # [1, T', 128]
             if "st_enc_mean" in stages:
                 out["st_enc_mean"] = st_mean.squeeze(0).numpy()   # (T', 128)
 

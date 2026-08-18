@@ -606,6 +606,16 @@ static ggml_tensor* build_block1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor
     h = ggml_mul_mat(ctx, ffn_up_w, h); // [C, C_ffn] @ [C, T] → [C_ffn, T]
     if (ffn_up_b)
         h = ggml_add(ctx, h, ffn_up_b);
+    // GELU, per upstream: vibevoice/modular/modular_vibevoice_tokenizer.py, class
+    // FFN — `self.gelu = ACT2FN["gelu"]`, applied between linear1 and linear2.
+    //
+    // Do not "fix" this to SiLU. Our own reference dumper
+    // (tools/reference_backends/vibevoice.py::_block1d) used F.silu, so a
+    // per-layer diff blamed every ConvNeXt stage and swapping this to silu
+    // raised speech_features parity 0.83 -> 0.98 against that dumper — while
+    // turning a correct Korean transcript into fluent Vietnamese. The parity
+    // number was measuring agreement with our own mistake; the transcript was
+    // measuring the truth. The dumper was fixed instead.
     h = ggml_gelu(ctx, h);
     h = ggml_mul_mat(ctx, ffn_down_w, h); // [C_ffn, C] @ [C_ffn, T] → [C, T]
     if (ffn_down_b)
@@ -624,6 +634,9 @@ static ggml_tensor* build_block1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor
 // Build ggml graph for one σ-VAE tokenizer encoder (acoustic or semantic).
 // prefix: "at_enc" for acoustic, "st_enc" for semantic
 // Input: [1, T] mono audio → Output: [vae_dim, T_out] mean
+// Defined below; used by the per-layer encoder taps.
+static void vibevoice_dump_f32(const char* dir, const char* name, const float* data, size_t n);
+
 static ggml_cgraph* build_tokenizer_encoder_graph(vibevoice_context* ctx, const char* prefix, int n_samples) {
     auto& hp = ctx->model.hp;
     auto& ts = ctx->model.tensors;
@@ -649,6 +662,11 @@ static ggml_cgraph* build_tokenizer_encoder_graph(vibevoice_context* ctx, const 
 
     ggml_tensor* h = inp;
 
+    // Opt-in: mark every per-layer intermediate as a graph output so it can be
+    // read back. Off by default — marking outputs blocks buffer reuse and costs
+    // memory, which is exactly why the values are otherwise clobbered.
+    const bool dump_layers = crispasr_env::get("CRISPASR_VIBEVOICE_DUMP_DIR") != nullptr;
+
     // Downsample layers + stages
     // ratios are REVERSED in the encoder: config [8,5,5,4,2,2] → encoder [2,2,4,5,5,8]
     std::vector<int> ratios(hp.encoder_ratios.rbegin(), hp.encoder_ratios.rend());
@@ -664,6 +682,18 @@ static ggml_cgraph* build_tokenizer_encoder_graph(vibevoice_context* ctx, const 
             int stride = (si == 0) ? 1 : ratios[si - 1]; // stem has stride 1
             h = build_causal_conv1d(ctx0, h, ds_w, ds_b, stride);
         }
+        // Per-layer taps for localising an encoder divergence (#369): the
+        // stage API bottoms out at the encoder OUTPUT, so a cos 0.83 there says
+        // nothing about which of the 7 downsample layers or their blocks caused
+        // it. set_output is mandatory, not decoration — without it ggml reuses
+        // the buffer and a later layer overwrites what you meant to read.
+        if (dump_layers) {
+            char dn[64];
+            snprintf(dn, sizeof(dn), "enc_ds_%d", si);
+            ggml_set_name(h, dn);
+            ggml_set_output(h);
+            ggml_build_forward_expand(gf, h);
+        }
 
         // Stage blocks
         int n_blocks = (si < (int)hp.encoder_depths.size()) ? hp.encoder_depths[si] : 3;
@@ -676,6 +706,13 @@ static ggml_cgraph* build_tokenizer_encoder_graph(vibevoice_context* ctx, const 
                               G(std::string(base) + ".ffn_ln.weight"), G(std::string(base) + ".ffn.up.weight"),
                               G(std::string(base) + ".ffn.up.bias"), G(std::string(base) + ".ffn.down.weight"),
                               G(std::string(base) + ".ffn.down.bias"), G(std::string(base) + ".ffn_gamma"));
+        }
+        if (dump_layers) {
+            char sn[64];
+            snprintf(sn, sizeof(sn), "enc_stage_%d", si);
+            ggml_set_name(h, sn);
+            ggml_set_output(h);
+            ggml_build_forward_expand(gf, h);
         }
     }
 
@@ -767,6 +804,22 @@ static std::vector<float> run_encoder_stage_one_call(vibevoice_context* ctx, con
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "vibevoice: %s compute failed\n", prefix);
         return {};
+    }
+    // Write the per-layer taps (see the dump_layers note in the graph builder).
+    // Prefixed by encoder so at_enc and st_enc do not overwrite each other.
+    if (const char* dd = crispasr_env::get("CRISPASR_VIBEVOICE_DUMP_DIR")) {
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            ggml_tensor* t = ggml_graph_node(gf, i);
+            const char* nm = ggml_get_name(t);
+            if (!nm || (strncmp(nm, "enc_ds_", 7) != 0 && strncmp(nm, "enc_stage_", 10) != 0))
+                continue;
+            const size_t n = ggml_nelements(t);
+            std::vector<float> buf(n);
+            ggml_backend_tensor_get(t, buf.data(), 0, n * sizeof(float));
+            char full[160];
+            snprintf(full, sizeof(full), "%s_%s", prefix, nm);
+            vibevoice_dump_f32(dd, full, buf.data(), n);
+        }
     }
     ggml_tensor* out = ggml_graph_get_tensor(gf, "encoder_out");
     int vae_dim = (int)out->ne[0];
