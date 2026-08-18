@@ -7,6 +7,53 @@ Review PR #352 end to end, validate that its long-form routing and gap repair
 do not regress any language path, add targeted unit/live coverage where needed,
 and merge or improve the change after local/SSD validation.
 
+## OPEN 2026-08-19 — vibevoice ASR acoustic conditioning diverges from upstream (#369)
+
+Our sigma-VAE output is materially different from upstream's on the SAME bytes.
+Measured with the new `crispasr-diff vibevoice` branch against upstream's own
+forward pass, cos_mean, after the -25 dBFS fix below:
+
+    stage             cue-kept   cue-lost
+    at_enc_mean         0.724      0.812
+    st_enc_mean         0.817      0.836
+    speech_features     0.829      0.846
+
+An F16 port against an F32 reference sits at 0.998+. 0.83 is not precision.
+Cross-checked on Kaggle (x86 Linux) and locally (macOS ARM): agreement to 4-5
+decimals, so the measurement is solid and the defect is real.
+
+**FIXED so far, and it is not enough.** Upstream normalises to -25 dBFS RMS
+before the encoders; our ASR path did not. The helper existed
+(`vibevoice_normalize_ref_pcm`, "matches Microsoft's default") wired ONLY into
+TTS voice cloning. Fixed on `fix/vibevoice-asr-input-norm`. It improves every
+stage (at_enc_mean +0.04/+0.05) but leaves the bulk of the gap, and it does NOT
+fix the reported language flip — the cue-lost clip still answers in English.
+
+**ELIMINATED, with evidence — do not re-chase these:**
+  * TQ2_0 vs upstream I2_S weights: 2 differing weights in 13.76 M, scales equal
+    to f16. The LM is not it.
+  * `speech_scaling_factor` / `speech_bias_factor`: correctly NOT applied for
+    ASR — the tensors do not exist in the ASR checkpoint and the reference does
+    not scale. The existing comment in vibevoice.cpp is right.
+  * Conv padding: ours matches the reference exactly — pad_left
+    `(K-1)*dilation-(stride-1)` clamped at 0, same pad_right stride-alignment
+    formula, constant padding.
+  * Resampling 16k->24k: linear vs soxr_hq is cos 0.9995, negligible.
+  * "The divergence causes the language flip": no. It is ANTI-correlated — the
+    failing clip is CLOSER to upstream than the working one on every stage.
+
+**Next step.** Localise inside the encoder stack: the reference computes
+downsample_layers[0..6] (ratios [8,5,5,4,2,2]) then stages; dumping after each
+and matching dump points in `build_tokenizer_encoder_graph` would say which
+layer first diverges. That is the only remaining way to narrow it — the
+stage-level API bottoms out at the encoder output.
+
+**Trap for whoever continues:** `crispasr-diff` loads audio at 16 kHz, this
+backend wants 24 kHz. Feeding 16 kHz silently yields 30 frames against the
+reference's 45 and makes every stage look catastrophically broken (cos ~0.01)
+when nothing is. The frame count is the tell. The vibevoice branch resamples;
+do not remove it.
+
 ## OPEN 2026-08-18 — TQ2_0 has no Metal kernels: BitNet models are silent on GPU
 
 `vibevoice-asr-bitnet-*` (TQ2_0 LM weights) yields an EMPTY transcript on Metal:
