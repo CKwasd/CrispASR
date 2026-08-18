@@ -106,13 +106,13 @@ public:
             omnivoice_set_language(ctx_, p.language.c_str());
         }
 
-        // Voice cloning
-        if (!p.tts_voice.empty()) {
-            std::string ref_text = p.tts_ref_text;
-            if (omnivoice_set_voice_prompt(ctx_, p.tts_voice.c_str(), ref_text.c_str()) != 0) {
-                fprintf(stderr, "crispasr[omnivoice]: failed to set voice prompt '%s'\n", p.tts_voice.c_str());
-            }
-        }
+        // Voice cloning is intentionally NOT applied here (at startup): the
+        // HTTP server owns ONE backend instance and passes a per-request
+        // `voice=` in params.tts_voice, which only takes effect if re-applied
+        // at synth time (see prepare_voice below) — the same shape as the
+        // per-request language/seed/instruct handling in synthesize(). Baking
+        // --voice at init alone made every /v1/audio/speech request serve the
+        // startup voice (or the built-in default when no --voice was given).
 
         // Style instruct. Upstream rejects an unsupported item rather than
         // ignoring it, so a bad --tts-instruct must fail the run — silently
@@ -144,6 +144,12 @@ public:
     std::vector<float> synthesize(const std::string& text, const whisper_params& params) override {
         if (!ctx_ || text.empty())
             return {};
+
+        // Per-request voice cloning, same reasoning as the per-request knobs
+        // below: the server copies the request's `voice` into
+        // params.tts_voice, so re-apply the reference prompt here whenever it
+        // changes (an empty value clears the prompt -> plain TTS).
+        prepare_voice(params);
 
         // Apply the diffusion step count PER CALL, not just at init: the server
         // reuses one backend instance and passes tts_num_steps per request, so a
@@ -209,7 +215,27 @@ public:
     }
 
 private:
+    // Re-apply the reference voice per request (mirror of moss-tts
+    // prepare_voice, and of the per-request language/seed/instruct handling in
+    // synthesize()). omnivoice_set_voice_prompt with an empty path clears the
+    // reference (plain TTS); with a path it encodes the WAV through the audio
+    // tokenizer into ref_audio_codes + ref_T. The encode is content-addressed
+    // disk-cached inside omnivoice.cpp, so re-calling it for the same ref is
+    // cheap. last_voice_ dedupes identical consecutive voices so a repeated
+    // request never pays the encode again.
+    void prepare_voice(const whisper_params& params) {
+        if (params.tts_voice == last_voice_)
+            return;
+        last_voice_ = params.tts_voice;
+        std::string ref_text = params.tts_ref_text;
+        if (omnivoice_set_voice_prompt(ctx_, params.tts_voice.c_str(), ref_text.c_str()) != 0) {
+            fprintf(stderr, "crispasr[omnivoice]: failed to set voice prompt '%s'\n", params.tts_voice.c_str());
+            last_voice_.clear();
+        }
+    }
+
     omnivoice_context* ctx_ = nullptr;
+    std::string last_voice_; // cache key for the loaded reference voice
 };
 
 } // namespace

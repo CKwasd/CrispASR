@@ -142,96 +142,116 @@ public:
             return false;
         }
 
-        // Load reference audio for voice cloning.
-        //
-        // "default" / "auto" mean "use the built-in reference", the same sentinel
-        // cosyvoice3, tada and omnivoice already honour. f5-tts alone treated them
-        // as a filename and died with "failed to load reference audio 'default'",
-        // which is what broke `--voice default` in the TTS regression manifest.
+        // Voice cloning is intentionally NOT applied here (at startup): the
+        // HTTP server owns ONE backend instance and passes a per-request
+        // `voice=` in params.tts_voice, which only takes effect if re-applied
+        // at synth time (see prepare_voice below). Baking --voice at init alone
+        // made every /v1/audio/speech request serve the startup voice (or the
+        // built-in default when no --voice was given).
+
+        return true;
+    }
+
+    // Load + encode the reference WAV (voice cloning), re-loading only when the
+    // path changes so single-shot and server callers pay the encode once.
+    // Mirrors moss-tts prepare_voice: the server passes a per-request `voice=`
+    // into params.tts_voice which MUST be consumed at synth time. "default" /
+    // "auto" mean "use the built-in reference" (kept as-is); an empty voice
+    // also keeps the current reference.
+    void prepare_voice(const whisper_params& p) {
+        if (p.tts_voice == last_voice_)
+            return;
+        last_voice_ = p.tts_voice;
         const bool voice_is_sentinel = p.tts_voice == "default" || p.tts_voice == "auto";
-        if (!p.tts_voice.empty() && !voice_is_sentinel) {
-            int wav_sr = 0;
-            auto ref_pcm = read_wav_mono(p.tts_voice, &wav_sr);
-            if (ref_pcm.empty() || wav_sr <= 0) {
-                fprintf(stderr, "crispasr[f5-tts]: failed to load reference audio '%s'\n", p.tts_voice.c_str());
-                return false;
+        if (p.tts_voice.empty() || voice_is_sentinel)
+            return;
+
+        int wav_sr = 0;
+        auto ref_pcm = read_wav_mono(p.tts_voice, &wav_sr);
+        if (ref_pcm.empty() || wav_sr <= 0) {
+            fprintf(stderr, "crispasr[f5-tts]: failed to load reference audio '%s'\n", p.tts_voice.c_str());
+            last_voice_.clear();
+            return;
+        }
+
+        // Resample to 24kHz
+        auto ref_24k = resample_linear(ref_pcm, wav_sr, 24000);
+
+        // RMS normalize to 0.1 (matching Python reference)
+        float rms = 0.0f;
+        for (float s : ref_24k)
+            rms += s * s;
+        rms = sqrtf(rms / (float)ref_24k.size());
+        if (rms < 0.1f && rms > 1e-10f) {
+            float scale = 0.1f / rms;
+            for (float& s : ref_24k)
+                s *= scale;
+        }
+
+        // Auto-transcribe reference audio when --ref-text is missing.
+        // F5-TTS needs the ref transcript to estimate speech rate for
+        // duration calculation; without it, output length is wrong.
+        std::string ref_text_str = p.tts_ref_text;
+        if (ref_text_str.empty()) {
+            // The reference transcript is stable per voice clip, and
+            // auto-transcription loads + runs a whole ASR model. Cache it
+            // next to the voice as "<voice>.f5reftext" so later runs skip
+            // Whisper entirely. Disable with CRISPASR_TTS_REF_CACHE=0.
+            const std::string cache_path = crispasr_ref_cache::path_for(p.tts_voice, ".f5reftext");
+            const bool cache_enabled = !crispasr_ref_cache::disabled();
+            std::vector<uint32_t> shape;
+            std::vector<uint8_t> payload;
+            if (cache_enabled && crispasr_ref_cache::load(cache_path, p.tts_voice, "f5-reftext", shape, payload)) {
+                ref_text_str.assign((const char*)payload.data(), payload.size());
+                if (!p.no_prints) {
+                    fprintf(stderr, "crispasr[f5-tts]: using cached ref transcript '%s': '%s'\n", cache_path.c_str(),
+                            ref_text_str.c_str());
+                }
+            } else {
+                // Resample ref to 16kHz for whisper
+                auto ref_16k = resample_linear(ref_pcm, wav_sr, 16000);
+                std::string asr_name = p.tts_ref_asr.empty() ? "whisper" : p.tts_ref_asr;
+                if (!p.no_prints) {
+                    fprintf(stderr, "crispasr[f5-tts]: --ref-text not set, auto-transcribing via %s...\n",
+                            asr_name.c_str());
+                }
+                ref_text_str = crispasr_ref_text::transcribe(ref_16k, p, asr_name, "crispasr[f5-tts]");
+                if (cache_enabled && !ref_text_str.empty()) {
+                    crispasr_ref_cache::save(cache_path, "f5-reftext", {(uint32_t)ref_text_str.size()},
+                                             ref_text_str.data(), ref_text_str.size());
+                }
             }
-
-            // Resample to 24kHz
-            auto ref_24k = resample_linear(ref_pcm, wav_sr, 24000);
-
-            // RMS normalize to 0.1 (matching Python reference)
-            float rms = 0.0f;
-            for (float s : ref_24k)
-                rms += s * s;
-            rms = sqrtf(rms / (float)ref_24k.size());
-            if (rms < 0.1f && rms > 1e-10f) {
-                float scale = 0.1f / rms;
-                for (float& s : ref_24k)
-                    s *= scale;
-            }
-
-            // Auto-transcribe reference audio when --ref-text is missing.
-            // F5-TTS needs the ref transcript to estimate speech rate for
-            // duration calculation; without it, output length is wrong.
-            std::string ref_text_str = p.tts_ref_text;
             if (ref_text_str.empty()) {
-                // The reference transcript is stable per voice clip, and
-                // auto-transcription loads + runs a whole ASR model. Cache it
-                // next to the voice as "<voice>.f5reftext" so later runs skip
-                // Whisper entirely. Disable with CRISPASR_TTS_REF_CACHE=0.
-                const std::string cache_path = crispasr_ref_cache::path_for(p.tts_voice, ".f5reftext");
-                const bool cache_enabled = !crispasr_ref_cache::disabled();
-                std::vector<uint32_t> shape;
-                std::vector<uint8_t> payload;
-                if (cache_enabled && crispasr_ref_cache::load(cache_path, p.tts_voice, "f5-reftext", shape, payload)) {
-                    ref_text_str.assign((const char*)payload.data(), payload.size());
-                    if (!p.no_prints) {
-                        fprintf(stderr, "crispasr[f5-tts]: using cached ref transcript '%s': '%s'\n",
-                                cache_path.c_str(), ref_text_str.c_str());
-                    }
-                } else {
-                    // Resample ref to 16kHz for whisper
-                    auto ref_16k = resample_linear(ref_pcm, wav_sr, 16000);
-                    std::string asr_name = p.tts_ref_asr.empty() ? "whisper" : p.tts_ref_asr;
-                    if (!p.no_prints) {
-                        fprintf(stderr, "crispasr[f5-tts]: --ref-text not set, auto-transcribing via %s...\n",
-                                asr_name.c_str());
-                    }
-                    ref_text_str = crispasr_ref_text::transcribe(ref_16k, p, asr_name, "crispasr[f5-tts]");
-                    if (cache_enabled && !ref_text_str.empty()) {
-                        crispasr_ref_cache::save(cache_path, "f5-reftext", {(uint32_t)ref_text_str.size()},
-                                                 ref_text_str.data(), ref_text_str.size());
-                    }
+                if (!p.no_prints) {
+                    fprintf(stderr, "crispasr[f5-tts]: auto-transcription returned empty; "
+                                    "duration estimate may be inaccurate\n");
                 }
-                if (ref_text_str.empty()) {
-                    if (!p.no_prints) {
-                        fprintf(stderr, "crispasr[f5-tts]: auto-transcription returned empty; "
-                                        "duration estimate may be inaccurate\n");
-                    }
-                } else if (!p.no_prints) {
-                    fprintf(stderr, "crispasr[f5-tts]: auto-transcribed ref: '%s'\n", ref_text_str.c_str());
-                }
-            }
-
-            const char* ref_text = ref_text_str.empty() ? "" : ref_text_str.c_str();
-            if (f5_tts_set_reference(ctx_, ref_24k.data(), (int)ref_24k.size(), ref_text) != 0) {
-                fprintf(stderr, "crispasr[f5-tts]: failed to set reference audio\n");
-                return false;
-            }
-
-            if (!p.no_prints) {
-                fprintf(stderr, "crispasr[f5-tts]: loaded ref audio '%s' (%d@%dHz → %d@24kHz) ref_text='%s'\n",
-                        p.tts_voice.c_str(), (int)ref_pcm.size(), wav_sr, (int)ref_24k.size(), ref_text);
+            } else if (!p.no_prints) {
+                fprintf(stderr, "crispasr[f5-tts]: auto-transcribed ref: '%s'\n", ref_text_str.c_str());
             }
         }
 
-        return true;
+        const char* ref_text = ref_text_str.empty() ? "" : ref_text_str.c_str();
+        if (f5_tts_set_reference(ctx_, ref_24k.data(), (int)ref_24k.size(), ref_text) != 0) {
+            fprintf(stderr, "crispasr[f5-tts]: failed to set reference audio\n");
+            last_voice_.clear();
+            return;
+        }
+
+        if (!p.no_prints) {
+            fprintf(stderr, "crispasr[f5-tts]: loaded ref audio '%s' (%d@%dHz → %d@24kHz) ref_text='%s'\n",
+                    p.tts_voice.c_str(), (int)ref_pcm.size(), wav_sr, (int)ref_24k.size(), ref_text);
+        }
     }
 
     std::vector<float> synthesize(const std::string& text, const whisper_params& p) override {
         if (!ctx_)
             return {};
+
+        // Per-request voice cloning: the server copies the request's `voice`
+        // into params.tts_voice, so (re)apply the reference here whenever it
+        // changes. Sentinels/empty keep the built-in reference.
+        prepare_voice(p);
 
         // Update runtime params
         if (p.seed > 0)
@@ -266,6 +286,7 @@ public:
 
 private:
     f5_tts_context* ctx_ = nullptr;
+    std::string last_voice_; // cache key for the loaded reference voice
 };
 
 } // namespace
