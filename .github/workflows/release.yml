@@ -162,10 +162,22 @@ jobs:
           submodules: recursive
           ref: ${{ inputs.tag || github.ref }}
 
+      # Same live-download flakiness as build-wasm.yml: cache the toolchain and
+      # retry once. A 503 here would fail a RELEASE, so the retry matters more.
       - name: Setup emsdk
+        id: emsdk
         uses: mymindstorm/setup-emsdk@v14
+        continue-on-error: true
         with:
           version: 6.0.2  # 6.0.3 regressed WASM ISel (voxtral_tts crash); pin last-good
+          actions-cache-folder: emsdk-6.0.2
+
+      - name: Setup emsdk (retry)
+        if: steps.emsdk.outcome == 'failure'
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.2
+          actions-cache-folder: emsdk-6.0.2
 
       - name: Build WASM (all backends)
         run: ./build-wasm.sh --clean
