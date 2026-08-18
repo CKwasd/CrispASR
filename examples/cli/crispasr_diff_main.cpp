@@ -62,6 +62,7 @@
 #include "cohere.h"
 #include "gemma4_e2b.h"
 #include "mimo_asr.h"
+#include "vibevoice.h"
 #include "ark_asr.h"
 #include "mimo_tokenizer.h"
 #include "core/snac.h"
@@ -3559,6 +3560,113 @@ int main(int argc, char** argv) {
         }
         mimo_asr_free(ctx);
 
+    } else if (backend_name == "vibevoice" || backend_name == "vibevoice-bitnet") {
+        // VibeVoice-ASR: two sigma-VAE encoders (acoustic 64-d, semantic 128-d)
+        // -> two SpeechConnectors -> summed speech features that condition the
+        // LM. Stage boundaries matter here because the reported symptom (#369)
+        // is the LM LOSING THE LANGUAGE CUE — emitting fluent Italian for Korean
+        // audio — while the LM weights are provably equivalent to upstream
+        // (2 differing ternary weights in 13.76 M). If the conditioning is
+        // faithful, the cause is not in our port; if it is not, the first
+        // diverging stage says where.
+        //
+        // The dumper is weight-layout driven, so the same reference_backends
+        // /vibevoice.py works on the BitNet checkpoint as on the 7B it was
+        // written for.
+        auto cp = vibevoice_context_default_params();
+        cp.n_threads = 4;
+        cp.use_gpu = crispasr_env::get("CRISPASR_VIBEVOICE_GPU") != nullptr;
+        vibevoice_context* ctx = vibevoice_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load vibevoice model '%s'\n", model_path.c_str());
+            return 1;
+        }
+        if (!vibevoice_has_asr(ctx)) {
+            printf("[SKIP] model has no ASR encoders (TTS-only variant)\n");
+            vibevoice_free(ctx);
+            return 0;
+        }
+        // The harness loads audio at 16 kHz; this backend wants 24 kHz
+        // (crispasr_backend_vibevoice.cpp declares input_sample_rate()==24000).
+        // Feeding 16 kHz straight in is silent and catastrophic: the encoder's
+        // 3200-sample compression yields 30 frames instead of 45, so every row
+        // is compared against the wrong frame and cos collapses to ~0.01 with
+        // healthy magnitudes on both sides — which reads exactly like a broken
+        // encoder and is not one. The frame-count mismatch is the tell.
+        std::vector<float> s24;
+        {
+            const int n16 = (int)samples.size();
+            const int n24 = (int)((int64_t)n16 * 24000 / 16000);
+            s24.resize((size_t)n24);
+            for (int i = 0; i < n24; i++) {
+                const float src = (float)i * 16000.0f / 24000.0f;
+                const int i0 = (int)src;
+                const int i1 = std::min(i0 + 1, n16 - 1);
+                const float t = src - (float)i0;
+                s24[(size_t)i] = samples[(size_t)i0] * (1.0f - t) + samples[(size_t)i1] * t;
+            }
+        }
+        int at_n = 0, at_d = 0, st_n = 0, st_d = 0;
+        float* at_mean = vibevoice_run_acoustic_encoder(ctx, s24.data(), (int)s24.size(), &at_n, &at_d);
+        if (at_mean) {
+            auto rep = ref.compare("at_enc_mean", at_mean, (size_t)at_n * at_d);
+            print_row("at_enc_mean", rep, COS_THRESHOLD);
+            record(rep);
+            print_tada_fm_rows(ref, "at_enc_mean", std::vector<float>(at_mean, at_mean + (size_t)at_n * at_d),
+                               (size_t)at_d, 6);
+        } else {
+            printf("[ERR ] at_enc_mean            extract returned null\n");
+            n_fail++;
+        }
+        float* st_mean = vibevoice_run_semantic_encoder(ctx, s24.data(), (int)s24.size(), &st_n, &st_d);
+        if (st_mean) {
+            auto rep = ref.compare("st_enc_mean", st_mean, (size_t)st_n * st_d);
+            print_row("st_enc_mean", rep, COS_THRESHOLD);
+            record(rep);
+            print_tada_fm_rows(ref, "st_enc_mean", std::vector<float>(st_mean, st_mean + (size_t)st_n * st_d),
+                               (size_t)st_d, 6);
+        } else {
+            printf("[ERR ] st_enc_mean            extract returned null\n");
+            n_fail++;
+        }
+        if (at_mean) {
+            int d_lm = 0;
+            float* c = vibevoice_run_connector(ctx, "at_conn", at_mean, at_n, at_d, &d_lm);
+            if (c) {
+                auto rep = ref.compare("at_conn_out", c, (size_t)at_n * d_lm);
+                print_row("at_conn_out", rep, COS_THRESHOLD);
+                record(rep);
+                free(c);
+            }
+        }
+        if (st_mean) {
+            int d_lm = 0;
+            float* c = vibevoice_run_connector(ctx, "se_conn", st_mean, st_n, st_d, &d_lm);
+            if (c) {
+                auto rep = ref.compare("st_conn_out", c, (size_t)st_n * d_lm);
+                print_row("st_conn_out", rep, COS_THRESHOLD);
+                record(rep);
+                free(c);
+            }
+        }
+        free(at_mean);
+        free(st_mean);
+        {
+            int n_frames = 0, d_lm = 0;
+            float* sf = vibevoice_encode_speech(ctx, s24.data(), (int)s24.size(), &n_frames, &d_lm);
+            if (sf) {
+                auto rep = ref.compare("speech_features", sf, (size_t)n_frames * d_lm);
+                print_row("speech_features", rep, COS_THRESHOLD);
+                record(rep);
+                print_tada_fm_rows(ref, "speech_features", std::vector<float>(sf, sf + (size_t)n_frames * d_lm),
+                                   (size_t)d_lm, 6);
+                free(sf);
+            } else {
+                printf("[ERR ] speech_features        extract returned null\n");
+                n_fail++;
+            }
+        }
+        vibevoice_free(ctx);
     } else if (backend_name == "ark-asr" || backend_name == "arkasr") {
         // ARK-ASR-3B: compute mel + encoder/adapter + prefill logits from the
         // raw audio and diff against the Python reference (PLAN §ARK). Three

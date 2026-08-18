@@ -797,8 +797,39 @@ static std::vector<float> run_encoder_stage_one_call(vibevoice_context* ctx, con
 // computed analytically, since build_causal_conv1d's stride-alignment
 // right-padding makes an exact closed-form frame count fragile to derive
 // across all 7 stages.
+// Upstream normalises the waveform to -25 dBFS RMS before the sigma-VAE
+// encoders (VibeVoice's documented default; the reference dump's `audio_norm`
+// stage measures exactly 10^(-25/20) = 0.0562 RMS). We had the helper —
+// vibevoice_normalize_ref_pcm in vibevoice_wav_ref.h, commented "matches
+// Microsoft's default" — but its ONLY call site was the TTS voice-cloning path.
+// ASR transcription fed the encoders whatever level the recording happened to
+// have.
+//
+// A sigma-VAE encoder is not scale-invariant, so that is not cosmetic. Measured
+// against upstream on a 6 s Korean clip: identical waveform (cos 0.9995) at
+// -21.9 dBFS instead of -25.0, and speech_features came out at cos 0.82.
+//
+// It also makes transcription LEVEL-DEPENDENT, which matches the field report
+// in #369: six takes of one sentence by one speaker spanning -20.9 to -26.0
+// dBFS, some transcribing correctly and some losing the language entirely.
+//
+// Normalising here covers all three ASR entry points (run_acoustic_encoder,
+// run_semantic_encoder, encode_speech) at one place. The TTS path normalises
+// before it gets here, and RMS normalisation is idempotent, so it is unaffected.
+// Disable with CRISPASR_VIBEVOICE_NO_INPUT_NORM=1 to compare against the old
+// behaviour.
 static std::vector<float> run_encoder_stage(vibevoice_context* ctx, const char* prefix, const float* samples,
                                             int n_samples, int* out_T, int* out_vae_dim) {
+    std::vector<float> normalized;
+    static const bool s_no_norm = []() {
+        const char* e = std::getenv("CRISPASR_VIBEVOICE_NO_INPUT_NORM");
+        return e && e[0] == '1';
+    }();
+    if (!s_no_norm && n_samples > 0) {
+        normalized.assign(samples, samples + n_samples);
+        vibevoice_normalize_ref_pcm(normalized);
+        samples = normalized.data();
+    }
     const int max_chunk = vibevoice_encoder_max_chunk_samples();
     const int left_ctx = vibevoice_encoder_left_context_samples();
     const int n_chunks = (n_samples + max_chunk - 1) / max_chunk;
