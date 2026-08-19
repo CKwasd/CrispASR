@@ -5735,8 +5735,12 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         if (s->beam_size > 1)
             canary_set_beam_size(s->canary_ctx, s->beam_size);
         canary_set_max_new_tokens(s->canary_ctx, s->max_new_tokens); // #292
-        canary_result* cr =
-            canary_transcribe_ex(s->canary_ctx, pcm, n_samples, src.c_str(), tgt.c_str(), s->punctuation, 0);
+        // Same routing as the CLI adapter: canary_transcribe_streamed follows
+        // the canary-1b-v2 dynamic-chunking blueprint and single-passes any
+        // audio that fits one 40 s chunk, so short-audio behavior is
+        // unchanged while long audio no longer runs past the trained window.
+        canary_result* cr = canary_transcribe_streamed(s->canary_ctx, pcm, n_samples, src.c_str(), tgt.c_str(),
+                                                       s->punctuation, 0, 0, -1);
         if (!cr) {
             delete r;
             return nullptr;

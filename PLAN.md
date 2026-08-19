@@ -9,9 +9,24 @@ AAC decoder (`f3d82d30`). Fixed upstream (glint `77738f3`), synced in-tree
 (`0e5d1344`), Tier-3 foreign-decode gate red-verified in glint. Awaiting the
 reporter's input-format confirmation on #375; full trail in
 `docs/handover/375-canary-streaming-regression.md` (fix-wiring branch).
-Follow-ups worth their own issues: linear-resampler gap on 44.1/48k compressed
-input (~28 vs ~38 dB, pre-existing), canary seam-dedup default (#365 matcher
-vs on-hold PR #376).
+
+**Canary seam artifacts (pre-existing, #365/#375 fallout): FIXED by porting
+the actual blueprint.** The 8 s / 2 s LCS-prefix streaming was parakeet
+machinery grafted onto canary; canary-1b-v2's own `.transcribe()` does
+dynamic 30..40 s raw-waveform chunks with a 1 s overlap, per-chunk
+normalization, and an LCS-alignment merge (`lcs_alignment_merge_buffer`,
+`_find_optimal_chunk_size` — both ported exactly into
+`core/canary_chunk_merge.h`, pinned by `tests/test-canary-chunk-merge.cpp`
+against vectors generated from the nemo 2.7.3 Python functions). jfk_x12
+(quote ×12) now transcribes as 12 clean repetitions (legacy gate reproduces
+`ask not Ask not` ×2 etc.); fleurs_600s has zero repeated n-grams in 925
+words. Old path gated `CRISPASR_CANARY_LEGACY_STREAM=1`
+(CRISPASR_CANARY_SEAM_DEDUP applies only there). Both CLI and session
+surfaces route through the library.
+
+Still open on the general quality front (separate from #375): the
+pre-existing linear-resampler gap on 44.1/48 kHz compressed input via the
+glint decode paths (~28 vs ~38 dB after the decoder fix).
 
 ## CLAIMED 2026-08-13 — PR #347 GGUF weight-mapping release review
 

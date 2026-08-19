@@ -37,6 +37,7 @@
 #include "core/attention.h"
 #include "core/cpu_ops.h" // core_cpu::to_f32 (quantized-safe weight read)
 #include "core/beam_decode.h"
+#include "core/canary_chunk_merge.h"
 #include "core/crispasr_lcs.h"
 #include "core/asr_overlap_trim.h"
 #include "core/fastconformer.h"
@@ -1553,20 +1554,88 @@ extern "C" struct canary_result* canary_transcribe_ex(struct canary_context* ctx
     return canary_finish_from_encoder(ctx, enc.data(), T_enc, source_lang, target_lang, punctuation, t_offset_cs);
 }
 
-// PLAN #114 P3 second half — parakeet-pattern long-audio port. Computes
-// mel for the FULL audio (so PerFeatureZ uses global statistics; this is
-// the NeMo convention and matches what canary_transcribe_ex does on short
-// audio), then encodes in overlapping mel chunks and concatenates the
-// encoder outputs with `overlap_enc` trimming. Runs the existing AED
-// decode + cross-attention K/V over the concat. Works for the 4 trained
-// languages (en/de/fr/es) — the whitelist in
-// crispasr_backend_canary.cpp::transcribe() refuses other langs before
-// either code path.
-extern "C" struct canary_result* canary_transcribe_streamed(struct canary_context* ctx, const float* samples,
-                                                            int n_samples, const char* source_lang,
-                                                            const char* target_lang, bool punctuation,
-                                                            int64_t t_offset_cs, int chunk_seconds,
-                                                            int overlap_seconds) {
+// ---------------------------------------------------------------------------
+// NeMo canary-1b-v2 dynamic-chunking blueprint (long-form audio).
+//
+// Ports, faithfully:
+//   - PromptedAudioToTextLhotseDataset._find_optimal_chunk_size / _chunk_waveform
+//     (nemo/collections/asr/data/audio_to_text_lhotse_prompted.py)
+//   - merge_parallel_chunks (nemo/collections/asr/parts/utils/chunking_utils.py)
+//   - lcs_alignment_merge_buffer + longest_common_subsequence_merge
+//     (nemo/collections/asr/parts/utils/streaming_utils.py)
+//
+// The reference splits the RAW WAVEFORM into chunks of a dynamically chosen
+// size (30..40 s, picked to maximize the last chunk's length), with a fixed
+// 1 s overlap, decodes each chunk independently (so each chunk gets its own
+// PerFeatureZ normalization, exactly like a standalone utterance), and merges
+// the token streams with an LCS alignment anchored in the 1 s overlap: the
+// accumulated buffer keeps everything up to the END of the match and the new
+// chunk contributes everything AFTER it — the duplicated acoustic event is
+// kept exactly once, from both sides. Audio under 40 s is a single pass.
+// ---------------------------------------------------------------------------
+
+// The exact ports of longest_common_subsequence_merge and
+// _find_optimal_chunk_size live in core/canary_chunk_merge.h (weight-free, so
+// tests pin them against vectors generated from the actual Python functions).
+
+// Word grouping (same as parakeet's; shared by the single-pass decode and the
+// blueprint chunk merge, whose token trims invalidate per-chunk words).
+static std::vector<canary_word_data> canary_words_from_tokens(const canary_token_data* toks, int n_tokens) {
+    std::vector<canary_word_data> words;
+    canary_word_data cur = {};
+    bool have_cur = false;
+    auto is_punct = [](const char* s) {
+        if (!s || !*s)
+            return false;
+        for (const char* p = s; *p; p++) {
+            unsigned char c = (unsigned char)*p;
+            if (!(c == '.' || c == ',' || c == '?' || c == '!' || c == ';' || c == ':' || c == '\'' || c == '"' ||
+                  c == '(' || c == ')' || c == '-'))
+                return false;
+        }
+        return true;
+    };
+    for (int i = 0; i < n_tokens; i++) {
+        const auto& td = toks[i];
+        if (!td.text[0])
+            continue;
+        const bool is_word_start = (td.text[0] == ' ');
+        const bool is_p = is_punct(td.text);
+        if (is_word_start && !is_p && have_cur) {
+            words.push_back(cur);
+            cur = {};
+            have_cur = false;
+        }
+        if (!have_cur) {
+            cur.t0 = td.t0;
+            have_cur = true;
+        }
+        cur.t1 = td.t1;
+        const char* src = td.text + (is_word_start ? 1 : 0);
+        size_t cl = strlen(cur.text);
+        size_t cap = sizeof(cur.text) - cl - 1;
+        size_t add = strlen(src);
+        if (add > cap)
+            add = cap;
+        memcpy(cur.text + cl, src, add);
+        cur.text[cl + add] = '\0';
+    }
+    if (have_cur)
+        words.push_back(cur);
+    return words;
+}
+
+// LEGACY pre-blueprint long-audio path (PLAN #114 P3): global-mel 8 s / 2 s
+// overlapping chunks with LCS prefix-drop + word-snap + splice-punctuation
+// cleanup. This is NOT what NeMo does for canary — kept, gated behind
+// CRISPASR_CANARY_LEGACY_STREAM=1, purely as the regression-bisection arm
+// (never delete the working path). CRISPASR_CANARY_SEAM_DEDUP only applies
+// here.
+static struct canary_result* canary_transcribe_streamed_legacy(struct canary_context* ctx, const float* samples,
+                                                               int n_samples, const char* source_lang,
+                                                               const char* target_lang, bool punctuation,
+                                                               int64_t t_offset_cs, int chunk_seconds,
+                                                               int overlap_seconds) {
     if (!ctx || !samples || n_samples <= 0 || !source_lang || !target_lang)
         return nullptr;
     if (chunk_seconds <= 0)
@@ -1871,6 +1940,135 @@ extern "C" struct canary_result* canary_transcribe_streamed(struct canary_contex
     for (int i = 0; i < r->n_words; i++)
         r->words[i] = all_words[(size_t)i];
 
+    return r;
+}
+
+// Long-form transcription, following canary-1b-v2's own `.transcribe()`
+// dynamic chunking (see the blueprint block above). chunk_seconds <= 0 picks
+// the reference's dynamic 30..40 s size; overlap_seconds < 0 uses the
+// reference's 1 s. Audio that fits one chunk is a single pass — identical to
+// canary_transcribe_ex.
+extern "C" struct canary_result* canary_transcribe_streamed(struct canary_context* ctx, const float* samples,
+                                                            int n_samples, const char* source_lang,
+                                                            const char* target_lang, bool punctuation,
+                                                            int64_t t_offset_cs, int chunk_seconds,
+                                                            int overlap_seconds) {
+    if (!ctx || !samples || n_samples <= 0 || !source_lang || !target_lang)
+        return nullptr;
+    {
+        static const bool legacy = [] {
+            const char* e = crispasr_env::get("CRISPASR_CANARY_LEGACY_STREAM");
+            return e && e[0] == '1';
+        }();
+        if (legacy)
+            return canary_transcribe_streamed_legacy(ctx, samples, n_samples, source_lang, target_lang, punctuation,
+                                                     t_offset_cs, chunk_seconds > 0 ? chunk_seconds : 8,
+                                                     overlap_seconds >= 0 ? overlap_seconds : 2);
+    }
+
+    const auto& hp = ctx->model.hparams;
+    const int SR = (int)hp.sample_rate;
+    const double overlap_sec = overlap_seconds >= 0 ? (double)overlap_seconds : 1.0;
+    const int kMinSec = 30, kMaxSec = 40; // _find_optimal_chunk_size defaults
+
+    int chunk_samples;
+    if (chunk_seconds > 0) {
+        chunk_samples = chunk_seconds * SR;
+    } else {
+        chunk_samples = core_canary_chunk::optimal_chunk_samples(n_samples, SR, kMinSec, kMaxSec, overlap_sec);
+    }
+    if (chunk_samples >= n_samples)
+        return canary_transcribe_ex(ctx, samples, n_samples, source_lang, target_lang, punctuation, t_offset_cs);
+
+    const int overlap_samples = (int)(overlap_sec * SR);
+    const int step = chunk_samples - overlap_samples;
+    if (step <= 0)
+        return canary_transcribe_ex(ctx, samples, n_samples, source_lang, target_lang, punctuation, t_offset_cs);
+
+    // merge_parallel_chunks: the overlap is 1 s; delay = that second's worth
+    // of encoder frames, and only ~60% of them carry non-blank tokens.
+    const int sub = hp.subsampling_factor > 0 ? (int)hp.subsampling_factor : 8;
+    const int delay = (int)(1.0 / ((double)sub / 100.0)); // 12 for 8x subsampling
+    const int head_len_cfg = (int)(delay * 0.6);          // 7
+    const int max_steps_per_timestep = 2;                 // search window = delay * 2
+
+    std::vector<canary_token_data> merged;
+    int chunks_processed = 0;
+    for (int start = 0; start + overlap_samples < n_samples; start += step) {
+        const int end = std::min(start + chunk_samples, n_samples);
+        const int64_t chunk_t_offset_cs = t_offset_cs + (int64_t)start * 100 / SR;
+        canary_result* part = canary_transcribe_ex(ctx, samples + start, end - start, source_lang, target_lang,
+                                                   punctuation, chunk_t_offset_cs);
+        if (!part)
+            continue;
+
+        if (chunks_processed == 0 || merged.empty() || delay < 1) {
+            for (int i = 0; i < part->n_tokens; i++)
+                merged.push_back(part->tokens[i]);
+        } else {
+            // lcs_alignment_merge_buffer(buffer, data=head, delay,
+            // max_steps_per_timestep=2, min_lcs_length=1, parallel_chunking).
+            const int head_len = std::min(head_len_cfg, part->n_tokens);
+            const int search = std::min(delay * max_steps_per_timestep, (int)merged.size());
+            std::vector<int> X, Y;
+            X.reserve((size_t)search);
+            Y.reserve((size_t)head_len);
+            for (int i = (int)merged.size() - search; i < (int)merged.size(); i++)
+                X.push_back(merged[(size_t)i].id);
+            for (int i = 0; i < head_len; i++)
+                Y.push_back(part->tokens[i].id);
+            int li = 0, lj = 0, llen = 0;
+            core_canary_chunk::nemo_lcs_merge(X, Y, li, lj, llen);
+            int append_from = 0;
+            if (llen >= 1) { // min_lcs_length
+                // merged = buffer[:i_abs_end] + data[j_after:] — keep the
+                // matched acoustic event once, trimming BOTH sides' overlap.
+                const int base = (int)merged.size() - search;
+                const int i_abs_end = base + li + llen;
+                if (i_abs_end >= 0 && i_abs_end <= (int)merged.size())
+                    merged.resize((size_t)i_abs_end);
+                append_from = std::min(lj + llen, head_len);
+            }
+            for (int i = append_from; i < part->n_tokens; i++)
+                merged.push_back(part->tokens[i]);
+        }
+        canary_result_free(part);
+        chunks_processed++;
+    }
+    if (chunks_processed == 0)
+        return nullptr;
+
+    std::string full_text;
+    for (const auto& t : merged)
+        full_text += t.text;
+    if (!full_text.empty() && full_text[0] == ' ')
+        full_text.erase(0, 1);
+    auto words = canary_words_from_tokens(merged.data(), (int)merged.size());
+
+    canary_result* r = (canary_result*)calloc(1, sizeof(canary_result));
+    if (!r)
+        return nullptr;
+    r->text = strdup(full_text.c_str());
+    if (!r->text) {
+        canary_result_free(r);
+        return nullptr;
+    }
+    r->n_tokens = (int)merged.size();
+    r->tokens = (canary_token_data*)calloc(r->n_tokens > 0 ? (size_t)r->n_tokens : 1, sizeof(canary_token_data));
+    if (!r->tokens) {
+        canary_result_free(r);
+        return nullptr;
+    }
+    for (int i = 0; i < r->n_tokens; i++)
+        r->tokens[i] = merged[(size_t)i];
+    r->n_words = (int)words.size();
+    r->words = (canary_word_data*)calloc(r->n_words > 0 ? (size_t)r->n_words : 1, sizeof(canary_word_data));
+    if (!r->words) {
+        canary_result_free(r);
+        return nullptr;
+    }
+    for (int i = 0; i < r->n_words; i++)
+        r->words[i] = words[(size_t)i];
     return r;
 }
 
@@ -2226,47 +2424,7 @@ static canary_result* canary_finish_from_encoder(canary_context* ctx, const floa
 
     // Word grouping (same as parakeet's)
     {
-        std::vector<canary_word_data> words;
-        canary_word_data cur = {};
-        bool have_cur = false;
-        auto is_punct = [](const char* s) {
-            if (!s || !*s)
-                return false;
-            for (const char* p = s; *p; p++) {
-                unsigned char c = (unsigned char)*p;
-                if (!(c == '.' || c == ',' || c == '?' || c == '!' || c == ';' || c == ':' || c == '\'' || c == '"' ||
-                      c == '(' || c == ')' || c == '-'))
-                    return false;
-            }
-            return true;
-        };
-        for (int i = 0; i < r->n_tokens; i++) {
-            const auto& td = r->tokens[i];
-            if (!td.text[0])
-                continue;
-            const bool is_word_start = (td.text[0] == ' ');
-            const bool is_p = is_punct(td.text);
-            if (is_word_start && !is_p && have_cur) {
-                words.push_back(cur);
-                cur = {};
-                have_cur = false;
-            }
-            if (!have_cur) {
-                cur.t0 = td.t0;
-                have_cur = true;
-            }
-            cur.t1 = td.t1;
-            const char* src = td.text + (is_word_start ? 1 : 0);
-            size_t cl = strlen(cur.text);
-            size_t cap = sizeof(cur.text) - cl - 1;
-            size_t add = strlen(src);
-            if (add > cap)
-                add = cap;
-            memcpy(cur.text + cl, src, add);
-            cur.text[cl + add] = '\0';
-        }
-        if (have_cur)
-            words.push_back(cur);
+        std::vector<canary_word_data> words = canary_words_from_tokens(r->tokens, r->n_tokens);
         r->n_words = (int)words.size();
         r->words = (canary_word_data*)calloc(r->n_words > 0 ? r->n_words : 1, sizeof(canary_word_data));
         if (!r->words) {

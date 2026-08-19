@@ -133,31 +133,25 @@ public:
             return out;
         }
 
-        // PLAN #114 P3 second half: route to canary_transcribe_streamed
-        // for all audio (matches the parakeet backend default). Single-pass
-        // over a long buffer lets the bidirectional Conformer attention
-        // amplify acoustic noise past the ~30 s training window. The
-        // streamed path (per-chunk AED decode with prompt re-injection
-        // + LCS-merge boundary dedup + splice-punctuation cleanup) is
-        // semantically equivalent to single-pass on short audio — JFK
-        // single-pass is "...for you, ask..." and JFK streamed is
-        // "...for you. Ask..." (LCS-dedup correctly converts the
-        // mid-sentence comma to a sentence boundary at the chunk
-        // splice). Set CANARY_STREAM_THRESHOLD_S=N to force single-pass
-        // for inputs ≤ N seconds.
+        // Long-form handling follows canary-1b-v2's own `.transcribe()`
+        // dynamic chunking (blueprint port in src/canary.cpp): audio that
+        // fits one 40 s chunk is a single pass; longer audio is split into
+        // dynamically sized 30..40 s raw-waveform chunks with a 1 s overlap
+        // and merged by the reference's LCS alignment. Passing 0 / -1 lets
+        // the library pick the reference's sizes.
+        // CRISPASR_CANARY_STREAM_THRESHOLD_S=N forces single-pass for
+        // inputs ≤ N seconds (debug/A-B); CRISPASR_CANARY_LEGACY_STREAM=1
+        // selects the pre-blueprint 8 s / 2 s machinery inside the library.
         int stream_threshold_s = 0;
         if (const char* e = crispasr_env::get("CRISPASR_CANARY_STREAM_THRESHOLD_S")) {
             stream_threshold_s = std::max(0, atoi(e));
         }
-        const int stream_chunk_s = 8;
-        const int stream_overlap_s = 2;
-        const bool use_streamed = stream_threshold_s == 0 || n_samples > stream_threshold_s * 16000;
+        const bool force_single = stream_threshold_s > 0 && n_samples <= stream_threshold_s * 16000;
 
-        canary_result* r =
-            use_streamed ? canary_transcribe_streamed(ctx_, samples, n_samples, src.c_str(), tgt.c_str(),
-                                                      params.punctuation, t_offset_cs, stream_chunk_s, stream_overlap_s)
-                         : canary_transcribe_ex(ctx_, samples, n_samples, src.c_str(), tgt.c_str(), params.punctuation,
-                                                t_offset_cs);
+        canary_result* r = force_single ? canary_transcribe_ex(ctx_, samples, n_samples, src.c_str(), tgt.c_str(),
+                                                               params.punctuation, t_offset_cs)
+                                        : canary_transcribe_streamed(ctx_, samples, n_samples, src.c_str(), tgt.c_str(),
+                                                                     params.punctuation, t_offset_cs, 0, -1);
         if (!r)
             return out;
 

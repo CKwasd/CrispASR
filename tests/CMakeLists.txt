@@ -3772,6 +3772,18 @@ catch_discover_tests(test-asr-overlap-trim
     PROPERTIES LABELS "unit;asr"
 )
 
+# ─── test-canary-chunk-merge — #375 canary long-form blueprint port ─────────
+# Pure header, no model: pins nemo_lcs_merge and optimal_chunk_samples against
+# vectors generated from the actual NeMo 2.7.3 Python functions, so the port
+# cannot drift from the blueprint unnoticed.
+add_executable(test-canary-chunk-merge test-canary-chunk-merge.cpp)
+target_include_directories(test-canary-chunk-merge PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-canary-chunk-merge PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-canary-chunk-merge
+    TEST_SPEC "[chunk-merge]"
+    PROPERTIES LABELS "unit;asr"
+)
+
 # ─── test-tts-ref-cache — #334 CLI-writes / session-reads contract ──────────
 # The reference-transcript cache couples two layers that never compile
 # together: the CLI writes it, crispasr_c_api.cpp reads it, and the suffix and
