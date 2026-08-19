@@ -20,7 +20,11 @@ Three arms, all on the same binary so only the flag differs:
 
   A  fixed      current main
   B  legacy     CRISPASR_VIBEVOICE_ASR_PROMPT=legacy + CRISPASR_HQ_RESAMPLE=0
-                — reconstructs the 0.8.29 behaviour the reporter measured
+                — restores the two dominant differences. NOT a full 0.8.29
+                  rebuild: this binary still has the -25 dBFS input
+                  normalisation and the exact-erf GELU, neither of which 0.8.29
+                  had, so read arm B as "the same binary without the prompt and
+                  resampler fixes", not as the reporter's baseline.
   C  cuda       fixed, on CUDA, with and without CRISPASR_VIBEVOICE_ATTN_PREC
                 — the GPU half of the flash-attention precision question, which
                   is a CPU no-op and could not be measured on the Mac at all

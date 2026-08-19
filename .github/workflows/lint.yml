@@ -9,6 +9,13 @@ name: Lint
 #   cppcheck                →  additional static analysis (fast, no compilation needed)
 
 on:
+  # Manual re-run. Without this, a commit whose push did not match the paths
+  # filter below can NEVER be linted: workflows trigger on the head commit of a
+  # push, so merging a C++ change and a tools/ change and pushing them together
+  # evaluates the filter against the tools/ commit only, and the C++ never gets
+  # checked. That happened to 824c934d (#369). Re-running the previous run does
+  # not help — it re-runs the OLD commit.
+  workflow_dispatch:
   push:
     branches: [main, master, integrated_cli]
     paths:
