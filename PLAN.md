@@ -105,7 +105,29 @@ occurrences of bitnet / ternary / i2_s / tq2_0, and its ggml type list stops at
 Q8_0/Q6_K. It cannot load a ternary checkpoint at all. The audio.cpp cross-check
 in #369 was only ever about the FULL model, which is resolved.
 
-**Next step — the only remaining control.** Build Microsoft's VibeASR.cpp and run
+**⚠ What the --lm-quant sweep could NOT see, and why the framing was wrong.**
+TQ2_0 is a ternary CONTAINER; it is not BitNet inference. Two consequences:
+
+  * All three arms call `ternary_quantize()` before diverging, so the sweep
+    proves TQ2_0 is a faithful container (F16 and TQ2_0 agreeing proves exactly
+    that) and is BLIND to an error in the ternarization itself. That matters more
+    than it sounds: the checkpoint is NOT pre-ternary — it ships the
+    full-precision latent QAT weights (12.6 M distinct values per tensor, ±2.7
+    against mean|w| ≈ 0.034), so the rounding is doing real work. Our rule does
+    match BitNet's `weight_quant`, and upstream's I2_S codes agree to 2 values in
+    13.76 M, so this specific risk is covered — but by that check, not by the
+    sweep.
+  * We implement only HALF of BitNet's forward. b1.58 also quantizes ACTIVATIONS
+    to int8 per token (`127/max|x|`) at every BitLinear, and the model was
+    TRAINED that way. `grep activation_quant src/vibevoice.cpp` is empty. The
+    sweep brackets per-token int8 between block-int8 and no-quantization, which
+    already agree character-for-character — suggestive, but two points on the
+    axis rather than a test of the operation the model was trained with.
+
+**Next step — two candidates now, cheapest first.**
+(a) Implement BitNet's per-token `activation_quant` on the 7 LM projections and
+    re-run the Korean clips. Contained, and it closes the half we skip.
+(b) Build Microsoft's VibeASR.cpp and run
 `vibeasr-lm-i2_s-embed-q6_k.gguf` (shipped in microsoft/VibeVoice-ASR-BitNet) on
 the same clips. That is the one comparison that can distinguish "checkpoint" from
 "runtime", and it is what the demo Space is. If it reproduces the demo's exact

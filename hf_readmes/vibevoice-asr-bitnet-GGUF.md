@@ -61,7 +61,29 @@ All variants use **TQ2_0** (ternary 2-bit) for the LM projection weights. They d
 
 ## Quantization strategy
 
-The LM projection weights (q/k/v/o/gate/up/down) are BitNet-trained with ternary values {-1, 0, 1}. The converter applies the ternary quantization (`s = 1/mean(|w|)`, round, clamp) and packs into ggml's native **TQ2_0** format (2.06 bpw). No custom SIMD kernels needed -- standard ggml `mul_mat` handles TQ2_0 transparently.
+The LM projection weights (q/k/v/o/gate/up/down) are BitNet-trained. ⚠ They are **not** stored ternary in the checkpoint — `microsoft/VibeVoice-ASR-BitNet` ships the full-precision latent QAT weights (12.6 M distinct values per tensor, range ±2.7 against mean|w| ≈ 0.034). The converter applies BitNet b1.58's own `weight_quant` (`s = 1/mean(|w|)`, round, clamp to ±1) and packs the result into ggml's native **TQ2_0** (2.06 bpw). Standard ggml `mul_mat` handles TQ2_0, so no custom SIMD kernel is needed.
+
+### ⚠ TQ2_0 is a ternary CONTAINER, not BitNet inference
+
+Worth being explicit, because the repo name invites the opposite reading.
+BitNet b1.58's forward pass has two halves:
+
+| | BitNet b1.58 | CrispASR |
+|---|---|---|
+| weights | `s = 1/mean(\|w\|)`, round, clamp ±1 | **same** — verified against upstream's I2_S codes: 2 differing values in 13.76 M, scales equal to f16 |
+| activations | int8, **per-token absmax** (`127/max\|x\|`) | **not quantized** |
+
+We implement the first half and skip the second. The model was *trained* with
+quantized activations, so feeding it unquantized ones is a real divergence, not
+an improvement — the same shape of mistake as feeding a σ-VAE its mean instead of
+a sample.
+
+Measured, it appears not to matter here: the [Quality verification](#quality-verification)
+table compares block-quantized int8 activations (TQ2_0) against **no**
+activation quantization (F16) and gets character-identical output on all four
+clips, which brackets per-token int8 between two points that already agree. That
+is two points on the axis, not a direct test of per-token absmax, and it is
+recorded as such rather than as a closed question.
 
 | Component | Quant options | Notes |
 |-----------|--------------|-------|

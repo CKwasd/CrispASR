@@ -47,6 +47,17 @@ BITNET_WEIGHT_KEYWORDS = [
 def ternary_quantize(weight_f32: np.ndarray) -> np.ndarray:
     """Quantize to ternary {-1, 0, +1} scaled by mean(|w|).
 
+    ⚠ This is genuinely lossy, not a repack. The checkpoint ships the
+    full-precision LATENT QAT weights — 12.6 M distinct values per tensor,
+    range +-2.7 against mean|w| ~= 0.034 — so the rounding rule below is doing
+    real work and has to match BitNet's. It does: verified against upstream's
+    I2_S codes at 2 differing values in 13.76 M, ties at the rounding boundary.
+
+    ⚠ It is also only HALF of BitNet inference. b1.58 quantizes ACTIVATIONS to
+    int8 per token (127/max|x|) at every BitLinear, and the model was trained
+    that way; the runtime does not. See the model card. An A/B that varies only
+    --lm-quant cannot see either of these, because both arms come through here.
+
     Mirrors quant_weight_fp16() from Microsoft's convert_lm_to_gguf.py:
         s = 1 / mean(|w|)
         w_ternary = round(w * s).clamp(-1, 1) / s
