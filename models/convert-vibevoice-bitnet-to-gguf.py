@@ -110,6 +110,18 @@ def main():
     parser.add_argument("--vae-quant", default="q8_0",
                         choices=["f16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1"],
                         help="Quantization for VAE encoder weights (default: q8_0)")
+    parser.add_argument("--lm-quant", default="tq2_0",
+                        choices=["tq2_0", "f16", "f32", "q8_0"],
+                        help="storage for the ternary LM projections. The VALUES are "
+                             "identical in every case -- ternary_quantize() has already "
+                             "collapsed them to {-mean, 0, +mean} -- so this changes only "
+                             "the ggml matmul path, and with it how ACTIVATIONS are "
+                             "handled: TQ2_0 multiplies against block-quantized int8 "
+                             "activations, f16/f32 against unquantized ones. That is the "
+                             "one axis on which we differ from Microsoft's I2_S kernel, "
+                             "which quantizes activations per token. f16 is the control "
+                             "for #369's BitNet-vs-demo gap; it costs ~3x the file size "
+                             "and is not meant for release.")
     parser.add_argument("--embed-quant", default="f16",
                         choices=["f16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1"],
                         help="Quantization for LM embedding (default: f16)")
@@ -308,15 +320,34 @@ def main():
                     w_f32 = raw.to(torch.float32).numpy()
                     w_ternary = ternary_quantize(w_f32)
                     shape = w_ternary.shape
-                    packed = gguf.quants.quantize(w_ternary.flatten(),
-                                                  gguf.GGMLQuantizationType.TQ2_0)
-                    nrow = shape[0]
-                    bytes_per_row = len(packed) // nrow
-                    packed = packed.reshape(nrow, bytes_per_row)
-                    writer.add_tensor(gguf_name, packed,
-                                      raw_dtype=gguf.GGMLQuantizationType.TQ2_0)
+                    if args.lm_quant == "tq2_0":
+                        packed = gguf.quants.quantize(w_ternary.flatten(),
+                                                      gguf.GGMLQuantizationType.TQ2_0)
+                        nrow = shape[0]
+                        bytes_per_row = len(packed) // nrow
+                        packed = packed.reshape(nrow, bytes_per_row)
+                        writer.add_tensor(gguf_name, packed,
+                                          raw_dtype=gguf.GGMLQuantizationType.TQ2_0)
+                        tag = " [TQ2_0]"
+                    elif args.lm_quant == "f16":
+                        # Same numbers, unquantized activations. ⚠ add_tensor's
+                        # raw_dtype LABELS bytes and never converts, so the cast
+                        # has to happen here.
+                        writer.add_tensor(gguf_name, w_ternary.astype(np.float16))
+                        tag = " [F16 ternary]"
+                    elif args.lm_quant == "f32":
+                        writer.add_tensor(gguf_name, w_ternary)
+                        tag = " [F32 ternary]"
+                    else:  # q8_0
+                        packed = gguf.quants.quantize(w_ternary.flatten(),
+                                                      gguf.GGMLQuantizationType.Q8_0)
+                        nrow = shape[0]
+                        bytes_per_row = len(packed) // nrow
+                        packed = packed.reshape(nrow, bytes_per_row)
+                        writer.add_tensor(gguf_name, packed,
+                                          raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+                        tag = " [Q8_0 ternary]"
                     tq2_count += 1
-                    tag = " [TQ2_0]"
                 elif target_q is not None and raw.ndim >= 2:
                     w_f32 = raw.to(torch.float32).numpy()
                     shape = w_f32.shape
