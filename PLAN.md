@@ -24,6 +24,15 @@ words. Old path gated `CRISPASR_CANARY_LEGACY_STREAM=1`
 (CRISPASR_CANARY_SEAM_DEDUP applies only there). Both CLI and session
 surfaces route through the library.
 
+Decoded-output acceptance vs the Python blueprint (HARD RULE 3, Kaggle
+kernel `tools/kaggle/canary-blueprint-ref/`, nemo 2.7.3 CPU, bf16 vs our
+q4_k): word similarity jfk_x12 **1.000** (264/264), fleurs_60s **1.000**
+(92/92 — incl. the dropped trailing incomplete sentence, which the
+blueprint drops identically), fleurs_600s **0.982** (925 vs 936 words;
+diffs are proper-noun spellings + one boundary sentence — quantization-
+class variance, zero repeated bigrams on either side). Main CI green on
+the port tree.
+
 Still open on the general quality front (separate from #375): the
 pre-existing linear-resampler gap on 44.1/48 kHz compressed input via the
 glint decode paths (~28 vs ~38 dB after the decoder fix).

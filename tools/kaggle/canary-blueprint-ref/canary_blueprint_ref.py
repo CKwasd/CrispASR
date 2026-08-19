@@ -48,7 +48,13 @@ with kh.build_heartbeat("pip nemo", 30):
     rc = subprocess.call([sys.executable, "-m", "pip", "install", "-q", "nemo_toolkit[asr]==2.7.3"])
     if rc != 0:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "nemo_toolkit[asr]"])
-kh.step("deps", note="nemo installed")
+    # Kaggle's numba-cuda split package breaks `import numba.cuda` inside
+    # NeMo's rnnt_loss (AttributeError: numba.cuda.types has no NPDatetime).
+    # Match the verified-working local pair: numba 0.61.2 (built-in cuda
+    # target) + llvmlite 0.44.0, and drop numba-cuda entirely.
+    subprocess.call([sys.executable, "-m", "pip", "uninstall", "-y", "-q", "numba-cuda"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "numba==0.61.2", "llvmlite==0.44.0"])
+kh.step("deps", note="nemo installed; numba pinned 0.61.2, numba-cuda removed")
 
 from huggingface_hub import hf_hub_download  # noqa: E402
 
@@ -69,12 +75,29 @@ with kh.build_heartbeat("fixtures", 30):
         )
 kh.step("fixtures", note=f"{len(paths)} clips downloaded")
 
+import torch  # noqa: E402
+
 import nemo.collections.asr as nemo_asr  # noqa: E402
 
+# Kaggle assigns P100 (sm_60) or T4 (sm_75) randomly; the preinstalled torch
+# ships no sm_60 kernels ("no kernel image is available"). Probe with a real
+# op and fall back to CPU — the run is minutes either way and the kernel
+# needs GPU enabled anyway for internet access.
+device = "cpu"
+if torch.cuda.is_available():
+    try:
+        (torch.zeros(4, device="cuda") + 1).sum().item()
+        device = "cuda"
+    except Exception as e:
+        print(f"CUDA probe failed ({type(e).__name__}); using CPU. cap={torch.cuda.get_device_capability()}", flush=True)
+if device == "cpu":
+    torch.set_num_threads(os.cpu_count() or 4)
+
 with kh.build_heartbeat("model load", 30):
-    model = nemo_asr.models.EncDecMultiTaskModel.from_pretrained("nvidia/canary-1b-v2")
+    model = nemo_asr.models.EncDecMultiTaskModel.from_pretrained("nvidia/canary-1b-v2", map_location=device)
+    model = model.to(device)
     model.eval()
-kh.step("model", note=f"loaded; ts_model={model.timestamps_asr_model is not None}")
+kh.step("model", note=f"loaded on {device}; ts_model={model.timestamps_asr_model is not None}")
 
 import nemo  # noqa: E402
 
