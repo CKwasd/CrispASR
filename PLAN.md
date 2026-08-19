@@ -2,9 +2,16 @@
 
 ## CLAIMED 2026-08-19 — Issue #375 Canary streaming regression
 
-Worktree: `.claude/worktrees/fix-375-canary-regression`.
-Reproduce and fix the post-`73bb9b2f` Canary recognition regression reported in
-#375 without reverting the scheduler UAF fix; add focused seam/streaming coverage.
+Root cause found + fixed 2026-08-19: NOT `73bb9b2f` (exonerated,
+byte-identical) but glint's AAC-LC decoder — window_shape discarded + TNS
+mis-decode → every real-world .aac at ~17 dB SNR since glint became the first
+AAC decoder (`f3d82d30`). Fixed upstream (glint `77738f3`), synced in-tree
+(`0e5d1344`), Tier-3 foreign-decode gate red-verified in glint. Awaiting the
+reporter's input-format confirmation on #375; full trail in
+`docs/handover/375-canary-streaming-regression.md` (fix-wiring branch).
+Follow-ups worth their own issues: linear-resampler gap on 44.1/48k compressed
+input (~28 vs ~38 dB, pre-existing), canary seam-dedup default (#365 matcher
+vs on-hold PR #376).
 
 ## CLAIMED 2026-08-13 — PR #347 GGUF weight-mapping release review
 
