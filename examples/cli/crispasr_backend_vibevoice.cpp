@@ -83,8 +83,20 @@ public:
         // auto-ran FireRedPunc over it (#308's audit item, found while fixing
         // #300): the capitaliser turned "And" into "ANd" and a second full stop
         // landed on text that already ended in one ("country..").
-        uint32_t caps = CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE | CAP_FLASH_ATTN | CAP_TTS |
-                        CAP_DIARIZE | CAP_PUNCTUATION_NATIVE;
+        // CAP_TEMPERATURE intentionally NOT declared (#369). It was, and it was
+        // a claim with nothing behind it: `params.temperature` is never plumbed
+        // into vibevoice_context, and the ASR decode is a plain argmax over the
+        // logits — no temperature, no top-p, no sampling of any kind. The
+        // reporter of #369 spent time establishing from outside that `-tp 0.8`
+        // with different `--seed` values returns character-identical output,
+        // which is exactly what warn_unsupported() would have told them for
+        // free. Dropping the cap makes `--temperature` print "unsupported by
+        // this backend" instead of being silently ignored. Re-declare it only
+        // together with a decode path that actually reads the value — cf.
+        // crispasr_backend_gemma4_e2b.cpp, "so CAP_TEMPERATURE is real, not
+        // just a claim". CAP_BEAM_SEARCH was already, correctly, absent.
+        uint32_t caps =
+            CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_FLASH_ATTN | CAP_TTS | CAP_DIARIZE | CAP_PUNCTUATION_NATIVE;
         if (allow_generic_no_voice_)
             caps |= CAP_VOICE_CLONING;
         return caps;
