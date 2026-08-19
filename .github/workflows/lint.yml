@@ -39,6 +39,7 @@ on:
       # four jobs and cost every Linux tarball of v0.8.26.
       - '.github/workflows/**'
       - 'tools/check-workflow-run-blocks.py'
+      - 'tools/check-release-portable-cpu.py'
       # OmniVoice prompt vocabularies: the generated headers must match their
       # vendored sources. Neither is cosmetic — both are what the model is
       # conditioned on (#13273).
@@ -124,6 +125,7 @@ on:
       - 'docs/**.md'
       - '.github/workflows/**'
       - 'tools/check-workflow-run-blocks.py'
+      - 'tools/check-release-portable-cpu.py'
       # OmniVoice prompt vocabularies: the generated headers must match their
       # vendored sources. Neither is cosmetic — both are what the model is
       # conditioned on (#13273).
@@ -472,6 +474,11 @@ jobs:
         run: |
           pip install --quiet pyyaml
           python tools/check-workflow-run-blocks.py
+          # #374: the shipped Windows CUDA .exe was built with -march=native on a
+          # runner that has AVX-512, so it SIGILL'd on every CPU without it. Nine
+          # of eleven GPU jobs were in that state. release.yml only runs on a tag
+          # push, so nothing else can catch this before the release IS the bug.
+          python tools/check-release-portable-cpu.py
 
       # Also hermetic, and also before the network steps. The table is generated
       # from third_party/omnivoice/lang_map.py, which is vendored precisely so
