@@ -184,7 +184,14 @@ public:
         // CRISPASR_VIBEVOICE_RAW_TRANSCRIPT=1 restores the pre-#300 behaviour
         // (one segment, raw model output) for anyone parsing the blob themselves.
         if (!crispasr_env::truthy("CRISPASR_VIBEVOICE_RAW_TRANSCRIPT")) {
-            for (const auto& u : core_vibevoice::parse(raw)) {
+            const std::vector<core_vibevoice::Utterance> utts = core_vibevoice::parse(raw);
+            for (const auto& u : utts) {
+                // The model's own non-speech markers are not transcript text.
+                // Dropped rather than emitted so an SRT never carries a literal
+                // "[Silence]" over speech, and so the CLI's non-silent-audio
+                // warning can fire (#369).
+                if (core_vibevoice::is_non_speech_marker(u.text))
+                    continue;
                 std::string t = u.text;
                 while (!t.empty() && (unsigned char)t.front() <= ' ')
                     t.erase(t.begin());
@@ -219,6 +226,12 @@ public:
                 out.push_back(std::move(seg));
             }
             if (!out.empty())
+                return out;
+            // The blob DID parse; it just carried nothing but non-speech. Return
+            // empty so the caller reports no transcript — falling through here
+            // would hand back the raw JSON, which is how "[Silence]" reached the
+            // user's transcript in the first place.
+            if (!utts.empty())
                 return out;
             // Nothing parsed — the model answered in prose, or the decode was
             // cut before the first complete object. Fall through and hand back

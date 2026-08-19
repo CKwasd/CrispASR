@@ -6538,7 +6538,13 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
             for (const auto& t : toks)
                 tok_texts.push_back(t.text);
             const std::vector<std::vector<int>> tok_of = core_vibevoice::assign_tokens(utts, tok_texts);
+            // The blob parsed as a transcript. Recorded BEFORE the filter so a
+            // response carrying only non-speech markers reports "no speech"
+            // rather than falling through to the raw JSON blob (#369).
+            parsed = !utts.empty();
             for (size_t u = 0; u < utts.size(); u++) {
+                if (core_vibevoice::is_non_speech_marker(utts[u].text))
+                    continue;
                 std::string t = utts[u].text;
                 while (!t.empty() && (unsigned char)t.front() <= ' ')
                     t.erase(t.begin());
@@ -6573,7 +6579,6 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
                     seg_toks.push_back(toks[(size_t)idx]);
                 seg.words = emit_words_from_tokens(seg_toks);
                 r->segments.push_back(std::move(seg));
-                parsed = true;
             }
         }
         if (!parsed) {
