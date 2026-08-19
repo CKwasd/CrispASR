@@ -1490,6 +1490,17 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
     // model ends the document instead of answering. Pre-seeding the assistant
     // turn is what the model would have had to emit next in any case.
     const bool assistant_header = prompt_mode != "no-assistant-header";
+    // JSON-keys instruction for the 7B, plain text for the 1.5B — the split
+    // Microsoft's own runtime makes (VibeASR.cpp utils/prompt_builder.h: "text"
+    // format is the 1.5B, "json" the 7B, and it defaults to text). We had sent
+    // every checkpoint the 7B form because ours came from the PYTHON processor,
+    // which only targets the 7B. Keyed on d_lm rather than the backend alias so
+    // it follows the weights: 1536 = 1.5B (incl. vibevoice-asr-bitnet),
+    // 3584 = 7B. CRISPASR_VIBEVOICE_ASR_PROMPT=json|text forces either.
+    const bool plain_prompt = legacy_prompt           ? false
+                              : prompt_mode == "text" ? true
+                              : prompt_mode == "json" ? false
+                                                      : (hp.d_lm <= 2048);
 
     std::vector<int> system_tokens = vvp::system_user_header();
     if (legacy_prompt) {
@@ -1525,7 +1536,7 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
         auto ctx_ids = !m.merge_rank.empty() ? core_bpe::tokenize_simple(m.token_to_id, m.merge_rank, spaced)
                                              : tokenize_text_bpe_vocab_rank(m, spaced);
         suffix_tokens.insert(suffix_tokens.end(), ctx_ids.begin(), ctx_ids.end());
-        const auto tail = vvp::suffix_context_tail();
+        const auto tail = plain_prompt ? vvp::suffix_context_tail_plain() : vvp::suffix_context_tail();
         suffix_tokens.insert(suffix_tokens.end(), tail.begin(), tail.end());
 
         if (ctx->params.verbosity >= 1)
@@ -1539,6 +1550,8 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
             5145, 882,  11, 3972, 882,   11,  29073, 3034, 11, 8883, // Start time, End time, Speaker ID, Content
         };
         suffix_tokens.insert(suffix_tokens.end(), std::begin(legacy_mid), std::end(legacy_mid));
+    } else if (plain_prompt) {
+        suffix_tokens = vvp::suffix_no_context_plain(dur_str);
     } else {
         suffix_tokens = vvp::suffix_no_context(dur_str);
     }

@@ -56,6 +56,12 @@ inline const char* system_user_header_text() {
            "You are a helpful assistant that transcribes audio input into text output in JSON format."
            "<|im_end|>\n<|im_start|>user\n";
 }
+inline const char* suffix_no_context_plain_text() {
+    return "\nThis is a %s seconds audio, please transcribe it.";
+}
+inline const char* suffix_context_tail_plain_text() {
+    return "\n\nPlease transcribe it.";
+}
 inline const char* suffix_no_context_text() {
     return "\nThis is a %s seconds audio, please transcribe it with these keys: "
            "Start time, End time, Speaker ID, Content";
@@ -117,6 +123,38 @@ inline std::vector<int32_t> suffix_no_context(const std::string& dur) {
     };
     out.insert(out.end(), std::begin(rest), std::end(rest));
     return out;
+}
+
+// " seconds audio, please transcribe it." — the PLAIN-TEXT instruction.
+//
+// ⚠ This form belongs to the 1.5B checkpoints (including VibeVoice-ASR-BitNet);
+// the JSON-keys form above belongs to the 7B. Microsoft's own reference runtime
+// says so in as many words — VibeASR.cpp, utils/prompt_builder.h:
+//
+//     // "text" format (1.5B model, plain text output):
+//     //   "This is a X.XX seconds audio, please transcribe it."
+//     // "json" format (7B model, JSON output with keys):
+//     //   "This is a X.XX seconds audio, please transcribe it with these keys: ..."
+//
+// and it defaults to "text". We sent every checkpoint the JSON form, because our
+// prompt was derived from microsoft/VibeVoice's PYTHON processor, which targets
+// the 7B. So the 1.5B was being asked for a JSON transcript it was not trained
+// to emit — which is the shape of #369's BitNet complaint: plausible but
+// degraded output on the small model, while the 7B is exact through the same
+// pipeline, and the official demo (VibeASR.cpp defaults, i.e. this form) is
+// exact on the same clip.
+inline std::vector<int32_t> suffix_no_context_plain(const std::string& dur) {
+    std::vector<int32_t> out = suffix_head(dur);
+    const int32_t rest[] = {6486, 7699, 11, 4486, 1356, 3114, 432, 13}; // " seconds audio, please transcribe it."
+    out.insert(out.end(), std::begin(rest), std::end(rest));
+    return out;
+}
+
+// "\n\nPlease transcribe it." — the context form's tail for the plain-text
+// instruction (VibeASR.cpp uses the capitalised sentence after the blank line,
+// exactly as it does for the JSON form).
+inline std::vector<int32_t> suffix_context_tail_plain() {
+    return {271, 5501, 1356, 3114, 432, 13};
 }
 
 // " seconds audio, with extra info:" — the context form stops here so the

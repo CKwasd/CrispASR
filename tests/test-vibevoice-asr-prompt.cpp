@@ -155,6 +155,30 @@ TEST_CASE("vibevoice-asr prompt: the suffix actually says 'transcribe'", "[unit]
     REQUIRE(s.find("PEND") == std::string::npos);
 }
 
+// The 1.5B checkpoints (including VibeVoice-ASR-BitNet) take a PLAIN-TEXT
+// instruction, not the JSON-keys one. Microsoft's own runtime says so —
+// VibeASR.cpp utils/prompt_builder.h labels "text" the 1.5B format and "json"
+// the 7B's, and defaults to text. We sent every checkpoint the 7B form because
+// ours came from the Python processor, which only targets the 7B; the 1.5B was
+// being asked for a JSON transcript it does not emit (#369).
+TEST_CASE("vibevoice-asr prompt: the 1.5B plain-text suffix decodes correctly", "[unit][vibevoice]") {
+    REQUIRE(decode(suffix_no_context_plain("3.26")) == "\nThis is a 3.26 seconds audio, please transcribe it.");
+    REQUIRE(decode(suffix_no_context_plain("5.98")) == "\nThis is a 5.98 seconds audio, please transcribe it.");
+    REQUIRE(decode(suffix_context_tail_plain()) == "\n\nPlease transcribe it.");
+}
+
+// The two instructions must stay distinguishable: the plain one must NOT ask for
+// keys, and the JSON one must. Sending the wrong one is the whole of the BitNet
+// half of #369, so it is asserted rather than left to reading.
+TEST_CASE("vibevoice-asr prompt: plain and JSON instructions do not collide", "[unit][vibevoice]") {
+    const std::string plain = decode(suffix_no_context_plain("5.98"));
+    const std::string json = decode(suffix_no_context("5.98"));
+    REQUIRE(plain.find("these keys") == std::string::npos);
+    REQUIRE(json.find("these keys") != std::string::npos);
+    REQUIRE(plain.find("please transcribe it.") != std::string::npos);
+    REQUIRE(plain != json);
+}
+
 TEST_CASE("vibevoice-asr prompt: the context form brackets the user's text", "[unit][vibevoice]") {
     REQUIRE(decode(suffix_context_head("5.98")) == "\nThis is a 5.98 seconds audio, with extra info:");
     REQUIRE(decode(suffix_context_tail()) ==
