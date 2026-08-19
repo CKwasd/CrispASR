@@ -148,6 +148,27 @@ def transcribe(binary: Path, model: Path, wav: Path, timeout=3600) -> dict:
     return {"rc": p.returncode, "text": text, "ok": ok, "stderr_tail": p.stderr[-1200:]}
 
 
+def preflight_converter(conv: Path) -> None:
+    """Prove the converter RUNS before spending eight minutes on 11 GB.
+
+    Run 1 of this kernel downloaded the whole checkpoint and then died on
+    `ModuleNotFoundError: No module named 'gguf'` — a two-second failure that
+    cost a full GPU session because it was discovered after the download rather
+    than before it. HARD RULE #8: never continue past a failed setup step, and
+    check the step as early as it can be checked.
+    """
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                    "safetensors", "transformers", "gguf"], check=False, timeout=900)
+    p = subprocess.run([sys.executable, str(conv), "--help"], text=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+    if p.returncode != 0:
+        print(p.stdout[-3000:], flush=True)
+        raise RuntimeError("converter cannot even run --help; fix deps before downloading")
+    if "--lm-quant" not in p.stdout:
+        raise RuntimeError("this checkout's converter has no --lm-quant; the clone is stale")
+    print("preflight: converter runs and exposes --lm-quant", flush=True)
+
+
 def main() -> int:
     token = kh.resolve_hf_token()
     from huggingface_hub import snapshot_download
@@ -155,12 +176,15 @@ def main() -> int:
     binary = build()
     fixtures = fetch_fixtures()
 
+    conv = REPO / "models" / "convert-vibevoice-bitnet-to-gguf.py"
+    kh.step("preflight.converter")
+    preflight_converter(conv)
+
     kh.step("download.checkpoint")
     with hb("download.checkpoint"):
         snapshot_download(repo_id=HF_CHECKPOINT, local_dir=str(SRC), token=token or None,
                           allow_patterns=["*.json", "*.safetensors", "*.txt"])
 
-    conv = REPO / "models" / "convert-vibevoice-bitnet-to-gguf.py"
     results: dict = {"commit": COMMIT, "gt_ko": GT_KO, "arms": {}}
     order = [k for k in ("ko-test", "ko-mic-cue-kept", "ko-mic-cue-lost", "en-jfk") if k in fixtures]
 
