@@ -79,13 +79,45 @@ We use the mean, i.e. the std=0 draw. Implemented behind
 `CRISPASR_VIBEVOICE_ASR_SAMPLE=1` — see the measurement recorded at the call
 site in `vibevoice_encode_speech`.
 
-**Next step.** The one piece of evidence that still points at us rather than at
-the model is the reporter's cross-check: audio.cpp's q8_0 transcribes
-`ko-mic-cue-lost.wav` correctly where our q4_k AND q8_0 both fail. That is the
-FULL model, which does not fit comfortably on the 16 GB Mac alongside a
-reference forward — it needs the VPS or Kaggle. Everything upstream of the LM is
-now proven equal, so the next divergence to look for is in the LM forward or the
-decode, not the acoustic path.
+**Next step — HANDOFF, needs a box with RAM (VPS or Kaggle, not this Mac).**
+
+The one piece of evidence still pointing at us rather than at the model is the
+reporter's cross-check: audio.cpp's own q8_0 transcribes `ko-mic-cue-lost.wav`
+correctly where our q4_k AND our q8_0 both fail. Everything upstream of the LM
+is now proven equal against upstream itself, so the remaining divergence is in
+the LM forward or the decode.
+
+⚠ Do NOT run this on the 16 GB Mac. The full ASR model is 4.8 GB (q4_k) / 8.8 GB
+(q8_0); loading it alongside a PyTorch reference forward hit 12 GB and had to be
+killed. The bitnet variant (1.05 GB) is fine here, but it is a DIFFERENT
+checkpoint, so it cannot answer the audio.cpp question.
+
+Run, in this order — the first three are cheap and two of them may close it:
+
+1. **Prompt ids on the full model.** `CRISPASR_VIBEVOICE_DUMP_DIR=<dir>` writes
+   `prompt_ids.bin` (int32). Decode it and diff against
+   `tests/test-vibevoice-asr-prompt.cpp`'s expected text. It should now be
+   byte-identical for both checkpoints — this is the cheap confirmation that
+   `b6efe1de` reached the full-model path too, not just bitnet.
+2. **`speech_features` vs upstream, full model.** `tools/dump_reference.py
+   --backend vibevoice --model-dir <full ASR checkpoint>` (needs
+   `CRISPASR_VIBEVOICE_SRC` or the vibevoice package). Expect ~0.999 as on
+   bitnet. If it is NOT, the full model's GGUF CONVERSION differs from the
+   bitnet one and that is the answer.
+3. **Step-0 logit-rank probe** (the MOSS-TTS #249 pattern in the diff-harness
+   section): prefill the identical prompt, dump `prefill_logits.bin`, and check
+   where upstream's greedy first token ranks in our distribution. Rank <= 1-2
+   with a small gap = quantization near-tie; far down = a real LM/head bug.
+   `prefill_logits.bin` is already written by the dump path.
+4. **Only if 1-3 are clean: cross-tap audio.cpp.** It is Apache-2.0 with
+   prebuilt CPU binaries, cloned at `/Volumes/backups/ai/audio.cpp`. Its
+   `speech_encoder.cpp` / `text_decoder.cpp` are the two places to add a dump.
+   Note its GGUF comes from its own converter, so a difference there is
+   "conversion + runtime" and still needs splitting.
+
+Fixtures: `samples/ko-369.wav` is tracked; the rest regenerate from the
+reporter's PowerShell + `ffmpeg -af atempo=` recipe in the issue, no files
+needed from them.
 
 ## OPEN 2026-08-18 — TQ2_0 has no Metal kernels: BitNet models are silent on GPU
 
