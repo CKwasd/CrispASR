@@ -7,52 +7,85 @@ Review PR #352 end to end, validate that its long-form routing and gap repair
 do not regress any language path, add targeted unit/live coverage where needed,
 and merge or improve the change after local/SSD validation.
 
-## OPEN 2026-08-19 — vibevoice ASR acoustic conditioning diverges from upstream (#369)
+## OPEN 2026-08-19 — vibevoice ASR language flip (#369): three defects fixed, symptom not
 
-Our sigma-VAE output is materially different from upstream's on the SAME bytes.
-Measured with the new `crispasr-diff vibevoice` branch against upstream's own
-forward pass, cos_mean, after the -25 dBFS fix below:
+**The acoustic-conditioning theory in the previous version of this entry was
+wrong, and it was wrong because the reference was ours.** Rebuilt the reference
+on upstream's OWN modules (`TokenizerEncoder` / `SpeechConnector` from
+microsoft/VibeVoice, loaded from the checkpoint, taps taken between module
+calls) instead of the hand-written PyTorch copy in
+`tools/reference_backends/vibevoice.py`. Feeding both sides the SAME 24 kHz
+bytes:
 
-    stage             cue-kept   cue-lost
-    at_enc_mean         0.724      0.812
-    st_enc_mean         0.817      0.836
-    speech_features     0.829      0.846
+    stage             cue-kept
+    at_enc_stage_6      0.999927
+    st_enc_stage_6      0.999943
+    speech_features     0.999926      |mine| 494.3200 vs |ref| 494.3192
 
-An F16 port against an F32 reference sits at 0.998+. 0.83 is not precision.
-Cross-checked on Kaggle (x86 Linux) and locally (macOS ARM): agreement to 4-5
-decimals, so the measurement is solid and the defect is real.
+The sigma-VAE encoder and both connectors are correct. The 0.83, then 0.95, then
+0.97 numbers reported earlier were an artifact of (a) the hand-rolled reference's
+own bugs and (b) the input resampler, which the old measurement fed through.
 
-**FIXED so far, and it is not enough.** Upstream normalises to -25 dBFS RMS
-before the encoders; our ASR path did not. The helper existed
-(`vibevoice_normalize_ref_pcm`, "matches Microsoft's default") wired ONLY into
-TTS voice cloning. Fixed on `fix/vibevoice-asr-input-norm`. It improves every
-stage (at_enc_mean +0.04/+0.05) but leaves the bulk of the gap, and it does NOT
-fix the reported language flip — the cue-lost clip still answers in English.
+**FIXED — three real divergences, all confirmed against upstream:**
 
-**ELIMINATED, with evidence — do not re-chase these:**
-  * TQ2_0 vs upstream I2_S weights: 2 differing weights in 13.76 M, scales equal
-    to f16. The LM is not it.
-  * `speech_scaling_factor` / `speech_bias_factor`: correctly NOT applied for
-    ASR — the tensors do not exist in the ASR checkpoint and the reference does
-    not scale. The existing comment in vibevoice.cpp is right.
-  * Conv padding: ours matches the reference exactly — pad_left
-    `(K-1)*dilation-(stride-1)` clamped at 0, same pad_right stride-alignment
-    formula, constant padding.
-  * Resampling 16k->24k: linear vs soxr_hq is cos 0.9995, negligible.
-  * "The divergence causes the language flip": no. It is ANTI-correlated — the
-    failing clip is CLOSER to upstream than the working one on every stage.
+1. **The prompt was corrupted.** The hardcoded suffix ids said
+   `6546, 7699, 11, 4587, 38840, 432, 449` under a comment reading
+   `"seconds audio, please transcribe it with"`. They decode to
+   `" configuration audio,thonPEND itiz"` — the word "transcribe" was never in
+   the prompt. Plus a stray `\n` (198) before `<|im_end|>` in the system block.
+   Confirmed wrong by three independent sources that agree with each other:
+   microsoft/VibeVoice's `vibevoice_asr_processor.py`, the chat_template
+   transformers ships in `convert_vibevoice_asr_to_hf.py`, and audio.cpp's
+   `tokenizer_text.cpp`. Now in `src/core/vibevoice_asr_prompt.h` with
+   `tests/test-vibevoice-asr-prompt.cpp`, which DECODES the ids back to text
+   against an embedded slice of the real Qwen2.5 vocab (red-verified against the
+   old ids).
+2. **`ggml_gelu` where upstream uses exact erf.** `ACT2FN["gelu"]` is
+   `GELUActivation` (erf); `ggml_gelu` is the tanh approximation. audio.cpp picks
+   `GeluApproximation::ExactErf` in the same block. Cosine cannot see this
+   (0.999926 vs 0.999927) — the NORM can: 494.188 -> 494.320 against a reference
+   of 494.319. HARD RULE 2b in miniature.
+3. **The audio loader resampled with miniaudio's linear resampler.**
+   `read_audio_data()` asked `ma_decoder` for the target rate, so miniaudio
+   resampled with `ma_resample_algorithm_linear` (linear interpolation + a
+   4th-order LPF). Measured: a 10 kHz tone decoded to 16 kHz, where it is above
+   Nyquist and must vanish, survives at **-10.3 dB** and folds down to 6 kHz —
+   inside the speech band. So every 44.1/48 kHz file fed to any backend carried
+   audible alias. Upsampling 16 -> 24 kHz for vibevoice/kyutai was cos 0.944 vs
+   soxr_vhq. Now decodes at the file's native rate and resamples with
+   `core_audio::resample_polyphase` (cos 0.99997 vs soxr, -89 dB on the alias
+   test). `CRISPASR_HQ_RESAMPLE=0` restores the old path.
 
-**Next step.** Localise inside the encoder stack: the reference computes
-downsample_layers[0..6] (ratios [8,5,5,4,2,2]) then stages; dumping after each
-and matching dump points in `build_tokenizer_encoder_graph` would say which
-layer first diverges. That is the only remaining way to narrow it — the
-stage-level API bottoms out at the encoder output.
+**The reported symptom is NOT fixed, and none of the three fixes it.** On the
+five Korean fixtures from the issue (bitnet embed-q8, CPU):
 
-**Trap for whoever continues:** `crispasr-diff` loads audio at 16 kHz, this
-backend wants 24 kHz. Feeding 16 kHz silently yields 30 frames against the
-reference's 45 and makes every stage look catastrophically broken (cos ~0.01)
-when nothing is. The frame count is the tell. The vibevoice branch resamples;
-do not remove it.
+  * the prompt fix leaves the two cue-kept files character-identical and turns
+    the three cue-lost files' wrong answers into different wrong answers;
+  * the resampler fix recovers Korean on `flip-ko` (atempo 0.525) and is
+    character-identical on three of the other four.
+
+**ELIMINATED, with evidence — do not re-chase:**
+  * TQ2_0 vs upstream I2_S weights: 2 differing weights in 13.76 M.
+  * The sigma-VAE encoder / connectors: 0.9999 vs upstream on identical input.
+  * `speech_scaling_factor`: correctly not applied for ASR.
+  * Conv padding: matches upstream's `SConv1d._forward_non_streaming` exactly.
+  * "The conditioning divergence causes the flip": there is no conditioning
+    divergence.
+
+**KNOWN, still divergent, opt-in.** Upstream's ASR path samples the acoustic
+posterior rather than using its mean (`encoder_output.sample('gaussian')`,
+fix_std 0.5 -> one scalar std ~ N(0, 0.625) per clip); audio.cpp does the same.
+We use the mean, i.e. the std=0 draw. Implemented behind
+`CRISPASR_VIBEVOICE_ASR_SAMPLE=1` — see the measurement recorded at the call
+site in `vibevoice_encode_speech`.
+
+**Next step.** The one piece of evidence that still points at us rather than at
+the model is the reporter's cross-check: audio.cpp's q8_0 transcribes
+`ko-mic-cue-lost.wav` correctly where our q4_k AND q8_0 both fail. That is the
+FULL model, which does not fit comfortably on the 16 GB Mac alongside a
+reference forward — it needs the VPS or Kaggle. Everything upstream of the LM is
+now proven equal, so the next divergence to look for is in the LM forward or the
+decode, not the acoustic path.
 
 ## OPEN 2026-08-18 — TQ2_0 has no Metal kernels: BitNet models are silent on GPU
 

@@ -145,6 +145,11 @@ public:
             vv_pcm = pcm24_buf.data();
             vv_n = (int)pcm24_buf.size();
         }
+        // ASR is greedy, so --seed only matters when the acoustic posterior is
+        // being sampled (CRISPASR_VIBEVOICE_ASR_SAMPLE=1). It was never plumbed
+        // through the transcribe path at all, which is part of why the knob
+        // looked inert from outside (#369).
+        vibevoice_set_seed(ctx_, (uint32_t)params.seed);
         const char* context = params.context.empty() ? nullptr : params.context.c_str();
         char* text = vibevoice_transcribe_with_context(ctx_, vv_pcm, vv_n, context);
         if (!text)
