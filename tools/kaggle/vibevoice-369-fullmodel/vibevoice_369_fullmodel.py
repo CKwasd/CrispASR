@@ -154,15 +154,48 @@ def fetch_fixtures() -> dict:
     return out
 
 
+# Transcript sentinels. "[Silence]" is what the CLI emits when the model
+# returns no utterance — a WRONG answer that must not be scored as a pass.
+EMPTY_MARKERS = ("[Silence]", "[BLANK_AUDIO]", "[silence]")
+
+
 def transcribe(binary: Path, model: Path, wav: Path, *, backend: str, gpu: bool,
                env: dict | None = None, timeout=3600) -> dict:
+    """Run one transcription, keeping stdout (the transcript) apart from stderr.
+
+    ⚠ The first version of this kernel merged the two streams and then filtered
+    the transcript out of the mix by prefix. ggml's CUDA banner ("  Device 0:
+    Tesla P100...") does not match any of those prefixes, so it landed in the
+    `text` field — which meant a run that produced NO transcript still looked
+    non-empty, and the proof-of-work check reported "0 of 25 bad" over four arms
+    that had actually answered "[Silence]" twice each. Separating the streams
+    removes the guesswork; EMPTY_MARKERS covers the rest.
+    """
     argv = [binary, "--backend", backend, "-m", model, "-t", "4", "-f", wav, "-nt"]
     if not gpu:
         argv.append("-ng")
-    p = run(argv, env=env, timeout=timeout, check=False)
-    text = "\n".join(ln for ln in p.stdout.splitlines()
-                     if ln.strip() and not re.match(r"^(crispasr|whisper|ggml|vibevoice|\[)", ln.strip()))
-    return {"rc": p.returncode, "text": text.strip(), "tail": p.stdout[-1500:]}
+    argv = [str(x) for x in argv]
+    merged = os.environ.copy()
+    if env:
+        merged.update({str(k): str(v) for k, v in env.items()})
+    print("$ " + " ".join(argv), flush=True)
+    p = subprocess.run(argv, env=merged, text=True, timeout=timeout,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    text = p.stdout.strip()
+    # The CLI prefixes diarized output with "(Speaker N) "; keep it out of the
+    # comparison but record it.
+    speaker = None
+    m = re.match(r"^\(Speaker (\d+)\)\s*", text)
+    if m:
+        speaker = int(m.group(1))
+        text = text[m.end():]
+    # What backend did it actually pick? An arm labelled "cpu" that silently ran
+    # on CUDA would make the CPU/GPU comparison meaningless.
+    dev = "cuda" if re.search(r"backend:\s*CUDA", p.stderr) else (
+        "cpu" if re.search(r"backend:\s*CPU", p.stderr) else "?")
+    ok = p.returncode == 0 and bool(text) and not any(k in text for k in EMPTY_MARKERS)
+    return {"rc": p.returncode, "text": text, "speaker": speaker, "device": dev,
+            "ok": ok, "stderr_tail": p.stderr[-1500:]}
 
 
 def main() -> int:
@@ -185,9 +218,20 @@ def main() -> int:
     legacy_env = {"CRISPASR_VIBEVOICE_ASR_PROMPT": "legacy", "CRISPASR_HQ_RESAMPLE": "0"}
     results: dict = {"commit": COMMIT, "gt": GT, "model": GGUF_FILE, "arms": {}}
 
+    # Roll the fixes back one at a time. Run 1 showed the full model getting
+    # ko-mic-cue-lost.wav RIGHT in both the fixed and the legacy arm — so
+    # whatever repaired it is something legacy does not roll back, and the
+    # obvious candidate is the -25 dBFS input normalisation (b7a1a71c), which
+    # was already in the binary and which I had written off after it failed to
+    # help the BITNET checkpoint. nonorm isolates it; v0829 is the closest
+    # reconstruction of what the reporter actually ran.
+    nonorm_env = {"CRISPASR_VIBEVOICE_NO_INPUT_NORM": "1"}
+    v0829_env = {**legacy_env, **nonorm_env, "CRISPASR_VIBEVOICE_GELU_TANH": "1"}
     arms = [
         ("full.cpu.fixed", full, "vibevoice", False, None),
         ("full.cpu.legacy", full, "vibevoice", False, legacy_env),
+        ("full.cpu.nonorm", full, "vibevoice", False, nonorm_env),
+        ("full.cpu.v0829", full, "vibevoice", False, v0829_env),
         ("full.cuda.fixed", full, "vibevoice", True, None),
         ("full.cuda.prec_default", full, "vibevoice", True,
          {"CRISPASR_VIBEVOICE_ATTN_PREC": "default"}),
@@ -200,7 +244,8 @@ def main() -> int:
             with hb(f"run.{arm}.{name}"):
                 r = transcribe(binary, model, fixtures[name], backend=backend, gpu=gpu, env=env)
             results["arms"][arm][name] = r
-            print(f"[{arm:22}] {name:16} rc={r['rc']} :: {r['text']}", flush=True)
+            print(f"[{arm:22}] {name:16} rc={r['rc']} dev={r['device']} ok={r['ok']} :: {r['text']}",
+                  flush=True)
             (RESULTS / f"{arm}.{name}.txt").write_text(r["text"] + "\n")
 
     (RESULTS / "results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2))
@@ -208,11 +253,17 @@ def main() -> int:
     print("\n" + "=" * 78)
     print(f"GT: {GT}")
     for arm in results["arms"]:
-        print(f"\n--- {arm}")
+        rows = results["arms"][arm]
+        devs = {r["device"] for r in rows.values()}
+        print(f"\n--- {arm}   (backend actually used: {sorted(devs)})")
         for name in order:
-            print(f"  {name:16} {results['arms'][arm][name]['text']}")
+            r = rows[name]
+            print(f"  {name:16} ok={str(r['ok']):5} {r['text'] or '<EMPTY>'}")
+    bad = [f"{a}.{n}" for a, rows in results["arms"].items()
+           for n, r in rows.items() if not r["ok"]]
+    print(f"\nruns that produced no usable transcript: {len(bad)} — {bad}")
     print("=" * 78, flush=True)
-    kh.step("done")
+    kh.step("done", unusable=len(bad))
     return 0
 
 
