@@ -6,6 +6,86 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #369 VibeVoice-ASR Korean language flip — five defects, merged 2026-08-19
+
+A reporter showed `vibevoice-bitnet` losing Korean entirely on borderline audio
+(answering in Italian, Vietnamese, Thai) while Microsoft's demo Space kept it on
+the same clips, and later that audio.cpp's q8_0 transcribed a file our full model
+failed. Five real defects came out of it. **Two of them were mine to begin with:
+the reference I measured against, and the conclusion I published from it.**
+
+**The language flip was the missing -25 dBFS input normalisation.** Upstream and
+audio.cpp normalise before the sigma-VAE encoders (`VibeVoiceASRFrontend::normalize`,
+`target_dB_FS`); our ASR path did not — the helper existed, wired only into TTS
+voice cloning. Bisected on Kaggle against the full 7B q4_k on the reporter's
+`ko-mic-cue-lost.wav`: current main EXACT, prompt+resampler rolled back still
+EXACT, normalisation rolled back **Thai**, everything rolled back **Thai** — and
+"Thai" is precisely what the reporter measured at q4_k and q8_0. One flag
+reproduces and removes it.
+
+⚠ I had already shipped that fix and reported it to the issue as a no-op, because
+I measured it on the BITNET checkpoint — the only one that fit on the dev Mac.
+BitNet is wrong on those clips whatever you do to the input, so that arm had no
+headroom and "still broken" was the only answer it could return. An arm that
+fails under every condition cannot discriminate a fix from a no-op.
+
+**BitNet was getting the 7B's prompt.** VibeASR.cpp's `utils/prompt_builder.h`
+says, in a comment, that `"text"` format is the 1.5B's ("…please transcribe it.")
+and `"json"` the 7B's ("…with these keys: …"), and it defaults to text. Ours came
+from microsoft/VibeVoice's PYTHON processor, which only targets the 7B, so every
+checkpoint got the JSON form. Two of three real Korean clips went straight to
+EXACT and `ko-mic-cue-lost` kept its language for the first time. Found by
+READING the reference runtime after every numerical avenue had been eliminated —
+weights equal to upstream's I2_S to 2 values in 13.76 M, sigma-VAE at cos
+0.999926, LM storage (TQ2_0/Q8_0/F16) character-identical, and BitNet's per-token
+`activation_quant` implemented and measured immaterial.
+
+**The prompt's hardcoded ids did not match their own comment.** They read
+`"seconds audio, please transcribe it with"` and decoded to
+`" configuration audio,thonPEND itiz"` — the word "transcribe" was absent from
+every transcription this project ever produced. Six wrong tokens in 107,
+confirmed against three independent implementations. Nothing had ever turned the
+ids back into text; `tests/test-vibevoice-asr-prompt.cpp` now does, against a
+vocabulary slice read out of the shipped GGUF.
+
+**The audio loader resampled with linear interpolation.** `read_audio_data()`
+asked miniaudio for the target rate, so every conversion ran through
+`ma_resample_algorithm_linear`. A 10 kHz tone decoded to 16 kHz — above Nyquist,
+must vanish — survived at **-10.3 dB** and folded to 6 kHz, inside the speech
+band; 48 -> 16 kHz measured cos 0.702 against soxr. That hit every backend on any
+44.1/48 kHz file. Now decodes at the file's own rate and resamples with the
+Kaiser sinc already in the tree (`CRISPASR_HQ_RESAMPLE=0` restores the old path).
+
+**`[Silence]` reached the transcript.** It is a Content value the MODEL emits; it
+appears nowhere in this codebase. Passing it through put the literal string in
+SRTs over non-silent speech AND suppressed the "no text produced" warning, which
+is gated on there being no text. The subtle half was the fallback: both consumers
+treated "no segments" as "not a transcript blob" and handed back the raw JSON, so
+filtering alone would have printed the whole object.
+
+Also: exact-erf GELU where `ACT2FN["gelu"]` is erf and ggml_gelu is the tanh
+approximation (cosine cannot see it — 0.999926 vs 0.999927 — the NORM can:
+494.188 -> 494.320 against 494.319); `GGML_PREC_F32` on the ASR attention as
+audio.cpp sets, measured identical on P100 so consistency insurance rather than a
+fix; a false `CAP_TEMPERATURE` that suppressed the warning telling the reporter
+`-tp` was unwired; and `--seed` never plumbed into transcribe at all.
+
+**The reference was the other thing I got wrong.** `tools/reference_backends/vibevoice.py`
+reimplemented the sigma-VAE in PyTorch "matching the C++ graph step by step" — a
+shape that cannot falsify the runtime's assumptions. It had F.silu where upstream
+has GELU, which made every ConvNeXt stage look like the divergence and nearly got
+the correct runtime "fixed" to match; after that, the resampler kept the number
+wrong. Rebuilt on upstream's own `TokenizerEncoder`, with identical 24 kHz input
+the runtime reads **cos 0.999926** at `speech_features`. There was never an
+acoustic-conditioning gap; the 0.83 / 0.95 / 0.97 figures published to the issue
+are withdrawn.
+
+Kernels: `tools/kaggle/vibevoice-369-fullmodel`, `tools/kaggle/vibeasr-bitnet-lm-precision`.
+Commits `b6efe1de`, `ac4aa478`, `e68664c7`, `26076da0`, `23107227`, `824c934d`,
+`3b1bc0b2`, `0627047b`, `51b99d1b`.
+
+---
+
 ## ark-asr empty transcripts, and a diff harness that could not see it — merged 2026-08-18
 
 `ark_asr.cpp` built the prompt as `<|user|><|begin_of_audio|>…<|end_of_audio|><|assistant|>`,

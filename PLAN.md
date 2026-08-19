@@ -7,136 +7,42 @@ Review PR #352 end to end, validate that its long-form routing and gap repair
 do not regress any language path, add targeted unit/live coverage where needed,
 and merge or improve the change after local/SSD validation.
 
-## RESOLVED 2026-08-19 — vibevoice ASR language flip (#369): input normalisation
+## OPEN 2026-08-19 — vibevoice-asr 7B answers "[Silence]" on time-stretched audio
 
-**The full model's language flip is fixed, and the cause is the -25 dBFS input
-normalisation.** Upstream normalises the waveform to -25 dBFS RMS before the
-sigma-VAE encoders; audio.cpp does the same in its frontend
-(`VibeVoiceASRFrontend::normalize`, gated on `normalize_audio` / `target_dB_FS`).
-Our ASR path did not — the helper existed but was wired only into TTS voice
-cloning. Fixed in `b7a1a71c`.
+The transcript-side damage is FIXED (`3b1bc0b2`, see HISTORY): `[Silence]` is a
+Content value the MODEL emits and we no longer pass it through as transcript
+text, so it cannot reach an SRT or suppress the empty-transcript warning.
 
-Bisected on Kaggle (P100, `tools/kaggle/vibevoice-369-fullmodel`, run 2), full
-7B `vibevoice-asr-q4_k.gguf`, on the reporter's `ko-mic-cue-lost.wav`:
-
-    arm                                        result
-    fixed (current main)                       내일 오전에 회의 자료를 보내주세요.  EXACT
-    legacy   (prompt + resampler rolled back)  내일 오전에 회의 자료를 보내주세요.  EXACT
-    nonorm   (only -25 dBFS rolled back)       ในอุจจาระ ให้จัดรูปผลิติเซลล์        THAI
-    v0829    (all four rolled back)            ในโอริจินอล ที่จัดดูรูปโน้ตเซลล์      THAI
-
-The reporter measured exactly "Thai" on this file at q4_k AND q8_0. One flag
-reproduces it and removes it, so this is causation, not correlation. It also
-answers "why does audio.cpp get this file right and we do not": audio.cpp
-normalises, 0.8.29 did not.
-
-⚠ **My earlier report on this was wrong, and the reason is worth keeping.** I
-measured the -25 dBFS fix on the BITNET checkpoint only, saw the cue still lost,
-and told the issue "the fix takes effect but it does not fix your issue". BitNet
-is a different, weaker checkpoint that is wrong on most of these files no matter
-what — it cannot discriminate. A fix must be measured on a checkpoint that is
-capable of getting the answer right.
-
-**Current state, full 7B q4_k, all three real fixtures EXACT** (ko-test,
-ko-mic-cue-kept, ko-mic-cue-lost) on CPU and CUDA alike.
-
-**Also fixed along the way** (all real, none of them the cause):
-  * the ASR prompt's hardcoded ids decoded to " configuration audio,thonPEND
-    itiz" — the word "transcribe" was absent (`b6efe1de`, guarded by
-    `tests/test-vibevoice-asr-prompt.cpp`)
-  * the audio loader resampled with miniaudio linear interpolation: a 10 kHz
-    tone survived at -10.3 dB into a 16 kHz stream (`ac4aa478`)
-  * tanh-approximation GELU where upstream uses exact erf (`e68664c7`)
-  * a false `CAP_TEMPERATURE` that suppressed the "unsupported" warning
-    (`23107227`)
-  * `ggml_flash_attn_ext_set_prec(GGML_PREC_F32)`, as audio.cpp sets
-    (`824c934d`) — MEASURED on P100 CUDA: identical output with and without, so
-    it is consistency insurance, not a fix
-
-**ELIMINATED, with evidence — do not re-chase:**
-  * the sigma-VAE encoder / connectors: cos 0.999926 vs upstream's own modules
-    on identical 24 kHz input.
-  * TQ2_0 vs upstream I2_S weights: 2 differing weights in 13.76 M.
-  * conv padding, `speech_scaling_factor`, GPU-vs-CPU divergence (CUDA and CPU
-    agree character-for-character on every file).
-
-## SOLVED 2026-08-19 — vibevoice-bitnet Korean: we sent the 1.5B the 7B's prompt
-
-The BitNet half of #369 was the PROMPT FORMAT, and Microsoft's own runtime says
-so in a comment — VibeASR.cpp `utils/prompt_builder.h`:
-
-    // "text" format (1.5B model, plain text output):
-    //   "This is a X.XX seconds audio, please transcribe it."
-    // "json" format (7B model, JSON output with keys):
-    //   "This is a X.XX seconds audio, please transcribe it with these keys: ..."
-
-and it DEFAULTS to text. VibeVoice-ASR-BitNet is the 1.5B; we sent it the JSON
-form, because our prompt came from microsoft/VibeVoice's PYTHON processor, which
-only targets the 7B. Fixed in `51b99d1b`, keyed on d_lm.
-
-    clip              JSON (before)                    plain text (now)
-    ko-test           네, 오늘은 해외 자료를 보내주세요.     내일 오전에 회의 자료를 보내주세요.  EXACT
-    ko-mic-cue-kept   내일 오전에 회의 자료 교육 …          내일 오전에 회의 자료를 보내주세요.  EXACT
-    ko-mic-cue-lost   Nếu ồ trên này … (VIETNAMESE)     늘 옷은 에 회의자 두를 보낼 수요.  KOREAN
-    flip-ko           네, 오늘은 해외 자료를 …             내일 오전에 회차를 보내주세요.
-    flip-en           English                          French (still flips)
-
-`ko-mic-cue-lost` keeps its language for the first time. JFK unaffected.
-
-**How it was found, since the route matters more than the answer.** Every
-numerical avenue had been eliminated — weights equal to upstream's I2_S to 2
-values in 13.76 M, σ-VAE at cos 0.999926, LM storage (TQ2_0/Q8_0/F16)
-character-identical, and BitNet's per-token activation quantization implemented
-and measured immaterial. What broke it open was READING the reference
-implementation's source instead of continuing to measure our own. The answer was
-in a comment.
-
-**Eliminated on the way, all still true and all worth not re-chasing:**
-  * TQ2_0 is a faithful ternary container (F16 storage of the same values is
-    character-identical).
-  * BitNet's per-token `activation_quant` is implemented
-    (`CRISPASR_VIBEVOICE_BITNET_ACT_QUANT=1`, CPU-only via ggml_map_custom1) and
-    changes nothing on 4 of 5 clips — verified a real null by sabotaging the
-    callback and watching the output collapse.
-  * `lm_head` is byte-identical to `embed_tokens`; every GGUF hyperparameter
-    matches the HF config.
-
-**Follow-up, deliberately not done on the way past:** in text mode the 1.5B
-returns prose, so there are no per-utterance timings or speaker labels — that is
-what "plain text output" means upstream. `vibevoice-bitnet` still advertises
-CAP_DIARIZE and CAP_TIMESTAMPS_CTC. Either those should go for the 1.5B, or the
-adapter should switch to =json when the user actually asks for diarization. Needs
-a decision, not a reflex.
-
-## PARTLY FIXED 2026-08-19 — vibevoice-asr "[Silence]" reached the transcript
-
-**Fixed: the marker no longer leaks into user output** (`3b1bc0b2`).
-`[Silence]` is a Content value the MODEL emits — it appears nowhere in this
-codebase — because VibeVoice-ASR is trained on JSON transcripts that LABEL
-non-speech instead of transcribing it. We passed it through as segment text, so
-an SRT carried the literal string over plainly non-silent audio, and the CLI's
-"no text produced for N s of non-silent audio" warning could not fire because
-there WAS text. A slow or stretched passage inside a long recording was dropped
-in silence. `core_vibevoice::is_non_speech_marker()` now drops it in core/, so
-both the CLI adapter and the session C-ABI get it.
-
-⚠ The trap: both consumers treated "no segments" as "not a transcript blob" and
-fell back to the RAW JSON, so filtering alone would have printed the whole
-object, marker included. Both now record that the blob parsed BEFORE filtering.
-
-**Still open: why the 7B says it at all.** Both members of the reporter's atempo
-pair (`ko-test` stretched 3.26 s -> ~6 s at atempo 0.535 / 0.525) come back with
-no utterance, on CPU and CUDA, in every arm including one with all four #369
-fixes rolled back — so this is not something we introduced. The 1.5B BitNet
-checkpoint transcribes the same two files, so it is specific to the 7B
-checkpoint. The user-visible damage is now contained (they get "no transcript"
-rather than a fake one), but a 2x time-stretch is not exotic input.
+Still open: why the 7B says it at all. Both members of the reporter's atempo pair
+(`ko-test` stretched 3.26 s -> ~6 s at atempo 0.535 / 0.525) come back with no
+utterance, on CPU and CUDA, in EVERY arm including one with all four #369 fixes
+rolled back — so this is not something we introduced. The 1.5B BitNet checkpoint
+transcribes the same two files, so it is specific to the 7B. A 2x time-stretch is
+not exotic input, and a long recording containing a slow passage would lose it.
 
 Next: dump `speech_features` for a stretched clip against its unstretched
-original. The encoder is trustworthy now (cos 0.999926 vs upstream), so if the
-conditioning is fine the divergence is the LM's, and the prompt's duration
-string ("This is a 6.11 seconds audio") against 46 speech tokens is the first
-thing to check for an inconsistency the model could read as "mostly empty".
+original. The encoder is trustworthy now (cos 0.999926 vs upstream's own
+modules), so if the conditioning matches, the divergence is the LM's. Also check
+the prompt's duration string ("This is a 6.11 seconds audio") against the 46
+speech tokens for an inconsistency the model could read as "mostly empty".
+
+## OPEN 2026-08-19 — vibevoice-bitnet advertises caps its default output cannot support
+
+Fallout from `51b99d1b`, recorded rather than fixed on the way past. The 1.5B now
+gets its own plain-text instruction, and in that mode it returns prose rather
+than the JSON array — which is what "plain text output" means upstream. So there
+are no per-utterance timings and no speaker labels, while `vibevoice-bitnet`
+still declares `CAP_DIARIZE` and `CAP_TIMESTAMPS_CTC`.
+
+That is the same class of false claim as the `CAP_TEMPERATURE` removed in
+`23107227`: a capability bit is a promise about output the framework then acts
+on. Two defensible fixes and they need a decision, not a reflex:
+  (a) drop both caps for the 1.5B — honest, and `--diarize` then warns; or
+  (b) have the adapter switch to `CRISPASR_VIBEVOICE_ASR_PROMPT=json` when the
+      user actually asks for diarization or timestamps, trading the non-English
+      quality back for the structure they asked for.
+(b) is friendlier but makes output quality depend on an unrelated flag, which is
+the kind of thing that gets rediscovered as a bug later.
 
 ## OPEN 2026-08-18 — TQ2_0 has no Metal kernels: BitNet models are silent on GPU
 
