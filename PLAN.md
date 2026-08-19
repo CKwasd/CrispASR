@@ -37,6 +37,26 @@ Still open on the general quality front (separate from #375): the
 pre-existing linear-resampler gap on 44.1/48 kHz compressed input via the
 glint decode paths (~28 vs ~38 dB after the decoder fix).
 
+**Canary speed audit (2026-08-19, M1 Metal, warm medians).** GPU default is
+19–25× RT (132 s in 5.34 s); CPU `-ng` is 2.7× — any doc/bench quoting ~2×
+was a `-ng` run. Quant A/B on the same clip: **q4_k is the fastest**
+(enc 399 / dec 230 ms) vs q8_0 (418/297) vs F16 (382/380) — the decoder is
+weight-bandwidth-bound, the encoder quant-INVARIANT, i.e. compute-bound at
+~600 effective GFLOPS (≈ M1 mul_mm ceiling for ~680 GFLOP per 34 s chunk of
+the 32-layer FastConformer): no encoder headroom on this hardware. Cross-KV
+already lives on the decode backend (the "CPU buffer" comment at
+`canary_build_cross_kv` is stale). Two real levers remain, both proper
+graph projects with mandatory byte-identical Metal+CPU A/B and Kaggle CUDA
+validation before any default flip:
+1. **Persistent decoder step graph** — `canary_decode_step` rebuilds +
+   sched-allocs per token (~4.2 ms/tok on Metal, mostly build/alloc/launch,
+   not FLOPs). The `core_rnnt_ggml::Decoder` pattern took parakeet decode
+   5.3× / nemotron 12.4× on P100; here decode is ~35 % of GPU wall →
+   est. ~1.3× total on Metal, more on CUDA.
+2. **Chunk-batched encode/decode for long-form** — the NeMo blueprint runs
+   chunks at batch_size=8; we encode+decode the 30–40 s chunks
+   sequentially. Mostly a CUDA/utilization win.
+
 ## CLAIMED 2026-08-13 — PR #347 GGUF weight-mapping release review
 
 Worktree: `.claude/worktrees/review-pr-352`.

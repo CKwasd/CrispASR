@@ -6,6 +6,53 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #375 canary "repeated phrases" — two real bugs, neither where the bisect pointed, fixed 2026-08-19
+
+A reporter's canary quality regressed after an upgrade: phrases repeated a few
+times before recognition continued, on every quantization, CUDA and CPU alike.
+Their bisect window turned out wrong (they later withdrew it), but chasing it
+methodically surfaced **two real, independent defects**, both fixed the same day:
+
+**1. glint's AAC-LC decoder mis-decoded every real-world `.aac` to ~17 dB SNR**
+(bitrate-independent — 96k and 192k both). It parsed and DISCARDED
+`window_shape` (sine synthesis against the KBD analysis windows ffmpeg/Apple/fdk
+emit on most frames breaks MDCT perfect reconstruction) and its TNS decode was
+wrong five ways (skipped on short windows entirely, no `tns_max_bands` clamp,
+direction ignored, one filter max, hardcoded 4-bit dequant). Invisible to every
+glint gate because the roundtrip tests own both sides of the contract — glint's
+own encoder emits neither KBD nor short-window TNS. Fixed upstream (glint
+`77738f3`, 17.7→67.3 dB at 16 kHz), synced in-tree (`0e5d1344`), gated by a
+red-verified foreign-decode SNR floor (old decoder 16.4 dB FAIL). Found because
+"all quants + all backends identical" is an **input-path signature** — compute
+bugs vary by backend — and because the window's WAV-only probes could not rule
+out formats whose ROUTING changed.
+
+**2. The reporter's actual bug: canary's long-form chunking was parakeet
+machinery wearing a canary comment.** `canary_transcribe_streamed` split ALL
+audio into 8 s chunks / 2 s overlap over a globally-normalized mel and merged
+seams with an LCS prefix-drop + word-snap + splice-punctuation heuristics; the
+comment cited NeMo's `FrameBatchMultiTaskAED` — which actually joins
+NON-overlapping chunks with `" ".join`, and canary-1b-v2's shipped
+`.transcribe()` does something else again: dynamic 30..40 s RAW-WAVEFORM chunks
+(size maximizing the last chunk), 1 s overlap, per-chunk normalization, and
+`lcs_alignment_merge_buffer` anchoring the seam in token space. Ported exactly
+(`core/canary_chunk_merge.h`, `8219b429`), pinned by unit vectors generated
+from the nemo 2.7.3 Python functions, old path kept behind
+`CRISPASR_CANARY_LEGACY_STREAM=1`. The reporter's 12 s sample reproduces
+byte-for-byte under the legacy gate and transcribes cleanly on the new default;
+jfk_x12 (quote ×12) went from "ask not Ask not"-riddled to 12 clean
+repetitions; decoded-output acceptance vs NeMo itself (Kaggle,
+`tools/kaggle/canary-blueprint-ref/`): word similarity 1.000 / 1.000 / 0.982 on
+132 s / 59 s / 594 s clips, q4_k vs bf16. Also fixed en route: the session
+C-ABI had single-passed ALL audio — and single-pass past the 40 s trained
+window EOSes early (a 59 s file lost everything after ~45 s), so chunking is
+REQUIRED for long audio, not just nicer.
+
+The trap that cost two prior sessions: a "reproduction" of the symptom on main
+that was never diffed against the good commit on the same file (the seam
+artifacts predated the window), and a file-path-scoped search ("the only canary
+commit in the window") that by construction cannot see cross-cutting changes.
+
 ## #369 VibeVoice-ASR Korean language flip — five defects, merged 2026-08-19
 
 A reporter showed `vibevoice-bitnet` losing Korean entirely on borderline audio
