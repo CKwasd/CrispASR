@@ -53,7 +53,7 @@ EXEMPT_SUBSTRINGS = ("arm64", "aarch64", "android", "wasm", "macos", "xcframewor
 
 
 def jobs(lines: list[str]) -> list[tuple[str, int, int]]:
-    start = next(i for i, l in enumerate(lines) if re.match(r"^jobs:\s*$", l))
+    start = next(i for i, line in enumerate(lines) if re.match(r"^jobs:\s*$", line))
     marks: list[tuple[int, str]] = []
     for i in range(start + 1, len(lines)):
         m = re.match(r"^  ([A-Za-z0-9_-]+):", lines[i])
