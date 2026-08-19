@@ -60,7 +60,7 @@ ko-mic-cue-kept, ko-mic-cue-lost) on CPU and CUDA alike.
   * conv padding, `speech_scaling_factor`, GPU-vs-CPU divergence (CUDA and CPU
     agree character-for-character on every file).
 
-## CLOSED 2026-08-19 — vibevoice-bitnet Korean: NOT a port defect (#369 title claim)
+## OPEN 2026-08-19 — vibevoice-bitnet Korean: five causes eliminated, one control unexplained
 
 The BitNet checkpoint transcribes Korean worse than the full model and worse
 than the official demo. Every axis we control is now eliminated, the last one by
@@ -92,18 +92,35 @@ identical pipeline. `lm_head` is byte-identical to `embed_tokens`, so the tying
 fallback is exact. Every GGUF hyperparameter matches the HF config, `rope_theta`
 included.
 
-**So the fix is documentation, and it is a real one.** The model card claimed
-"pick any file — quality is identical across all variants ... zero degradation",
-verified on JFK alone, while listing seven languages. Variant equivalence and
-model quality are different claims and the card ran them together.
+**⚠ But this is elimination without a positive control, and one data point
+still contradicts "the checkpoint is simply weak".** The official demo Space runs
+the SAME BitNet checkpoint through Microsoft's VibeASR.cpp and returns `ko-test`
+EXACTLY (`내일 오전에 회의 자료를 보내주세요.`); we return
+`네, 오늘은 해외 자료를 보내주세요.` A weak checkpoint does not explain a
+reference implementation getting it right. So something still differs, and by
+elimination it is inside VibeASR.cpp's runtime.
+
+**audio.cpp cannot arbitrate this one.** Verified against the local clone: zero
+occurrences of bitnet / ternary / i2_s / tq2_0, and its ggml type list stops at
+Q8_0/Q6_K. It cannot load a ternary checkpoint at all. The audio.cpp cross-check
+in #369 was only ever about the FULL model, which is resolved.
+
+**Next step — the only remaining control.** Build Microsoft's VibeASR.cpp and run
+`vibeasr-lm-i2_s-embed-q6_k.gguf` (shipped in microsoft/VibeVoice-ASR-BitNet) on
+the same clips. That is the one comparison that can distinguish "checkpoint" from
+"runtime", and it is what the demo Space is. If it reproduces the demo's exact
+Korean on the same audio we feed ours, the gap is ours and the search resumes
+inside the LM with a trustworthy reference; if it does not, the demo result was
+not reproducible and the checkpoint conclusion stands.
+
+**Card fixed regardless, and it was a real error.** It claimed "pick any file —
+quality is identical across all variants ... zero degradation", verified on JFK
+alone, while listing seven languages. Variant equivalence and model quality are
+different claims and the card ran them together.
 `hf_readmes/vibevoice-asr-bitnet-GGUF.md` (previously absent — the card had no
 local source at all) now scopes the equivalence claim, records the LM-precision
 result, and states the measured Korean gap with the full model as the remedy.
-
-⚠ Do not spend more time on "our BitNet port is broken". It is not. If someone
-wants to close the remaining gap with the demo, the only untested difference is
-VibeASR.cpp itself, and our numerics are provably insensitive to the one axis
-that runtime differs on.
+That much is independent of how the runtime question lands.
 
 ## PARTLY FIXED 2026-08-19 — vibevoice-asr "[Silence]" reached the transcript
 

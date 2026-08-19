@@ -100,13 +100,21 @@ The model card used to list seven languages and verify one. Measured on Korean
 | mic recording | `내일 오전에 회의 자료 교육 보내주세요.` | `내일 오전에 회의 자료를 보내주세요.` ✅ |
 | mic recording, pitch-shifted | `Nếu ồ trên này, …` (Vietnamese) | `내일 오전에 회의 자료를 보내주세요.` ✅ |
 
-English is unaffected — JFK is exact. This is the ternary checkpoint's own
-capability on harder non-English material, not a conversion or runtime defect:
-the σ-VAE encoder matches upstream's own modules at cos 0.999926 on identical
-24 kHz input, the ternary weights differ from upstream's I2_S in 2 values out of
-13.76 M, and the table above shows the LM's numerics are insensitive to storage
-precision. The full model gets every one of these right through the *same*
-CrispASR pipeline.
+English is unaffected — JFK is exact.
+
+Everything we can measure says this is the ternary checkpoint's own capability
+rather than a conversion defect: the σ-VAE encoder matches upstream's own modules
+at cos 0.999926 on identical 24 kHz input, the ternary weights differ from
+upstream's I2_S in 2 values out of 13.76 M, the table above shows the LM's
+numerics are insensitive to storage precision, and the full model gets every one
+of these right through the *same* CrispASR pipeline.
+
+**One caveat, stated because it is not settled:** Microsoft's own demo Space
+reportedly transcribes the first clip exactly using this same checkpoint through
+VibeASR.cpp. A weak checkpoint would not explain that, so a runtime difference we
+have not found may remain. Tracked in
+[#369](https://github.com/CrispStrobe/CrispASR/issues/369). Either way the
+guidance is the same — use the full model when the language matters.
 
 Use this checkpoint for its size and for English; reach for the full model when
 the language matters.
