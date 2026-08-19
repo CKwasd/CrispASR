@@ -1223,6 +1223,67 @@ extern "C" float* vibevoice_run_connector(struct vibevoice_context* ctx, const c
     return out;
 }
 
+// ── BitNet activation quantization (#369) ───────────────────────────────────
+//
+// TQ2_0 gives us BitNet's WEIGHTS; it is a ternary container, not BitNet's
+// inference. b1.58's forward has two halves and we only ever implemented one:
+//
+//     weights      s = 1/mean(|w|); round(w*s).clamp(-1,1)/s      <- the converter
+//     activations  s = 127/max(|x|) PER TOKEN; round(x*s).clamp/s <- was missing
+//
+// The model was TRAINED with quantized activations, so feeding it unquantized
+// ones is a divergence rather than an improvement — the same shape of mistake as
+// handing a sigma-VAE its mean instead of a sample.
+//
+// ⚠ CPU-ONLY, and opt-in for that reason. ggml has no row-wise absmax, so this
+// goes through ggml_map_custom1, which no GPU backend implements — enabling it
+// on a GPU build drags those nodes onto the CPU. It exists to MEASURE whether
+// the missing half matters (CRISPASR_VIBEVOICE_BITNET_ACT_QUANT=1). If it does,
+// the answer is real kernels in the ggml fork, not this.
+//
+// The reference returns the DEQUANTIZED value (divided back by the scale), so
+// this is a pure element-wise rounding of x and needs no custom matmul.
+static void vibevoice_bitnet_act_quant_cb(ggml_tensor* dst, const ggml_tensor* a, int ith, int nth, void* ud) {
+    (void)ud;
+    const int64_t ne0 = a->ne[0]; // features of one token
+    const int64_t nrows = ggml_nrows(a);
+    for (int64_t r = ith; r < nrows; r += nth) {
+        const float* src = (const float*)((const char*)a->data + r * a->nb[1]);
+        float* out = (float*)((char*)dst->data + r * dst->nb[1]);
+        float amax = 0.0f;
+        for (int64_t i = 0; i < ne0; i++) {
+            const float v = fabsf(src[i]);
+            if (v > amax)
+                amax = v;
+        }
+        if (amax < 1e-5f) // clamp_(min=1e-5), as the reference does
+            amax = 1e-5f;
+        const float scale = 127.0f / amax;
+        for (int64_t i = 0; i < ne0; i++) {
+            float q = roundf(src[i] * scale);
+            if (q > 127.0f)
+                q = 127.0f;
+            if (q < -128.0f)
+                q = -128.0f;
+            out[i] = q / scale;
+        }
+    }
+}
+
+static bool vibevoice_bitnet_act_quant_enabled() {
+    static const bool on = [] {
+        const char* v = crispasr_env::get("CRISPASR_VIBEVOICE_BITNET_ACT_QUANT");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+static ggml_tensor* vibevoice_aq(ggml_context* ctx, ggml_tensor* x) {
+    if (!vibevoice_bitnet_act_quant_enabled())
+        return x;
+    return ggml_map_custom1(ctx, x, vibevoice_bitnet_act_quant_cb, GGML_N_TASKS_MAX, nullptr);
+}
+
 // Defined below, next to the MT19937 it shares with the TTS diffusion sampler.
 static void vibevoice_sample_acoustic_posterior(std::vector<float>& at_mean, uint32_t seed, int verbosity);
 
@@ -1613,13 +1674,17 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
                 int Lk = n_past + T_cur;
 
                 // Q, K, V projections with bias
-                ggml_tensor* Q = ggml_mul_mat(ctx0, q_w, cur);
+                // BitNet quantizes the INPUT of every projection, so q/k/v share a
+                // single quantization of `cur` — what one activation_quant()
+                // ahead of three BitLinears does.
+                ggml_tensor* cur_q = vibevoice_aq(ctx0, cur);
+                ggml_tensor* Q = ggml_mul_mat(ctx0, q_w, cur_q);
                 if (q_b)
                     Q = ggml_add(ctx0, Q, q_b);
-                ggml_tensor* K = ggml_mul_mat(ctx0, k_w, cur);
+                ggml_tensor* K = ggml_mul_mat(ctx0, k_w, cur_q);
                 if (k_b)
                     K = ggml_add(ctx0, K, k_b);
-                ggml_tensor* V = ggml_mul_mat(ctx0, v_w, cur);
+                ggml_tensor* V = ggml_mul_mat(ctx0, v_w, cur_q);
                 if (v_b)
                     V = ggml_add(ctx0, V, v_b);
 
@@ -1686,7 +1751,7 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
                     ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
 
                 attn_out = ggml_reshape_2d(ctx0, attn_out, hp.d_lm, T_cur);
-                attn_out = ggml_mul_mat(ctx0, o_w, attn_out);
+                attn_out = ggml_mul_mat(ctx0, o_w, vibevoice_aq(ctx0, attn_out));
 
                 cur = ggml_add(ctx0, residual, attn_out);
             }
@@ -1695,9 +1760,22 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
             residual = cur;
             cur = ggml_rms_norm(ctx0, cur, 1e-6f);
             cur = ggml_mul(ctx0, cur, G(std::string(p) + ".ffn_ln.weight"));
-            ggml_tensor* ffn =
-                core_ffn::swiglu(ctx0, cur, G(std::string(p) + ".ffn.gate.weight"),
-                                 G(std::string(p) + ".ffn.up.weight"), G(std::string(p) + ".ffn.down.weight"));
+            ggml_tensor* gate_w = G(std::string(p) + ".ffn.gate.weight");
+            ggml_tensor* up_w = G(std::string(p) + ".ffn.up.weight");
+            ggml_tensor* down_w = G(std::string(p) + ".ffn.down.weight");
+            ggml_tensor* ffn = nullptr;
+            if (vibevoice_bitnet_act_quant_enabled()) {
+                // swiglu() inlined so down_proj's input is quantized too. It is a
+                // BitLinear like the other six, and covering only the easy call
+                // sites would make a null result meaningless.
+                ggml_tensor* cur_q = vibevoice_aq(ctx0, cur);
+                ggml_tensor* gate = ggml_mul_mat(ctx0, gate_w, cur_q);
+                ggml_tensor* up = ggml_mul_mat(ctx0, up_w, cur_q);
+                ggml_tensor* mlp = ggml_mul(ctx0, ggml_silu(ctx0, gate), up);
+                ffn = ggml_mul_mat(ctx0, down_w, vibevoice_aq(ctx0, mlp));
+            } else {
+                ffn = core_ffn::swiglu(ctx0, cur, gate_w, up_w, down_w);
+            }
             cur = ggml_add(ctx0, residual, ffn);
         }
 
