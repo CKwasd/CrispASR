@@ -60,6 +60,51 @@ ko-mic-cue-kept, ko-mic-cue-lost) on CPU and CUDA alike.
   * conv padding, `speech_scaling_factor`, GPU-vs-CPU divergence (CUDA and CPU
     agree character-for-character on every file).
 
+## CLOSED 2026-08-19 — vibevoice-bitnet Korean: NOT a port defect (#369 title claim)
+
+The BitNet checkpoint transcribes Korean worse than the full model and worse
+than the official demo. Every axis we control is now eliminated, the last one by
+direct measurement on Kaggle (`tools/kaggle/vibeasr-bitnet-lm-precision`).
+
+**The last live hypothesis was activation quantization.** ggml's TQ2_0
+multiplies against block-quantized int8 activations; Microsoft's I2_S kernel
+quantizes them per token. `--lm-quant {tq2_0,f16,f32,q8_0}` (new) stores the SAME
+ternary values — `ternary_quantize()` has already collapsed them to
+`{-mean, 0, +mean}` — so only the ggml matmul path moves. Three builds from the
+official checkpoint, VAE and embedding pinned at q8_0:
+
+    LM stored as   size      activations              result
+    TQ2_0          1.41 GB   block-quantized int8     baseline
+    Q8_0           2.46 GB   per-32-block int8        character-identical
+    F16            3.69 GB   NOT QUANTIZED            character-identical
+
+Identical on all four clips. **F16 activations are strictly more accurate than
+I2_S's per-token int8, so if activation quantization were the cause F16 would
+have moved the answer. It did not.** That also kills the near-tie theory: the
+model is confidently wrong, not balanced on a knife edge that numerics could
+tip.
+
+**Everything else was already eliminated:** ternary weights differ from upstream
+I2_S in 2 values out of 13.76 M; σ-VAE + connectors at cos 0.999926 vs upstream's
+own modules on identical 24 kHz input; prompt, -25 dBFS normalisation and
+resampler all fixed, and the FULL 7B is exact on every real fixture through the
+identical pipeline. `lm_head` is byte-identical to `embed_tokens`, so the tying
+fallback is exact. Every GGUF hyperparameter matches the HF config, `rope_theta`
+included.
+
+**So the fix is documentation, and it is a real one.** The model card claimed
+"pick any file — quality is identical across all variants ... zero degradation",
+verified on JFK alone, while listing seven languages. Variant equivalence and
+model quality are different claims and the card ran them together.
+`hf_readmes/vibevoice-asr-bitnet-GGUF.md` (previously absent — the card had no
+local source at all) now scopes the equivalence claim, records the LM-precision
+result, and states the measured Korean gap with the full model as the remedy.
+
+⚠ Do not spend more time on "our BitNet port is broken". It is not. If someone
+wants to close the remaining gap with the demo, the only untested difference is
+VibeASR.cpp itself, and our numerics are provably insensitive to the one axis
+that runtime differs on.
+
 ## PARTLY FIXED 2026-08-19 — vibevoice-asr "[Silence]" reached the transcript
 
 **Fixed: the marker no longer leaks into user output** (`3b1bc0b2`).
