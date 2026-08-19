@@ -60,22 +60,35 @@ ko-mic-cue-kept, ko-mic-cue-lost) on CPU and CUDA alike.
   * conv padding, `speech_scaling_factor`, GPU-vs-CPU divergence (CUDA and CPU
     agree character-for-character on every file).
 
-## OPEN 2026-08-19 — vibevoice-asr 7B answers "[Silence]" on heavily time-stretched audio
+## PARTLY FIXED 2026-08-19 — vibevoice-asr "[Silence]" reached the transcript
 
-Found while closing #369, and NOT caused by anything in that work — it
-reproduces identically in the `v0829` arm with every fix rolled back.
+**Fixed: the marker no longer leaks into user output** (`3b1bc0b2`).
+`[Silence]` is a Content value the MODEL emits — it appears nowhere in this
+codebase — because VibeVoice-ASR is trained on JSON transcripts that LABEL
+non-speech instead of transcribing it. We passed it through as segment text, so
+an SRT carried the literal string over plainly non-silent audio, and the CLI's
+"no text produced for N s of non-silent audio" warning could not fire because
+there WAS text. A slow or stretched passage inside a long recording was dropped
+in silence. `core_vibevoice::is_non_speech_marker()` now drops it in core/, so
+both the CLI adapter and the session C-ABI get it.
 
-The 7B model returns `[Silence]` for both members of the reporter's atempo pair
-(`ko-test` at atempo 0.535 / 0.525, i.e. a 3.26 s clip stretched to ~6 s), on CPU
-and CUDA. It generates 23 tokens and the JSON it emits carries no utterance. The
-BitNet 1.5B checkpoint transcribes the same two files without difficulty, so this
-is specific to the 7B checkpoint rather than to the pipeline.
+⚠ The trap: both consumers treated "no segments" as "not a transcript blob" and
+fell back to the RAW JSON, so filtering alone would have printed the whole
+object, marker included. Both now record that the blob parsed BEFORE filtering.
 
-Worth a look because `[Silence]` on clearly non-silent speech is a bad failure
-mode for long-form: if a stretched or slow passage inside a real recording gets
-the same treatment, it is dropped silently. Start by dumping `speech_features`
-for a stretched clip against its unstretched original — the encoder is now
-trustworthy (0.9999 vs upstream), so the divergence should be visible.
+**Still open: why the 7B says it at all.** Both members of the reporter's atempo
+pair (`ko-test` stretched 3.26 s -> ~6 s at atempo 0.535 / 0.525) come back with
+no utterance, on CPU and CUDA, in every arm including one with all four #369
+fixes rolled back — so this is not something we introduced. The 1.5B BitNet
+checkpoint transcribes the same two files, so it is specific to the 7B
+checkpoint. The user-visible damage is now contained (they get "no transcript"
+rather than a fake one), but a 2x time-stretch is not exotic input.
+
+Next: dump `speech_features` for a stretched clip against its unstretched
+original. The encoder is trustworthy now (cos 0.999926 vs upstream), so if the
+conditioning is fine the divergence is the LM's, and the prompt's duration
+string ("This is a 6.11 seconds audio") against 46 speech tokens is the first
+thing to check for an inconsistency the model could read as "mostly empty".
 
 ## OPEN 2026-08-18 — TQ2_0 has no Metal kernels: BitNet models are silent on GPU
 
