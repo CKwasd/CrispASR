@@ -5063,6 +5063,15 @@ catch_discover_tests(test-omnivoice-instruct
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test-vibevoice-asr-prompt — decode the hardcoded ASR prompt ids back into
+# text (#369). The old table's comment said "seconds audio, please transcribe it
+# with" while the ids said " configuration audio,thonPEND itiz"; nothing turned
+# them back into words, so it shipped. Hermetic: carries its own vocab slice.
+add_executable(test-vibevoice-asr-prompt test-vibevoice-asr-prompt.cpp)
+target_include_directories(test-vibevoice-asr-prompt PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-vibevoice-asr-prompt PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-vibevoice-asr-prompt)
+
 # ─── test-omnivoice-prompt — the assembled style prefix, i.e. the last thing the
 # model sees before tokenization. The resolvers had unit tests; the string they
 # feed was only ever checked by hand against the HF tokenizer, which needs a
