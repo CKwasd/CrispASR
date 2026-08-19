@@ -1657,9 +1657,33 @@ static char* vibevoice_transcribe_impl(struct vibevoice_context* ctx, const floa
                 // Permute Q for flash-attn: [hd, T, nh]
                 Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
 
-                // Flash attention (native GQA)
+                // Flash attention (native GQA).
+                //
+                // GGML_PREC_F32 is set explicitly, matching 0xShug0/audio.cpp
+                // (`attention_precision = GGML_PREC_F32` in its Qwen decoder) and
+                // the fp32 softmax/accumulation of the PyTorch reference.
+                //
+                // On CPU this is a NO-OP and was verified as one: ggml's
+                // ggml_compute_forward_flash_attn_ext dispatches GGML_PREC_DEFAULT
+                // and GGML_PREC_F32 to the same F32-accumulator kernel. It bites on
+                // GPU — ggml-metal-device.m branches on `fa_prec == GGML_PREC_F32`,
+                // and CUDA/Vulkan likewise pick an F16-accumulation path otherwise.
+                //
+                // That asymmetry matches the one thing #369's reporter could not
+                // explain: their Windows/Vulkan run and my macOS/CPU run agreed
+                // character-for-character on the file that keeps its language cue
+                // and diverged on the one that loses it. F16 accumulation is
+                // exactly where backend kernels differ, and only a knife-edge
+                // input surfaces it. CRISPASR_VIBEVOICE_ATTN_PREC=default restores
+                // ggml's default for A/B.
+                static const bool attn_prec_f32 = [] {
+                    const char* v = crispasr_env::get("CRISPASR_VIBEVOICE_ATTN_PREC");
+                    return !(v && strcmp(v, "default") == 0);
+                }();
                 ggml_tensor* attn_out =
                     ggml_flash_attn_ext(ctx0, Q, Kfull, Vfull, causal_mask, kvp.attn_scale, 0.0f, 0.0f);
+                if (attn_prec_f32)
+                    ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
 
                 attn_out = ggml_reshape_2d(ctx0, attn_out, hp.d_lm, T_cur);
                 attn_out = ggml_mul_mat(ctx0, o_w, attn_out);
