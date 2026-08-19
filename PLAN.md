@@ -7,117 +7,75 @@ Review PR #352 end to end, validate that its long-form routing and gap repair
 do not regress any language path, add targeted unit/live coverage where needed,
 and merge or improve the change after local/SSD validation.
 
-## OPEN 2026-08-19 — vibevoice ASR language flip (#369): three defects fixed, symptom not
+## RESOLVED 2026-08-19 — vibevoice ASR language flip (#369): input normalisation
 
-**The acoustic-conditioning theory in the previous version of this entry was
-wrong, and it was wrong because the reference was ours.** Rebuilt the reference
-on upstream's OWN modules (`TokenizerEncoder` / `SpeechConnector` from
-microsoft/VibeVoice, loaded from the checkpoint, taps taken between module
-calls) instead of the hand-written PyTorch copy in
-`tools/reference_backends/vibevoice.py`. Feeding both sides the SAME 24 kHz
-bytes:
+**The full model's language flip is fixed, and the cause is the -25 dBFS input
+normalisation.** Upstream normalises the waveform to -25 dBFS RMS before the
+sigma-VAE encoders; audio.cpp does the same in its frontend
+(`VibeVoiceASRFrontend::normalize`, gated on `normalize_audio` / `target_dB_FS`).
+Our ASR path did not — the helper existed but was wired only into TTS voice
+cloning. Fixed in `b7a1a71c`.
 
-    stage             cue-kept
-    at_enc_stage_6      0.999927
-    st_enc_stage_6      0.999943
-    speech_features     0.999926      |mine| 494.3200 vs |ref| 494.3192
+Bisected on Kaggle (P100, `tools/kaggle/vibevoice-369-fullmodel`, run 2), full
+7B `vibevoice-asr-q4_k.gguf`, on the reporter's `ko-mic-cue-lost.wav`:
 
-The sigma-VAE encoder and both connectors are correct. The 0.83, then 0.95, then
-0.97 numbers reported earlier were an artifact of (a) the hand-rolled reference's
-own bugs and (b) the input resampler, which the old measurement fed through.
+    arm                                        result
+    fixed (current main)                       내일 오전에 회의 자료를 보내주세요.  EXACT
+    legacy   (prompt + resampler rolled back)  내일 오전에 회의 자료를 보내주세요.  EXACT
+    nonorm   (only -25 dBFS rolled back)       ในอุจจาระ ให้จัดรูปผลิติเซลล์        THAI
+    v0829    (all four rolled back)            ในโอริจินอล ที่จัดดูรูปโน้ตเซลล์      THAI
 
-**FIXED — three real divergences, all confirmed against upstream:**
+The reporter measured exactly "Thai" on this file at q4_k AND q8_0. One flag
+reproduces it and removes it, so this is causation, not correlation. It also
+answers "why does audio.cpp get this file right and we do not": audio.cpp
+normalises, 0.8.29 did not.
 
-1. **The prompt was corrupted.** The hardcoded suffix ids said
-   `6546, 7699, 11, 4587, 38840, 432, 449` under a comment reading
-   `"seconds audio, please transcribe it with"`. They decode to
-   `" configuration audio,thonPEND itiz"` — the word "transcribe" was never in
-   the prompt. Plus a stray `\n` (198) before `<|im_end|>` in the system block.
-   Confirmed wrong by three independent sources that agree with each other:
-   microsoft/VibeVoice's `vibevoice_asr_processor.py`, the chat_template
-   transformers ships in `convert_vibevoice_asr_to_hf.py`, and audio.cpp's
-   `tokenizer_text.cpp`. Now in `src/core/vibevoice_asr_prompt.h` with
-   `tests/test-vibevoice-asr-prompt.cpp`, which DECODES the ids back to text
-   against an embedded slice of the real Qwen2.5 vocab (red-verified against the
-   old ids).
-2. **`ggml_gelu` where upstream uses exact erf.** `ACT2FN["gelu"]` is
-   `GELUActivation` (erf); `ggml_gelu` is the tanh approximation. audio.cpp picks
-   `GeluApproximation::ExactErf` in the same block. Cosine cannot see this
-   (0.999926 vs 0.999927) — the NORM can: 494.188 -> 494.320 against a reference
-   of 494.319. HARD RULE 2b in miniature.
-3. **The audio loader resampled with miniaudio's linear resampler.**
-   `read_audio_data()` asked `ma_decoder` for the target rate, so miniaudio
-   resampled with `ma_resample_algorithm_linear` (linear interpolation + a
-   4th-order LPF). Measured: a 10 kHz tone decoded to 16 kHz, where it is above
-   Nyquist and must vanish, survives at **-10.3 dB** and folds down to 6 kHz —
-   inside the speech band. So every 44.1/48 kHz file fed to any backend carried
-   audible alias. Upsampling 16 -> 24 kHz for vibevoice/kyutai was cos 0.944 vs
-   soxr_vhq. Now decodes at the file's native rate and resamples with
-   `core_audio::resample_polyphase` (cos 0.99997 vs soxr, -89 dB on the alias
-   test). `CRISPASR_HQ_RESAMPLE=0` restores the old path.
+⚠ **My earlier report on this was wrong, and the reason is worth keeping.** I
+measured the -25 dBFS fix on the BITNET checkpoint only, saw the cue still lost,
+and told the issue "the fix takes effect but it does not fix your issue". BitNet
+is a different, weaker checkpoint that is wrong on most of these files no matter
+what — it cannot discriminate. A fix must be measured on a checkpoint that is
+capable of getting the answer right.
 
-**The reported symptom is NOT fixed, and none of the three fixes it.** On the
-five Korean fixtures from the issue (bitnet embed-q8, CPU):
+**Current state, full 7B q4_k, all three real fixtures EXACT** (ko-test,
+ko-mic-cue-kept, ko-mic-cue-lost) on CPU and CUDA alike.
 
-  * the prompt fix leaves the two cue-kept files character-identical and turns
-    the three cue-lost files' wrong answers into different wrong answers;
-  * the resampler fix recovers Korean on `flip-ko` (atempo 0.525) and is
-    character-identical on three of the other four.
+**Also fixed along the way** (all real, none of them the cause):
+  * the ASR prompt's hardcoded ids decoded to " configuration audio,thonPEND
+    itiz" — the word "transcribe" was absent (`b6efe1de`, guarded by
+    `tests/test-vibevoice-asr-prompt.cpp`)
+  * the audio loader resampled with miniaudio linear interpolation: a 10 kHz
+    tone survived at -10.3 dB into a 16 kHz stream (`ac4aa478`)
+  * tanh-approximation GELU where upstream uses exact erf (`e68664c7`)
+  * a false `CAP_TEMPERATURE` that suppressed the "unsupported" warning
+    (`23107227`)
+  * `ggml_flash_attn_ext_set_prec(GGML_PREC_F32)`, as audio.cpp sets
+    (`824c934d`) — MEASURED on P100 CUDA: identical output with and without, so
+    it is consistency insurance, not a fix
 
 **ELIMINATED, with evidence — do not re-chase:**
+  * the sigma-VAE encoder / connectors: cos 0.999926 vs upstream's own modules
+    on identical 24 kHz input.
   * TQ2_0 vs upstream I2_S weights: 2 differing weights in 13.76 M.
-  * The sigma-VAE encoder / connectors: 0.9999 vs upstream on identical input.
-  * `speech_scaling_factor`: correctly not applied for ASR.
-  * Conv padding: matches upstream's `SConv1d._forward_non_streaming` exactly.
-  * "The conditioning divergence causes the flip": there is no conditioning
-    divergence.
+  * conv padding, `speech_scaling_factor`, GPU-vs-CPU divergence (CUDA and CPU
+    agree character-for-character on every file).
 
-**KNOWN, still divergent, opt-in.** Upstream's ASR path samples the acoustic
-posterior rather than using its mean (`encoder_output.sample('gaussian')`,
-fix_std 0.5 -> one scalar std ~ N(0, 0.625) per clip); audio.cpp does the same.
-We use the mean, i.e. the std=0 draw. Implemented behind
-`CRISPASR_VIBEVOICE_ASR_SAMPLE=1` — see the measurement recorded at the call
-site in `vibevoice_encode_speech`.
+## OPEN 2026-08-19 — vibevoice-asr 7B answers "[Silence]" on heavily time-stretched audio
 
-**Next step — HANDOFF, needs a box with RAM (VPS or Kaggle, not this Mac).**
+Found while closing #369, and NOT caused by anything in that work — it
+reproduces identically in the `v0829` arm with every fix rolled back.
 
-The one piece of evidence still pointing at us rather than at the model is the
-reporter's cross-check: audio.cpp's own q8_0 transcribes `ko-mic-cue-lost.wav`
-correctly where our q4_k AND our q8_0 both fail. Everything upstream of the LM
-is now proven equal against upstream itself, so the remaining divergence is in
-the LM forward or the decode.
+The 7B model returns `[Silence]` for both members of the reporter's atempo pair
+(`ko-test` at atempo 0.535 / 0.525, i.e. a 3.26 s clip stretched to ~6 s), on CPU
+and CUDA. It generates 23 tokens and the JSON it emits carries no utterance. The
+BitNet 1.5B checkpoint transcribes the same two files without difficulty, so this
+is specific to the 7B checkpoint rather than to the pipeline.
 
-⚠ Do NOT run this on the 16 GB Mac. The full ASR model is 4.8 GB (q4_k) / 8.8 GB
-(q8_0); loading it alongside a PyTorch reference forward hit 12 GB and had to be
-killed. The bitnet variant (1.05 GB) is fine here, but it is a DIFFERENT
-checkpoint, so it cannot answer the audio.cpp question.
-
-Run, in this order — the first three are cheap and two of them may close it:
-
-1. **Prompt ids on the full model.** `CRISPASR_VIBEVOICE_DUMP_DIR=<dir>` writes
-   `prompt_ids.bin` (int32). Decode it and diff against
-   `tests/test-vibevoice-asr-prompt.cpp`'s expected text. It should now be
-   byte-identical for both checkpoints — this is the cheap confirmation that
-   `b6efe1de` reached the full-model path too, not just bitnet.
-2. **`speech_features` vs upstream, full model.** `tools/dump_reference.py
-   --backend vibevoice --model-dir <full ASR checkpoint>` (needs
-   `CRISPASR_VIBEVOICE_SRC` or the vibevoice package). Expect ~0.999 as on
-   bitnet. If it is NOT, the full model's GGUF CONVERSION differs from the
-   bitnet one and that is the answer.
-3. **Step-0 logit-rank probe** (the MOSS-TTS #249 pattern in the diff-harness
-   section): prefill the identical prompt, dump `prefill_logits.bin`, and check
-   where upstream's greedy first token ranks in our distribution. Rank <= 1-2
-   with a small gap = quantization near-tie; far down = a real LM/head bug.
-   `prefill_logits.bin` is already written by the dump path.
-4. **Only if 1-3 are clean: cross-tap audio.cpp.** It is Apache-2.0 with
-   prebuilt CPU binaries, cloned at `/Volumes/backups/ai/audio.cpp`. Its
-   `speech_encoder.cpp` / `text_decoder.cpp` are the two places to add a dump.
-   Note its GGUF comes from its own converter, so a difference there is
-   "conversion + runtime" and still needs splitting.
-
-Fixtures: `samples/ko-369.wav` is tracked; the rest regenerate from the
-reporter's PowerShell + `ffmpeg -af atempo=` recipe in the issue, no files
-needed from them.
+Worth a look because `[Silence]` on clearly non-silent speech is a bad failure
+mode for long-form: if a stretched or slow passage inside a real recording gets
+the same treatment, it is dropped silently. Start by dumping `speech_features`
+for a stretched clip against its unstretched original — the encoder is now
+trustworthy (0.9999 vs upstream), so the divergence should be visible.
 
 ## OPEN 2026-08-18 — TQ2_0 has no Metal kernels: BitNet models are silent on GPU
 
