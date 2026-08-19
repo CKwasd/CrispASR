@@ -1,5 +1,11 @@
 # CrispASR — Pending work
 
+## CLAIMED 2026-08-19 — Issue #375 Canary streaming regression
+
+Worktree: `.claude/worktrees/fix-375-canary-regression`.
+Reproduce and fix the post-`73bb9b2f` Canary recognition regression reported in
+#375 without reverting the scheduler UAF fix; add focused seam/streaming coverage.
+
 ## CLAIMED 2026-08-13 — PR #347 GGUF weight-mapping release review
 
 Worktree: `.claude/worktrees/review-pr-352`.
