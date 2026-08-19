@@ -60,89 +60,53 @@ ko-mic-cue-kept, ko-mic-cue-lost) on CPU and CUDA alike.
   * conv padding, `speech_scaling_factor`, GPU-vs-CPU divergence (CUDA and CPU
     agree character-for-character on every file).
 
-## OPEN 2026-08-19 — vibevoice-bitnet Korean: five causes eliminated, one control unexplained
+## SOLVED 2026-08-19 — vibevoice-bitnet Korean: we sent the 1.5B the 7B's prompt
 
-The BitNet checkpoint transcribes Korean worse than the full model and worse
-than the official demo. Every axis we control is now eliminated, the last one by
-direct measurement on Kaggle (`tools/kaggle/vibeasr-bitnet-lm-precision`).
+The BitNet half of #369 was the PROMPT FORMAT, and Microsoft's own runtime says
+so in a comment — VibeASR.cpp `utils/prompt_builder.h`:
 
-**The last live hypothesis was activation quantization.** ggml's TQ2_0
-multiplies against block-quantized int8 activations; Microsoft's I2_S kernel
-quantizes them per token. `--lm-quant {tq2_0,f16,f32,q8_0}` (new) stores the SAME
-ternary values — `ternary_quantize()` has already collapsed them to
-`{-mean, 0, +mean}` — so only the ggml matmul path moves. Three builds from the
-official checkpoint, VAE and embedding pinned at q8_0:
+    // "text" format (1.5B model, plain text output):
+    //   "This is a X.XX seconds audio, please transcribe it."
+    // "json" format (7B model, JSON output with keys):
+    //   "This is a X.XX seconds audio, please transcribe it with these keys: ..."
 
-    LM stored as   size      activations              result
-    TQ2_0          1.41 GB   block-quantized int8     baseline
-    Q8_0           2.46 GB   per-32-block int8        character-identical
-    F16            3.69 GB   NOT QUANTIZED            character-identical
+and it DEFAULTS to text. VibeVoice-ASR-BitNet is the 1.5B; we sent it the JSON
+form, because our prompt came from microsoft/VibeVoice's PYTHON processor, which
+only targets the 7B. Fixed in `51b99d1b`, keyed on d_lm.
 
-Identical on all four clips. **F16 activations are strictly more accurate than
-I2_S's per-token int8, so if activation quantization were the cause F16 would
-have moved the answer. It did not.** That also kills the near-tie theory: the
-model is confidently wrong, not balanced on a knife edge that numerics could
-tip.
+    clip              JSON (before)                    plain text (now)
+    ko-test           네, 오늘은 해외 자료를 보내주세요.     내일 오전에 회의 자료를 보내주세요.  EXACT
+    ko-mic-cue-kept   내일 오전에 회의 자료 교육 …          내일 오전에 회의 자료를 보내주세요.  EXACT
+    ko-mic-cue-lost   Nếu ồ trên này … (VIETNAMESE)     늘 옷은 에 회의자 두를 보낼 수요.  KOREAN
+    flip-ko           네, 오늘은 해외 자료를 …             내일 오전에 회차를 보내주세요.
+    flip-en           English                          French (still flips)
 
-**Everything else was already eliminated:** ternary weights differ from upstream
-I2_S in 2 values out of 13.76 M; σ-VAE + connectors at cos 0.999926 vs upstream's
-own modules on identical 24 kHz input; prompt, -25 dBFS normalisation and
-resampler all fixed, and the FULL 7B is exact on every real fixture through the
-identical pipeline. `lm_head` is byte-identical to `embed_tokens`, so the tying
-fallback is exact. Every GGUF hyperparameter matches the HF config, `rope_theta`
-included.
+`ko-mic-cue-lost` keeps its language for the first time. JFK unaffected.
 
-**⚠ But this is elimination without a positive control, and one data point
-still contradicts "the checkpoint is simply weak".** The official demo Space runs
-the SAME BitNet checkpoint through Microsoft's VibeASR.cpp and returns `ko-test`
-EXACTLY (`내일 오전에 회의 자료를 보내주세요.`); we return
-`네, 오늘은 해외 자료를 보내주세요.` A weak checkpoint does not explain a
-reference implementation getting it right. So something still differs, and by
-elimination it is inside VibeASR.cpp's runtime.
+**How it was found, since the route matters more than the answer.** Every
+numerical avenue had been eliminated — weights equal to upstream's I2_S to 2
+values in 13.76 M, σ-VAE at cos 0.999926, LM storage (TQ2_0/Q8_0/F16)
+character-identical, and BitNet's per-token activation quantization implemented
+and measured immaterial. What broke it open was READING the reference
+implementation's source instead of continuing to measure our own. The answer was
+in a comment.
 
-**audio.cpp cannot arbitrate this one.** Verified against the local clone: zero
-occurrences of bitnet / ternary / i2_s / tq2_0, and its ggml type list stops at
-Q8_0/Q6_K. It cannot load a ternary checkpoint at all. The audio.cpp cross-check
-in #369 was only ever about the FULL model, which is resolved.
+**Eliminated on the way, all still true and all worth not re-chasing:**
+  * TQ2_0 is a faithful ternary container (F16 storage of the same values is
+    character-identical).
+  * BitNet's per-token `activation_quant` is implemented
+    (`CRISPASR_VIBEVOICE_BITNET_ACT_QUANT=1`, CPU-only via ggml_map_custom1) and
+    changes nothing on 4 of 5 clips — verified a real null by sabotaging the
+    callback and watching the output collapse.
+  * `lm_head` is byte-identical to `embed_tokens`; every GGUF hyperparameter
+    matches the HF config.
 
-**⚠ What the --lm-quant sweep could NOT see, and why the framing was wrong.**
-TQ2_0 is a ternary CONTAINER; it is not BitNet inference. Two consequences:
-
-  * All three arms call `ternary_quantize()` before diverging, so the sweep
-    proves TQ2_0 is a faithful container (F16 and TQ2_0 agreeing proves exactly
-    that) and is BLIND to an error in the ternarization itself. That matters more
-    than it sounds: the checkpoint is NOT pre-ternary — it ships the
-    full-precision latent QAT weights (12.6 M distinct values per tensor, ±2.7
-    against mean|w| ≈ 0.034), so the rounding is doing real work. Our rule does
-    match BitNet's `weight_quant`, and upstream's I2_S codes agree to 2 values in
-    13.76 M, so this specific risk is covered — but by that check, not by the
-    sweep.
-  * We implement only HALF of BitNet's forward. b1.58 also quantizes ACTIVATIONS
-    to int8 per token (`127/max|x|`) at every BitLinear, and the model was
-    TRAINED that way. `grep activation_quant src/vibevoice.cpp` is empty. The
-    sweep brackets per-token int8 between block-int8 and no-quantization, which
-    already agree character-for-character — suggestive, but two points on the
-    axis rather than a test of the operation the model was trained with.
-
-**Next step — two candidates now, cheapest first.**
-(a) Implement BitNet's per-token `activation_quant` on the 7 LM projections and
-    re-run the Korean clips. Contained, and it closes the half we skip.
-(b) Build Microsoft's VibeASR.cpp and run
-`vibeasr-lm-i2_s-embed-q6_k.gguf` (shipped in microsoft/VibeVoice-ASR-BitNet) on
-the same clips. That is the one comparison that can distinguish "checkpoint" from
-"runtime", and it is what the demo Space is. If it reproduces the demo's exact
-Korean on the same audio we feed ours, the gap is ours and the search resumes
-inside the LM with a trustworthy reference; if it does not, the demo result was
-not reproducible and the checkpoint conclusion stands.
-
-**Card fixed regardless, and it was a real error.** It claimed "pick any file —
-quality is identical across all variants ... zero degradation", verified on JFK
-alone, while listing seven languages. Variant equivalence and model quality are
-different claims and the card ran them together.
-`hf_readmes/vibevoice-asr-bitnet-GGUF.md` (previously absent — the card had no
-local source at all) now scopes the equivalence claim, records the LM-precision
-result, and states the measured Korean gap with the full model as the remedy.
-That much is independent of how the runtime question lands.
+**Follow-up, deliberately not done on the way past:** in text mode the 1.5B
+returns prose, so there are no per-utterance timings or speaker labels — that is
+what "plain text output" means upstream. `vibevoice-bitnet` still advertises
+CAP_DIARIZE and CAP_TIMESTAMPS_CTC. Either those should go for the 1.5B, or the
+adapter should switch to =json when the user actually asks for diarization. Needs
+a decision, not a reflex.
 
 ## PARTLY FIXED 2026-08-19 — vibevoice-asr "[Silence]" reached the transcript
 

@@ -113,33 +113,29 @@ Sweep ran on Kaggle (CPU). Conversion + transcription took ~20 min for the 6 shi
 
 ## Non-English quality
 
-The model card used to list seven languages and verify one. Measured on Korean
-(GT: `내일 오전에 회의 자료를 보내 주세요`), CPU, with CrispASR at the #369 fixes:
+An earlier version of this card listed seven languages and verified one, and the
+Korean results behind that omission turned out to be a CrispASR bug rather than a
+checkpoint limitation: we were sending this 1.5B model the 7B's JSON-keys
+instruction. Microsoft's own runtime uses a plain-text instruction for the 1.5B
+(VibeASR.cpp `utils/prompt_builder.h`, which labels "text" the 1.5B format and
+defaults to it). Fixed in CrispASR — the backend now picks the instruction by
+model size.
 
-| clip | this BitNet checkpoint | full VibeVoice-ASR (7B) |
+Measured on Korean (GT: `내일 오전에 회의 자료를 보내 주세요`), CPU:
+
+| clip | with the 7B's JSON prompt | with the 1.5B's own prompt |
 |---|---|---|
 | synthetic TTS, 3.3 s | `네, 오늘은 해외 자료를 보내주세요.` | `내일 오전에 회의 자료를 보내주세요.` ✅ |
 | mic recording | `내일 오전에 회의 자료 교육 보내주세요.` | `내일 오전에 회의 자료를 보내주세요.` ✅ |
-| mic recording, pitch-shifted | `Nếu ồ trên này, …` (Vietnamese) | `내일 오전에 회의 자료를 보내주세요.` ✅ |
+| mic, pitch-shifted | `Nếu ồ trên này, …` (Vietnamese) | `늘 옷은 에 회의자 두를 보낼 수요.` (Korean) |
 
-English is unaffected — JFK is exact.
+English is unaffected either way. Use **CrispASR ≥ the #369 fixes** for
+non-English audio with this checkpoint; older builds send the wrong instruction.
 
-Everything we can measure says this is the ternary checkpoint's own capability
-rather than a conversion defect: the σ-VAE encoder matches upstream's own modules
-at cos 0.999926 on identical 24 kHz input, the ternary weights differ from
-upstream's I2_S in 2 values out of 13.76 M, the table above shows the LM's
-numerics are insensitive to storage precision, and the full model gets every one
-of these right through the *same* CrispASR pipeline.
-
-**One caveat, stated because it is not settled:** Microsoft's own demo Space
-reportedly transcribes the first clip exactly using this same checkpoint through
-VibeASR.cpp. A weak checkpoint would not explain that, so a runtime difference we
-have not found may remain. Tracked in
-[#369](https://github.com/CrispStrobe/CrispASR/issues/369). Either way the
-guidance is the same — use the full model when the language matters.
-
-Use this checkpoint for its size and for English; reach for the full model when
-the language matters.
+> In plain-text mode the model returns prose, not a JSON array — so there are no
+> per-utterance timestamps or speaker labels. That is what "plain text output"
+> means for the 1.5B. `CRISPASR_VIBEVOICE_ASR_PROMPT=json` restores the
+> structured form at a quality cost on non-English.
 
 ## Usage
 
