@@ -5,6 +5,7 @@
 #include "grammar-parser.h"
 #include "whisper_params.h"       // struct whisper_params (shared with crispasr_*)
 #include "crispasr_backend.h"     // crispasr_run_backend() dispatch entry point
+#include "crispasr_cpu_isa.h"     // fail-fast on build-vs-host ISA mismatch (#380)
 #include "crispasr_diagnostics.h" // --version / --diagnostics + verbose banner (#31)
 #include "crispasr_consent_record.h"
 #include "crispasr_diarize_cli.h"      // crispasr_apply_diarize / pyannote cache (#107)
@@ -2378,6 +2379,31 @@ int main(int argc, char** argv) {
     // hitting #31 get a complete capture in the same log block.
     if (params.verbose) {
         crispasr_print_full_diagnostics(stderr);
+    }
+
+    // #380 (and #261/#374 before it): if this binary's ggml kernels emit
+    // instructions the host CPU lacks (e.g. the AVX2+FMA release zip on a
+    // pre-2013 CPU), the first compute op dies with an illegal-instruction
+    // fault that Windows swallows — the user sees the banner and then
+    // nothing. Fail fast with the actual fix instead. Every backend runs
+    // some ops on the CPU backend even in GPU mode, so there is no safe way
+    // to continue; CRISPASR_IGNORE_CPU_ISA=1 overrides for experts.
+    {
+        const crispasr_cpu_isa::IsaCheck isa = crispasr_cpu_isa::check();
+        if (isa.checked && !isa.ok) {
+            const char* ov = getenv("CRISPASR_IGNORE_CPU_ISA");
+            fprintf(stderr,
+                    "error: this build was compiled for %s, but this CPU lacks: %s (%s).\n"
+                    "       Running it would crash with an illegal instruction at the first\n"
+                    "       compute step. Use the '-legacy' release artifact instead (e.g.\n"
+                    "       crispasr-windows-x86_64-cpu-legacy.zip — generic x86-64 baseline\n"
+                    "       for CPUs without AVX2/FMA), or build from source on this machine.\n",
+                    isa.required.c_str(), isa.missing.c_str(), isa.host_note.c_str());
+            if (!(ov && ov[0] == '1')) {
+                return 1;
+            }
+            fprintf(stderr, "warning: CRISPASR_IGNORE_CPU_ISA=1 set — continuing anyway.\n");
+        }
     }
 
     if (params.use_gpu) {

@@ -58,6 +58,22 @@ readelf -d crispasr | grep NEEDED
 > tarballs below are still statically linked, because flipping the release leg
 > needs an A/B on real CUDA, HIP and Vulkan hardware first.
 
+## Windows CPU: which zip? (#380)
+
+`crispasr-windows-x86_64-cpu.zip` targets an **AVX2 + FMA** baseline (Intel
+Haswell 2013+ / AMD Excavator 2015+). On an older CPU — e.g. Sandy/Ivy Bridge,
+which have AVX but not AVX2 — the first compute instruction raises an
+illegal-instruction fault that the Windows console swallows: the program
+prints its banner and exits with no output and no error (issue #380). Since
+that report the CLI checks at startup and prints an explicit error instead
+(`CRISPASR_IGNORE_CPU_ISA=1` overrides).
+
+For pre-AVX2 CPUs use **`crispasr-windows-x86_64-cpu-legacy.zip`** — a generic
+x86-64/SSE2-floor build (`CRISPASR_PORTABLE_CPU=ON`) that runs on anything
+from Westmere up, just slower per core. Check with `wmic cpu get name` and
+look the model up, or run the AVX2 build once: the new error message tells
+you which features are missing.
+
 ## Windows CUDA: split downloads (#342)
 
 The Windows CUDA packages bundle three NVIDIA runtime DLLs — `cudart64_*.dll`,

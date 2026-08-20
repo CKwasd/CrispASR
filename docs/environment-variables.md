@@ -95,6 +95,7 @@ These are not tied to a single backend.
 | `CRISPASR_DUMP_DIR` | Global tensor-dump directory (diagnostics). |
 | `CRISPASR_GGUF_MMAP` / `CRISPASR_GGUF_PRELOAD` | Control GGUF mmap vs. preload-into-RAM loading. |
 | `CRISPASR_MLOCK` | mlock model weights into RAM. |
+| `CRISPASR_IGNORE_CPU_ISA` | Continue past the startup build-vs-host CPU instruction-set check (#380) instead of exiting; the process will SIGILL at the first compute op the CPU can't run. |
 
 ### GPU / device placement
 
