@@ -724,6 +724,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.chat_n_ctx = std::stoi(ARGV_NEXT);
     } else if (arg == "--chat-gpu-layers") {
         params.chat_n_gpu_layers = std::stoi(ARGV_NEXT);
+    } else if (arg == "--separate-model") {
+        params.separate_model = ARGV_NEXT;
     } else if (arg == "--g2p-dict") {
         params.g2p_dict = ARGV_NEXT;
     } else if (arg == "--tts-trim-silence") {
@@ -1442,6 +1444,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --chat-gpu-layers N      [%-7d] server: GPU layers for the chat model "
             "(-1 = all, 0 = CPU only)\n",
             params.chat_n_gpu_layers);
+    fprintf(stderr, "             --separate-model PATH    server: enable POST /v1/audio/separation backed by "
+                    "this GGUF (htdemucs or mel-band-roformer; independent of --model)\n");
     fprintf(stderr,
             "             --tts-steps N            [%-7d] diffusion/ODE steps (vibevoice 10-20; irodori 40; "
             "chatterbox/f5/tada)\n",

@@ -552,6 +552,42 @@ audio is watermarked by default, same as TTS (process-level opt-out via
 | `DELETE /v1/voices/{name}` | **Done**. |
 | Native-backend `speed` (duration knobs vs server-side resample) | Pending — backend-by-backend. |
 
+## Source separation endpoint (§381)
+
+`POST /v1/audio/separation` runs source separation on uploaded audio and
+returns one WAV per stem. Requires a secondary model loaded at startup via
+`--separate-model` (independent of the primary ASR/TTS model).
+
+```bash
+crispasr --server -m parakeet-q4_k.gguf \
+  --separate-model mel-band-roformer-vocals-f16.gguf
+```
+
+```bash
+# Separate all stems:
+curl http://localhost:8080/v1/audio/separation \
+  -F "file=@song.wav" -o stems.bin -D -
+# Content-Type: multipart/mixed (one WAV per stem)
+
+# Select specific stems:
+curl http://localhost:8080/v1/audio/separation \
+  -F "file=@song.wav" -F "stems=vocals" -o vocals.wav
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `file` | (required) | Audio file upload (multipart). Decoded to stereo at the model's native rate (44100 Hz). |
+| `stems` | `all` | Comma-separated stem subset to return (e.g. `vocals,drums`). |
+
+Response is `multipart/mixed` with one `audio/wav` part per selected stem
+(stereo 16-bit PCM). Each part carries
+`Content-Disposition: attachment; filename="<stem>.wav"`. No AI-provenance
+tag — the audio is the user's own.
+
+Returns `503` when `--separate-model` is not configured, `400` for
+missing/invalid audio or a `stems` filter matching nothing, `500` on
+backend failure.
+
 ## Translation endpoint
 
 `POST /v1/translate` is the text-to-text translation counterpart — the HTTP

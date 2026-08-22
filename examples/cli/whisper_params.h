@@ -653,4 +653,10 @@ struct whisper_params {
     std::string chat_model; // path to a GGUF chat model
     int32_t chat_n_ctx = 4096;
     int32_t chat_n_gpu_layers = -1;
+
+    // Source separation (server-mode POST /v1/audio/separation). Independent
+    // from the primary ASR backend — a secondary GGUF loaded at startup.
+    // GGUF arch auto-detected (htdemucs / mel-band-roformer). When empty,
+    // /v1/audio/separation returns 503 with `separation_disabled`.
+    std::string separate_model;
 };

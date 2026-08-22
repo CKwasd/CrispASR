@@ -82,6 +82,25 @@ lines per backend.
 - `mel_band_roformer_{init,separate}` (the C API mirroring `htdemucs.h`) lands
   with the MBR C++ backend; until then the dispatcher's MBR branch is stubbed.
 
+## HTTP server (§381)
+
+```
+crispasr --server -m asr.gguf --separate-model htdemucs-f16.gguf --port 8080
+```
+
+- **`--separate-model PATH`** — loads a secondary GGUF at startup (auto-detected
+  `htdemucs` or `mel-band-roformer`, resolved via `crispasr_resolve_model_cli`).
+  Persistent context, serialised by `std::mutex` (concurrent requests queue).
+- **`POST /v1/audio/separation`** — multipart `file` (audio upload, any supported
+  container) + optional `stems` field (comma list, default all). Returns
+  `multipart/mixed` with one `audio/wav` part per selected stem (stereo 16-bit
+  PCM, no AI-provenance tag). Each part carries
+  `Content-Disposition: attachment; filename="<stem>.wav"`.
+- **Errors**: `503` when `--separate-model` not configured (`separation_disabled`),
+  `400` for missing/invalid audio or an empty stem selection, `500` on backend
+  failure — all in `{"error": {"message", "type"}}` shape.
+- The endpoint appears in the startup banner when `--separate-model` is set.
+
 ## RESOLVED — one surface (2026-07-19)
 
 Two surfaces briefly coexisted: the `--separate` dispatcher (this spec, which
