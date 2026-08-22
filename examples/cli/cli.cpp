@@ -1405,12 +1405,13 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "                                                 [--align-format srt|json|plain] [--align-output f])\n"
             "             --align-only              standalone CTC forced alignment (issue #217)\n"
             "                                                 (-am <aligner.gguf> -f <audio> --ref-text \"text\"\n"
-            "                                                 or --text-file <file.txt|file.srt|->)\n"
-            "                                                 --text-file - reads the transcript from stdin;\n"
+            "                                                 or --text-file <file.txt|.srt|.json|->)\n"
+            "                                                 --text-file - reads from stdin (auto-detects format);\n"
+            "                                                 .json accepts CrispASR --output-json transcription\n"
             "                                                 -m/--backend, --vad, --max-len are unused here\n"
             "             --align-granularity G     [auto   ] align-only output units: auto|word|segment\n"
-            "                                                 (segment = re-timed input SRT cues / .txt lines;\n"
-            "                                                 auto = segment for .srt input, word otherwise)\n");
+            "                                                 (segment = re-timed input cues/segments;\n"
+            "                                                 auto = segment for .srt/.json, word otherwise)\n");
     fprintf(stderr,
             "             --codec-model FNAME      codec / companion GGUF (defaults to sibling/cache/registry)\n");
     fprintf(stderr, "             --codec-quant Q          [%-7s] preferred quant for registry companion resolution\n",

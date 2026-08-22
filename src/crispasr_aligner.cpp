@@ -416,6 +416,92 @@ std::vector<std::string> crispasr_parse_srt_cues(const std::string& raw) {
     return cues;
 }
 
+// #317: extract segment texts from CrispASR JSON output. Handles two shapes:
+//   1. Full output:  {"transcription": [{"text": "...", ...}, ...]}
+//   2. Align output: [{"text": "...", "start": N, "end": N}, ...]
+// No nlohmann dependency — the structure is simple enough for string scanning.
+// Extracts every JSON string value whose key is "text" at one level of nesting
+// inside an array. Robust against whitespace/newline variations.
+std::vector<std::string> crispasr_parse_json_segments(const std::string& raw) {
+    std::vector<std::string> segs;
+
+    // Find the array to scan: either "transcription": [...] or a top-level [...].
+    size_t arr_start = std::string::npos;
+    const size_t tkey = raw.find("\"transcription\"");
+    if (tkey != std::string::npos) {
+        arr_start = raw.find('[', tkey);
+    } else {
+        // Top-level array (align-only JSON output).
+        for (size_t i = 0; i < raw.size(); i++) {
+            if (raw[i] == ' ' || raw[i] == '\t' || raw[i] == '\n' || raw[i] == '\r')
+                continue;
+            if (raw[i] == '[') {
+                arr_start = i;
+            }
+            break;
+        }
+    }
+    if (arr_start == std::string::npos)
+        return segs;
+
+    // Scan for "text": "..." pairs inside the array.
+    size_t pos = arr_start;
+    while (pos < raw.size()) {
+        size_t tk = raw.find("\"text\"", pos);
+        if (tk == std::string::npos)
+            break;
+        // Skip past the colon.
+        size_t colon = raw.find(':', tk + 6);
+        if (colon == std::string::npos)
+            break;
+        // Find the opening quote of the value.
+        size_t q1 = raw.find('"', colon + 1);
+        if (q1 == std::string::npos)
+            break;
+        // Parse the JSON string value (handle escapes).
+        std::string val;
+        size_t i = q1 + 1;
+        while (i < raw.size() && raw[i] != '"') {
+            if (raw[i] == '\\' && i + 1 < raw.size()) {
+                i++;
+                switch (raw[i]) {
+                case '"':
+                    val += '"';
+                    break;
+                case '\\':
+                    val += '\\';
+                    break;
+                case 'n':
+                    val += '\n';
+                    break;
+                case 't':
+                    val += '\t';
+                    break;
+                case 'r':
+                    val += '\r';
+                    break;
+                default:
+                    val += raw[i];
+                    break;
+                }
+            } else {
+                val += raw[i];
+            }
+            i++;
+        }
+        pos = (i < raw.size()) ? i + 1 : raw.size();
+
+        // Trim and emit non-empty texts.
+        while (!val.empty() && (val.front() == ' ' || val.front() == '\t'))
+            val.erase(val.begin());
+        while (!val.empty() && (val.back() == ' ' || val.back() == '\t'))
+            val.pop_back();
+        if (!val.empty())
+            segs.push_back(std::move(val));
+    }
+    return segs;
+}
+
 std::vector<CrispasrAlignedSegment> crispasr_group_aligned_segments(const std::vector<std::string>& segment_texts,
                                                                     const std::vector<CrispasrAlignedWord>& words) {
     std::vector<CrispasrAlignedSegment> out;

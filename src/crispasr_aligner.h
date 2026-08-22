@@ -60,6 +60,13 @@ std::vector<std::string> crispasr_tokenise_align_words(const std::string& text);
 /// multi-line cue text joined with spaces, whitespace-only cues dropped).
 std::vector<std::string> crispasr_parse_srt_cues(const std::string& raw);
 
+/// Parse CrispASR JSON output into segment texts. Extracts the "text" field
+/// from each object in the "transcription" array. Works with both the full
+/// JSON format (--output-json-full) and the plain format (--output-json).
+/// Also accepts the align-only JSON format (array of {text, start, end}).
+/// Returns empty on parse failure or missing transcription data.
+std::vector<std::string> crispasr_parse_json_segments(const std::string& raw);
+
 /// Group a flat word alignment back into the segment texts it was built
 /// from. `segment_texts` joined with spaces must equal the transcript the
 /// words were aligned against; each segment consumes its own word count

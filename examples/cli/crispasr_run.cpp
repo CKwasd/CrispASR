@@ -2562,6 +2562,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // words can be re-grouped per segment afterwards.
         std::vector<std::string> segment_texts;
         bool is_srt_input = false;
+        bool is_json_input = false;
         auto trim = [](std::string s) {
             while (!s.empty() && (s.front() == ' ' || s.front() == '\t'))
                 s.erase(s.begin());
@@ -2607,17 +2608,41 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 fclose(tf);
             }
 
-            // Detect .srt by extension: cue texts kept, timestamps/indices
-            // stripped. Stdin has no extension, so sniff the content instead —
-            // an SRT always opens with a cue index line followed by a timing
-            // line containing "-->".
+            // Detect format by extension; stdin has no extension so sniff
+            // content instead. Order: .srt, .json, then plain .txt fallback.
             const std::string& p = params.text_file;
             is_srt_input = (p.size() >= 4 && (p.substr(p.size() - 4) == ".srt" || p.substr(p.size() - 4) == ".SRT"));
             if (p == "-")
                 is_srt_input = raw.find(" --> ") != std::string::npos;
+
+            // #317: detect JSON — by extension or by content sniff for stdin.
+            // Accepts CrispASR --output-json transcription and the align-only
+            // JSON format, extracting the "text" field from each segment.
+            is_json_input = (p.size() >= 5 && (p.substr(p.size() - 5) == ".json" || p.substr(p.size() - 5) == ".JSON"));
+            if (p == "-" && !is_srt_input) {
+                // Sniff: JSON starts with '{' or '[' (ignoring whitespace).
+                for (size_t c = 0; c < raw.size(); c++) {
+                    if (raw[c] == ' ' || raw[c] == '\t' || raw[c] == '\n' || raw[c] == '\r')
+                        continue;
+                    is_json_input = (raw[c] == '{' || raw[c] == '[');
+                    break;
+                }
+            }
+
             if (is_srt_input) {
                 for (auto& cue : crispasr_parse_srt_cues(raw))
                     segment_texts.push_back(trim(std::move(cue)));
+            } else if (is_json_input) {
+                segment_texts = crispasr_parse_json_segments(raw);
+                if (segment_texts.empty()) {
+                    fprintf(stderr, "crispasr[align-only]: JSON input has no 'text' fields. "
+                                    "Expected CrispASR --output-json format with a \"transcription\" array, "
+                                    "or an array of {\"text\": \"...\"}.\n");
+                    return 10;
+                }
+                if (!params.no_prints)
+                    fprintf(stderr, "crispasr[align-only]: parsed %zu segment(s) from JSON input\n",
+                            segment_texts.size());
             } else {
                 // Plain .txt: each non-empty line is one segment.
                 size_t i = 0;
@@ -2645,7 +2670,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
             fprintf(stderr, "crispasr[align-only]: no transcript given — alignment needs the text to align.\n"
                             "  --text-file <file.txt>   one segment per line\n"
                             "  --text-file <file.srt>   re-time existing cues (text kept, timings discarded)\n"
-                            "  --text-file -            read the transcript from stdin\n"
+                            "  --text-file <file.json>  CrispASR JSON output (--output-json); extracts segment texts\n"
+                            "  --text-file -            read from stdin (auto-detects SRT/JSON/plain text)\n"
                             "  --ref-text \"...\"         a single segment inline\n"
                             "Only -am (the aligner model) is needed besides; -m/--backend, --vad and\n"
                             "--max-len belong to transcription and are unused here.\n");
@@ -2664,8 +2690,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
             return 10;
         }
 
-        // segment output: explicit, or auto for .srt input (re-timed cues).
-        const bool segment_mode = gran == "segment" || (gran == "auto" && is_srt_input);
+        // segment output: explicit, or auto for structured input (SRT cues / JSON segments).
+        const bool segment_mode = gran == "segment" || (gran == "auto" && (is_srt_input || is_json_input));
 
         // Load audio.
         if (params.fname_inp.empty()) {

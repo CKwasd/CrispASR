@@ -117,6 +117,62 @@ TEST_CASE("align-only: SRT cue parsing", "[unit][align]") {
     }
 }
 
+TEST_CASE("align-only: JSON segment parsing (#317)", "[unit][align]") {
+    SECTION("CrispASR --output-json format") {
+        const char* json = R"({
+  "systeminfo": "...",
+  "model": {},
+  "transcription": [
+    {"timestamps": {"from": "00:00:00,400", "to": "00:00:02,160"}, "text": "And so my fellow Americans"},
+    {"timestamps": {"from": "00:00:03,520", "to": "00:00:07,280"}, "text": "ask not what your country can do for you"}
+  ]
+})";
+        auto segs = crispasr_parse_json_segments(json);
+        REQUIRE(segs.size() == 2);
+        CHECK(segs[0] == "And so my fellow Americans");
+        CHECK(segs[1] == "ask not what your country can do for you");
+    }
+
+    SECTION("align-only JSON output format (array of objects)") {
+        const char* json = R"([
+  {"text": "And so my fellow Americans", "start": 0.400, "end": 2.160},
+  {"text": "ask not what your country can do for you", "start": 3.520, "end": 7.280}
+])";
+        auto segs = crispasr_parse_json_segments(json);
+        REQUIRE(segs.size() == 2);
+        CHECK(segs[0] == "And so my fellow Americans");
+        CHECK(segs[1] == "ask not what your country can do for you");
+    }
+
+    SECTION("escaped characters in text") {
+        const char* json = R"({"transcription": [{"text": "He said \"hello\" and\\left"}]})";
+        auto segs = crispasr_parse_json_segments(json);
+        REQUIRE(segs.size() == 1);
+        CHECK(segs[0] == "He said \"hello\" and\\left");
+    }
+
+    SECTION("empty transcription array") {
+        auto segs = crispasr_parse_json_segments(R"({"transcription": []})");
+        CHECK(segs.empty());
+    }
+
+    SECTION("whitespace-only text is skipped") {
+        auto segs = crispasr_parse_json_segments(R"({"transcription": [{"text": "  "}, {"text": "real"}]})");
+        REQUIRE(segs.size() == 1);
+        CHECK(segs[0] == "real");
+    }
+
+    SECTION("no transcription key returns empty") {
+        auto segs = crispasr_parse_json_segments(R"({"something": "else"})");
+        CHECK(segs.empty());
+    }
+
+    SECTION("invalid JSON returns empty") {
+        auto segs = crispasr_parse_json_segments("not json at all");
+        CHECK(segs.empty());
+    }
+}
+
 TEST_CASE("align-only: tokenise_align_words", "[unit][align]") {
     SECTION("space-delimited") {
         auto w = crispasr_tokenise_align_words("Hello  world\tfoo\nbar");
