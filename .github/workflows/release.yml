@@ -304,9 +304,14 @@ jobs:
 
       - name: Build
         run: |
+          # §355: build with GGML_BACKEND_DL so ggml-cuda is a dlopen'd plugin.
+          # The main binary has NO DT_NEEDED for libcuda/libcudart — if the CUDA
+          # driver is absent, ggml-cuda.so simply fails to load and the CPU
+          # backend is used instead (the "CPU fallback" the project advertises).
           cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_BACKEND_DL=ON \
             -DGGML_CUDA=ON \
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DGGML_OPENBLAS=ON \
@@ -322,10 +327,13 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64-cuda
           cp build/bin/crispasr release/crispasr-linux-x86_64-cuda/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-cuda/
+          # §355: bundle ggml backend shared libs (ggml-cuda.so, ggml-cpu.so, etc.)
+          # so the main binary can dlopen them from $ORIGIN at runtime.
+          for so in build/bin/libggml*.so* build/bin/libcrispasr*.so*; do
+            [ -f "$so" ] && cp -P "$so" release/crispasr-linux-x86_64-cuda/
+          done
           bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-cuda || true
-          # Self-contained: rewrite RUNPATH to $ORIGIN (v0.8.25 shipped a leaked
-          # /home/runner/... path, and crispasr-quantize had no $ORIGIN at all, so it
-          # could not find its own bundled libc2pa_c.so) and copy in the non-system
+          # Self-contained: rewrite RUNPATH to $ORIGIN and copy in the non-system
           # dependency closure — libopenblas AND libgomp, per CrispASR #296.
           # CUDA's own libraries are the user's toolkit, not ours — the same
           # contract libcudart and libcublas have always had here. Declaring the
@@ -337,6 +345,9 @@ jobs:
             bash scripts/bundle-linux-runtime.sh release/crispasr-linux-x86_64-cuda
           # Then assert it: any DT_NEEDED that is neither bundled nor base-system
           # means the loader dies before main() and the process exits 127 silently.
+          # §355: with GGML_BACKEND_DL the main binary no longer DT_NEEDs CUDA
+          # libs at all — ggml-cuda.so does, but it is dlopen'd, not link-loaded.
+          # The --allow list covers ggml-cuda.so's own deps (still in the dir).
           python3 scripts/check-bundled-deps.py release/crispasr-linux-x86_64-cuda \
             --allow 'libcuda.so.*' --allow 'libcudart.so.*' --allow 'libcublas*.so.*' --allow 'libnv*.so.*'
           # Ship the licence text with the binaries. Every Windows, Android and
@@ -393,9 +404,11 @@ jobs:
 
       - name: Build
         run: |
+          # §355: GGML_BACKEND_DL — same rationale as the CUDA 12 leg above.
           cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_SHARED_LIBS=ON \
+            -DGGML_BACKEND_DL=ON \
             -DGGML_CUDA=ON \
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
             -DGGML_OPENBLAS=ON \
@@ -411,27 +424,16 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64-cuda13
           cp build/bin/crispasr release/crispasr-linux-x86_64-cuda13/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-cuda13/
+          # §355: bundle ggml backend shared libs for dlopen
+          for so in build/bin/libggml*.so* build/bin/libcrispasr*.so*; do
+            [ -f "$so" ] && cp -P "$so" release/crispasr-linux-x86_64-cuda13/
+          done
           bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-cuda13 || true
-          # Self-contained: rewrite RUNPATH to $ORIGIN (v0.8.25 shipped a leaked
-          # /home/runner/... path, and crispasr-quantize had no $ORIGIN at all, so it
-          # could not find its own bundled libc2pa_c.so) and copy in the non-system
-          # dependency closure — libopenblas AND libgomp, per CrispASR #296.
-          # CUDA's own libraries are the user's toolkit, not ours — the same
-          # contract libcudart and libcublas have always had here. Declaring the
-          # directory rather than naming sonames keeps a future libcusolver or
-          # libcufft (hundreds of MB each, and not on the name list) out of the
-          # tarball, and EXTRA_RPATH makes them findable through our own RUNPATH.
           CRISPASR_BUNDLE_HOST_DIRS=/usr/local/cuda \
           CRISPASR_BUNDLE_EXTRA_RPATH=/usr/local/cuda/lib64 \
             bash scripts/bundle-linux-runtime.sh release/crispasr-linux-x86_64-cuda13
-          # Then assert it: any DT_NEEDED that is neither bundled nor base-system
-          # means the loader dies before main() and the process exits 127 silently.
           python3 scripts/check-bundled-deps.py release/crispasr-linux-x86_64-cuda13 \
             --allow 'libcuda.so.*' --allow 'libcudart.so.*' --allow 'libcublas*.so.*' --allow 'libnv*.so.*'
-          # Ship the licence text with the binaries. Every Windows, Android and
-          # libcrispasr artifact already did; no CLI tarball did, and these bundle
-          # third-party shared libraries (libgomp, and libomp on HIP) whose terms
-          # require the notice to travel with them.
           cp LICENSE release/crispasr-linux-x86_64-cuda13/
           cp THIRD_PARTY_NOTICES.txt release/crispasr-linux-x86_64-cuda13/
           cd release && tar czf crispasr-linux-x86_64-cuda13.tar.gz crispasr-linux-x86_64-cuda13/
