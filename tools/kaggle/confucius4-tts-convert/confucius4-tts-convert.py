@@ -219,8 +219,11 @@ n_written = 0
 with safe_open(t2s_path, framework="pt") as f:
     for name in sorted(f.keys()):
         t = f.get_tensor(name).float().numpy()
-        # Convert to F16 for storage (gguf library handles this)
-        writer.add_tensor(name, t, raw_dtype=gguf.GGMLQuantizationType.F16)
+        # 1-D tensors (biases, norms) stay F32; everything else → F16
+        if t.ndim == 1:
+            writer.add_tensor(name, t)
+        else:
+            writer.add_tensor(name, t.astype(np.float16))
         n_written += 1
         if n_written % 50 == 0:
             print(f"  wrote {n_written} tensors...", flush=True)
@@ -307,7 +310,10 @@ s2a_writer.add_uint32("confucius4.s2a.wavenet_num_layers", 8)
 n_written = 0
 for name in sorted(s2a_state.keys()):
     t = s2a_state[name].float().numpy()
-    s2a_writer.add_tensor(name, t, raw_dtype=gguf.GGMLQuantizationType.F16)
+    if t.ndim == 1:
+        s2a_writer.add_tensor(name, t)
+    else:
+        s2a_writer.add_tensor(name, t.astype(np.float16))
     n_written += 1
     if n_written % 50 == 0:
         print(f"  wrote {n_written} tensors...", flush=True)
