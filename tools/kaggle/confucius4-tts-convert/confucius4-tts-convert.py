@@ -48,6 +48,16 @@ if not REPO.exists():
     except Exception as e:
         print(f"  git clone failed: {e}")
 
+# Init ALL submodules (ggml + c2pa-audio — cmake requires both)
+if REPO.exists():
+    try:
+        subprocess.check_call(
+            ["git", "submodule", "update", "--init", "--recursive"],
+            cwd=str(REPO),
+        )
+    except Exception as e:
+        print(f"  submodule init failed: {e}")
+
 if (REPO / "tools" / "kaggle").is_dir():
     sys.path.insert(0, os.path.join(str(REPO), "tools", "kaggle"))
 else:
@@ -242,12 +252,7 @@ print("  uploaded T2S F16")
 
 # ── Phase 10: Build quantizer + quantize ─────────────────────────────────────
 kh.step("build quantizer")
-if (REPO / "ggml").is_dir() and not (REPO / "ggml" / "CMakeLists.txt").exists():
-    try:
-        subprocess.check_call(["git", "submodule", "update", "--init", "ggml"], cwd=str(REPO))
-    except Exception as e:
-        print(f"  submodule init: {e}")
-
+# Submodules already initialised in Phase 0.
 BUILD = TEMP / "build"
 BUILD.mkdir(parents=True, exist_ok=True)
 flags = kh.cache_and_link_flags()
