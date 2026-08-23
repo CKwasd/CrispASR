@@ -935,6 +935,83 @@ static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::v
     return semantic_codes;
 }
 
+// ---------------------------------------------------------------------------
+// S2A: run flow-matching to produce mel from semantic codes
+// ---------------------------------------------------------------------------
+
+// Run the S2A conditioning pipeline: semantic codes → cond vector for DiT.
+// Returns (lr_out_channels, T_mel) conditioning, or empty on failure.
+static std::vector<float> s2a_build_conditioning(confucius4_tts_context* ctx,
+                                                 const std::vector<int32_t>& semantic_codes, int T_mel) {
+    const auto& s = ctx->s2a;
+    const auto& hp = s.hp;
+    const int T_sem = (int)semantic_codes.size();
+    const int vb = ctx->params.verbosity;
+
+    // Step 1: embed semantic codes → (semantic_embed_dim, T_sem)
+    // Step 2: concat with zero LM latent → project → (lr_in, T_sem)
+    // Step 3: length regulate → (lr_out, T_mel)
+    // For now, return zeros (stub) — the DiT will get random noise as velocity
+    // which produces noise mel, but the pipeline shape is complete.
+
+    if (vb >= 1)
+        fprintf(stderr, "confucius4: S2A conditioning: T_sem=%d, T_mel=%d (stub — returning zeros)\n", T_sem, T_mel);
+
+    // The conditioning should be (input_size=512, T_mel) — lr_out_channels
+    return std::vector<float>((size_t)hp.input_size * T_mel, 0.0f);
+}
+
+// Run the full S2A flow-matching ODE to produce mel.
+// Returns (output_size, T_mel) mel spectrogram as float32, or empty on failure.
+static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const std::vector<int32_t>& semantic_codes) {
+    const auto& s = ctx->s2a;
+    const auto& hp = s.hp;
+    const int T_sem = (int)semantic_codes.size();
+    const int T_mel = (int)(T_sem * 1.72); // heuristic from Python
+    const int mel_dim = hp.output_size;    // 80
+    const int vb = ctx->params.verbosity;
+    const int n_steps = ctx->params.ode_steps > 0 ? ctx->params.ode_steps : 25;
+
+    if (vb >= 1)
+        fprintf(stderr, "confucius4: S2A flow-matching: T_sem=%d → T_mel=%d, %d ODE steps\n", T_sem, T_mel, n_steps);
+
+    // Build conditioning (stub: zeros for now)
+    std::vector<float> cond = s2a_build_conditioning(ctx, semantic_codes, T_mel);
+    if (cond.empty())
+        return {};
+
+    // Initialize noise: z ~ N(0, 1) of shape (mel_dim, T_mel)
+    std::mt19937 rng(ctx->params.seed ? ctx->params.seed : 42);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> z((size_t)mel_dim * T_mel);
+    for (auto& v : z)
+        v = dist(rng);
+
+    // Cosine time schedule: t_span[i] = 1 - cos(i/(n_steps) * pi/2)
+    std::vector<float> t_span(n_steps + 1);
+    for (int i = 0; i <= n_steps; i++)
+        t_span[i] = 1.0f - cosf((float)i / n_steps * 1.5707963f);
+
+    // Euler ODE: for each step, compute velocity via DiT, then x = x + dt * v
+    // TODO: implement the actual DiT forward graph here. For now, use zero
+    // velocity (produces the initial noise as mel — garbage but validates shape).
+    for (int step = 1; step <= n_steps; step++) {
+        float dt = t_span[step] - t_span[step - 1];
+        // velocity = DiT(z, cond, t_span[step-1], spks=0)
+        // For now: velocity = 0 → z stays as noise
+        // z[i] += dt * velocity[i];
+        (void)dt;
+        if (vb >= 2 && step <= 3)
+            fprintf(stderr, "confucius4: S2A ODE step %d/%d: t=%.4f dt=%.4f (stub)\n", step, n_steps, t_span[step - 1],
+                    dt);
+    }
+
+    if (vb >= 1)
+        fprintf(stderr, "confucius4: S2A flow-matching done (stub — noise mel)\n");
+
+    return z; // (mel_dim, T_mel) — noise for now
+}
+
 float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, const char* lang, int* out_n_samples) {
     if (!ctx || !text || !out_n_samples)
         return nullptr;
@@ -994,10 +1071,35 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
         return nullptr;
     }
 
-    fprintf(stderr, "confucius4: generated %zu semantic codes, S2A loaded but forward not yet implemented\n",
-            semantic_codes.size());
-    *out_n_samples = 0;
-    return nullptr;
+    // Run S2A flow-matching → mel
+    std::vector<float> mel = s2a_flow_matching(ctx, semantic_codes);
+    if (mel.empty()) {
+        fprintf(stderr, "confucius4: S2A flow-matching failed\n");
+        *out_n_samples = 0;
+        return nullptr;
+    }
+
+    const int mel_dim = ctx->s2a.hp.output_size;
+    const int T_mel = (int)(mel.size() / mel_dim);
+
+    // Step 4: BigVGAN vocoder → PCM @ 22050 Hz
+    // TODO: load and run BigVGAN. For now, output silence at the right duration.
+    const int sr = ctx->t2s.hp.sample_rate; // 22050
+    const int hop = 256;                    // BigVGAN hop_length
+    const int n_pcm = T_mel * hop;
+    float* pcm = (float*)calloc(n_pcm, sizeof(float)); // silence
+    if (!pcm) {
+        *out_n_samples = 0;
+        return nullptr;
+    }
+
+    if (vb >= 1)
+        fprintf(stderr,
+                "confucius4: output: %d mel frames → %d PCM samples @ %d Hz (%.2fs, silence — vocoder pending)\n",
+                T_mel, n_pcm, sr, (float)n_pcm / sr);
+
+    *out_n_samples = n_pcm;
+    return pcm;
 }
 
 void confucius4_tts_pcm_free(float* pcm) {
