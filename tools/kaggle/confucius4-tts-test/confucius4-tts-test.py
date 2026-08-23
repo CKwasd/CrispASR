@@ -151,12 +151,12 @@ else:
 kh.step("ASR roundtrip")
 if tts_wav.exists() and os.path.getsize(str(tts_wav)) > 100:
     # Download a small whisper model for ASR
-    whisper_model = hf_hub_download(
-        "cstr/whisper-gguf",
-        "ggml-tiny.en.bin",
-        local_dir=str(TEMP / "models"),
-        token=hf_token,
-    )
+    import urllib.request
+    whisper_url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+    whisper_model = str(TEMP / "models" / "ggml-tiny.en.bin")
+    os.makedirs(os.path.dirname(whisper_model), exist_ok=True)
+    if not os.path.exists(whisper_model):
+        urllib.request.urlretrieve(whisper_url, whisper_model)
     print(f"  ASR model: {whisper_model}")
 
     asr_result = subprocess.run(
