@@ -58,7 +58,16 @@ model_path = hf_hub_download(
     local_dir=str(TEMP / "models"),
     token=hf_token,
 )
-print(f"  model: {model_path} ({os.path.getsize(model_path) / 1024**2:.0f} MB)")
+print(f"  T2S model: {model_path} ({os.path.getsize(model_path) / 1024**2:.0f} MB)")
+
+# Also download S2A companion model
+s2a_path = hf_hub_download(
+    "cstr/confucius4-tts-GGUF",
+    "confucius4-tts-s2a-q4_k.gguf",
+    local_dir=str(TEMP / "models"),
+    token=hf_token,
+)
+print(f"  S2A model: {s2a_path} ({os.path.getsize(s2a_path) / 1024**2:.0f} MB)")
 
 # ── Phase 4: Download tokenizer ──────────────────────────────────────────────
 kh.step("download tokenizer")
@@ -123,8 +132,8 @@ env["CRISPASR_CONFUCIUS4_TEXT_IDS"] = token_ids_str
 
 result = subprocess.run(
     [str(crispasr_bin), "--backend", "confucius4-tts",
-     "-m", model_path, "--tts", test_text,
-     "-v"],
+     "-m", model_path, "--codec-model", s2a_path,
+     "--tts", test_text, "-v"],
     capture_output=True, text=True, timeout=120, env=env,
 )
 print(f"  rc={result.returncode}")
