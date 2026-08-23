@@ -1,6 +1,7 @@
 // crispasr_backend_confucius4_tts.cpp — CLI adapter for Confucius4-TTS (§377).
 
 #include "crispasr_backend.h"
+#include "crispasr_backend_utils.h"
 #include "whisper_params.h"
 #include "confucius4_tts.h"
 
@@ -38,22 +39,22 @@ public:
 
     std::vector<crispasr_segment> transcribe(const float*, int, int64_t, const whisper_params&) override { return {}; }
 
-    crispasr_tts_result synthesize(const std::string& text, const whisper_params& params) override {
-        crispasr_tts_result r{};
+    std::vector<float> synthesize(const std::string& text, const whisper_params& params) override {
         if (!ctx_)
-            return r;
+            return {};
 
         const std::string lang = params.language.empty() ? "en" : params.language;
         int n_samples = 0;
         float* pcm = confucius4_tts_synthesize(ctx_, text.c_str(), lang.c_str(), &n_samples);
         if (!pcm || n_samples <= 0)
-            return r;
+            return {};
 
-        r.audio.assign(pcm, pcm + n_samples);
-        r.sample_rate = confucius4_tts_sample_rate(ctx_);
+        std::vector<float> out(pcm, pcm + n_samples);
         confucius4_tts_pcm_free(pcm);
-        return r;
+        return out;
     }
+
+    int tts_sample_rate() const override { return confucius4_tts_sample_rate(ctx_); }
 
     void shutdown() override {
         if (ctx_) {

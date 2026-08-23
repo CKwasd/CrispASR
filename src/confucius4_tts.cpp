@@ -9,6 +9,7 @@
 
 #include "confucius4_tts.h"
 
+#include "core/attention.h"
 #include "core/ggml_cpu_backend.h"
 #include "core/gpu_backend_pref.h"
 #include "core/gguf_loader.h"
@@ -269,6 +270,76 @@ static bool load_t2s(confucius4_tts_context* ctx, const char* path) {
         fprintf(stderr, "confucius4: T2S loaded %zu tensors OK\n", wl.tensors.size());
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// GPT-2 transformer forward: one step (prefill or single-token decode)
+// ---------------------------------------------------------------------------
+
+// Build a single GPT-2 forward pass graph for T input tokens.
+// Returns the logits tensor (T, semantic_vocab_size).
+// `kv_k` / `kv_v` are the KV cache tensors per layer (pre-allocated).
+// `n_past` is the KV cache position (0 for prefill).
+static ggml_tensor* gpt2_forward(confucius4_tts_context* ctx, ggml_context* ctx0, ggml_cgraph* gf,
+                                 ggml_tensor* input_emb, // (model_dim, T)
+                                 ggml_tensor** kv_k, ggml_tensor** kv_v, int n_past) {
+    const auto& m = ctx->t2s;
+    const auto& hp = m.hp;
+
+    core_attn::KvSelfAttnParams ap;
+    ap.n_heads = hp.num_heads;
+    ap.n_kv_heads = hp.num_heads; // GPT-2: no GQA
+    ap.n_kv_grp = 1;
+    ap.head_dim = hp.head_dim();
+    ap.rope_theta = 0.0f; // GPT-2 uses learned positional embeddings, not RoPE
+
+    ggml_tensor* x = input_emb;
+
+    for (int il = 0; il < hp.num_layers; il++) {
+        const auto& L = m.layers[il];
+
+        // Pre-attention LayerNorm
+        ggml_tensor* ln1 = ggml_norm(ctx0, x, 1e-5f);
+        ln1 = ggml_add(ctx0, ggml_mul(ctx0, ln1, L.ln_1_w), L.ln_1_b);
+
+        // Self-attention with fused QKV (GPT-2 style)
+        ggml_tensor* attn_out =
+            core_attn::kv_self_attn(ctx0, gf, ln1,
+                                    /*q_w=*/nullptr, /*k_w=*/nullptr, /*v_w=*/nullptr, L.attn_proj_w,
+                                    /*q_norm_w=*/nullptr, /*k_norm_w=*/nullptr,
+                                    /*positions=*/nullptr, /*causal_mask=*/nullptr, kv_k[il], kv_v[il], il, n_past, ap,
+                                    /*qkv_w=*/L.attn_qkv_w, /*fixed_kv_len=*/0,
+                                    /*kv_indices=*/nullptr,
+                                    /*q_b=*/nullptr, /*k_b=*/nullptr, /*v_b=*/nullptr,
+                                    /*o_b=*/L.attn_proj_b, /*qkv_b=*/L.attn_qkv_b);
+
+        // Residual
+        x = ggml_add(ctx0, x, attn_out);
+
+        // Pre-FFN LayerNorm
+        ggml_tensor* ln2 = ggml_norm(ctx0, x, 1e-5f);
+        ln2 = ggml_add(ctx0, ggml_mul(ctx0, ln2, L.ln_2_w), L.ln_2_b);
+
+        // FFN: Linear → GELU → Linear (GPT-2 MLP)
+        ggml_tensor* ff = ggml_mul_mat(ctx0, L.ffn_fc_w, ln2);
+        ff = ggml_add(ctx0, ff, L.ffn_fc_b);
+        ff = ggml_gelu(ctx0, ff);
+        ff = ggml_mul_mat(ctx0, L.ffn_proj_w, ff);
+        ff = ggml_add(ctx0, ff, L.ffn_proj_b);
+
+        // Residual
+        x = ggml_add(ctx0, x, ff);
+    }
+
+    // Final LayerNorm
+    x = ggml_norm(ctx0, x, 1e-5f);
+    x = ggml_add(ctx0, ggml_mul(ctx0, x, m.final_norm_w), m.final_norm_b);
+
+    // Semantic head: Linear(model_dim, semantic_vocab_size)
+    ggml_tensor* logits = ggml_mul_mat(ctx0, m.semantic_head_w, x);
+    logits = ggml_add(ctx0, logits, m.semantic_head_b);
+
+    return logits;
 }
 
 // ---------------------------------------------------------------------------
