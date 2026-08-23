@@ -215,10 +215,34 @@ writer.add_array("confucius4.w2v_bert.mean", stats["mean"].float().numpy().tolis
 writer.add_array("confucius4.w2v_bert.var", stats["var"].float().numpy().tolist())
 
 # Write tensors from T2S safetensors (lazy per-tensor loading)
+# GPT-2 Conv1D stores weights as (in_features, out_features) — the TRANSPOSE
+# of PyTorch's normal nn.Linear (out_features, in_features). ggml mul_mat(A,B)
+# computes B @ A.T and requires A.ne[0] == B.ne[0] == in_features. So Conv1D
+# weights must be transposed before writing to GGUF: numpy (in, out) → (out, in)
+# → ggml ne[0]=in, ne[1]=out.
+GPT2_CONV1D_WEIGHTS = {
+    "transformer.h.", ".attn.c_attn.weight",
+    "transformer.h.", ".attn.c_proj.weight",
+    "transformer.h.", ".mlp.c_fc.weight",
+    "transformer.h.", ".mlp.c_proj.weight",
+}
+def is_gpt2_conv1d(name):
+    """Check if this tensor is a GPT-2 Conv1D weight that needs transposing."""
+    return (name.startswith("transformer.h.") and
+            (name.endswith(".attn.c_attn.weight") or
+             name.endswith(".attn.c_proj.weight") or
+             name.endswith(".mlp.c_fc.weight") or
+             name.endswith(".mlp.c_proj.weight")))
+
 n_written = 0
+n_transposed = 0
 with safe_open(t2s_path, framework="pt") as f:
     for name in sorted(f.keys()):
         t = f.get_tensor(name).float().numpy()
+        # Transpose GPT-2 Conv1D weights: (in, out) → (out, in)
+        if t.ndim == 2 and is_gpt2_conv1d(name):
+            t = t.T.copy()
+            n_transposed += 1
         # 1-D tensors (biases, norms) stay F32; everything else → F16
         if t.ndim == 1:
             writer.add_tensor(name, t)
@@ -227,6 +251,8 @@ with safe_open(t2s_path, framework="pt") as f:
         n_written += 1
         if n_written % 50 == 0:
             print(f"  wrote {n_written} tensors...", flush=True)
+
+print(f"  transposed {n_transposed} GPT-2 Conv1D weights")
 
 print(f"  wrote {n_written} tensors total")
 writer.write_header_to_file()
