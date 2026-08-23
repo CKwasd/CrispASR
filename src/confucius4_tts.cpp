@@ -542,11 +542,13 @@ static std::vector<float> build_prefix_embedding(confucius4_tts_context* ctx, co
     ggml_build_forward_expand(gf, text_emb);
     ggml_build_forward_expand(gf, bos_out);
 
-    // Allocate with sched (references weight tensors in the model buffer)
-    ggml_backend_sched_t sched = ggml_backend_sched_new(&ctx->backend, nullptr, 1, n_tensors, false, false);
-    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+    // Allocate compute buffers with gallocr. Weight tensors already have valid
+    // buffers from load_weights — gallocr skips them and only allocates the new
+    // compute intermediates + inputs.
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
         fprintf(stderr, "confucius4: prefix graph alloc failed\n");
-        ggml_backend_sched_free(sched);
+        ggml_gallocr_free(galloc);
         ggml_free(ctx0);
         return {};
     }
@@ -585,7 +587,7 @@ static std::vector<float> build_prefix_embedding(confucius4_tts_context* ctx, co
                 ggml_graph_n_nodes(gf)); // leafs count not exposed, use nodes as proxy
     }
 
-    ggml_backend_sched_graph_compute(sched, gf);
+    ggml_backend_graph_compute(ctx->backend, gf);
 
     // Read results
     std::vector<float> result(prefix_len * D, 0.0f);
@@ -599,7 +601,7 @@ static std::vector<float> build_prefix_embedding(confucius4_tts_context* ctx, co
     // Slot T_text+1: BOS embedding
     ggml_backend_tensor_get(bos_out, result.data() + (1 + T_text) * D, 0, (size_t)D * sizeof(float));
 
-    ggml_backend_sched_free(sched);
+    ggml_gallocr_free(galloc);
     ggml_free(ctx0);
     return result;
 }
@@ -634,9 +636,9 @@ static std::vector<float> embed_semantic_token(confucius4_tts_context* ctx, int3
     ggml_set_output(out);
     ggml_build_forward_expand(gf, out);
 
-    ggml_backend_sched_t sched = ggml_backend_sched_new(&ctx->backend, nullptr, 1, 64, false, false);
-    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-        ggml_backend_sched_free(sched);
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        ggml_gallocr_free(galloc);
         ggml_free(ctx0);
         return {};
     }
@@ -645,12 +647,12 @@ static std::vector<float> embed_semantic_token(confucius4_tts_context* ctx, int3
     int32_t pos_val = sem_pos;
     ggml_backend_tensor_set(pos_id, &pos_val, 0, sizeof(int32_t));
 
-    ggml_backend_sched_graph_compute(sched, gf);
+    ggml_backend_graph_compute(ctx->backend, gf);
 
     std::vector<float> result(D);
     ggml_backend_tensor_get(out, result.data(), 0, D * sizeof(float));
 
-    ggml_backend_sched_free(sched);
+    ggml_gallocr_free(galloc);
     ggml_free(ctx0);
     return result;
 }
