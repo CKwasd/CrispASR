@@ -2133,6 +2133,16 @@ if(NOT MSVC)
     target_compile_options(dots-tts PRIVATE -O3)
 endif()
 
+# confucius4-tts — Confucius4-TTS (§377)
+add_library(confucius4-tts STATIC confucius4_tts.h confucius4_tts.cpp)
+set_target_properties(confucius4-tts PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(confucius4-tts PUBLIC .)
+target_compile_features   (confucius4-tts PUBLIC cxx_std_17)
+target_link_libraries     (confucius4-tts PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+if(NOT MSVC)
+    target_compile_options(confucius4-tts PRIVATE -O3)
+endif()
+
 # ---------------------------------------------------------------------------
 # bananamind-tts — BananaMind-TTS-V2.1 Tacotron-lite + HiFi-GAN TTS
 # ---------------------------------------------------------------------------
