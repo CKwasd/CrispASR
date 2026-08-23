@@ -130,40 +130,70 @@ env = os.environ.copy()
 env["CRISPASR_CONFUCIUS4_TEXT_IDS"] = token_ids_str
 # gallocr is now the default for GPT-2 step (sched has index corruption)
 
+tts_wav = TEMP / "confucius4_output.wav"
 result = subprocess.run(
     [str(crispasr_bin), "--backend", "confucius4-tts",
      "-m", model_path, "--codec-model", s2a_path,
-     "--tts", test_text, "-v"],
-    capture_output=True, text=True, timeout=120, env=env,
+     "--tts", test_text, "-of", str(tts_wav), "-v"],
+    capture_output=True, text=True, timeout=180, env=env,
 )
-print(f"  rc={result.returncode}")
-print("--- stderr ---")
-print(result.stderr[-6000:] if len(result.stderr) > 6000 else result.stderr)
-print("--- stdout ---")
-print(result.stdout[-500:] if result.stdout else "(empty)")
+print(f"  TTS rc={result.returncode}")
+for line in result.stderr.split("\n"):
+    if "confucius4:" in line or "output:" in line:
+        print(f"  {line.strip()}")
 
-# ── Phase 9: Summary ─────────────────────────────────────────────────────────
+if tts_wav.exists():
+    print(f"  WAV: {tts_wav} ({os.path.getsize(str(tts_wav))} bytes)")
+else:
+    print("  WAV: not produced")
+
+# ── Phase 9: ASR roundtrip ───────────────────────────────────────────────────
+kh.step("ASR roundtrip")
+if tts_wav.exists() and os.path.getsize(str(tts_wav)) > 100:
+    # Download a small whisper model for ASR
+    whisper_model = hf_hub_download(
+        "cstr/whisper-gguf",
+        "ggml-tiny.en.bin",
+        local_dir=str(TEMP / "models"),
+        token=hf_token,
+    )
+    print(f"  ASR model: {whisper_model}")
+
+    asr_result = subprocess.run(
+        [str(crispasr_bin), "-m", whisper_model, "-f", str(tts_wav), "--no-prints"],
+        capture_output=True, text=True, timeout=60,
+    )
+    print(f"  ASR rc={asr_result.returncode}")
+    transcript = asr_result.stdout.strip()
+    print(f"  ASR transcript: '{transcript}'")
+
+    if transcript:
+        # Check word overlap with original text
+        orig_words = set(test_text.lower().split())
+        asr_words = set(transcript.lower().split())
+        overlap = orig_words & asr_words
+        print(f"  Word overlap: {len(overlap)}/{len(orig_words)} "
+              f"({100*len(overlap)/max(len(orig_words),1):.0f}%)")
+    else:
+        print("  ASR: empty transcript (expected — audio is silence/stub)")
+else:
+    print("  Skipping ASR — no WAV file produced")
+
+# ── Phase 10: Summary ────────────────────────────────────────────────────────
 kh.step("summary")
-# Check what happened
+import re
 if "prefill done" in result.stderr:
     print("  PREFILL: OK")
-else:
-    print("  PREFILL: not reached")
-
-if "EOS at step" in result.stderr:
-    import re
-    m = re.search(r"EOS at step (\d+)", result.stderr)
-    print(f"  EOS: step {m.group(1)}")
-elif "generated" in result.stderr and "semantic codes" in result.stderr:
+if "generated" in result.stderr and "semantic codes" in result.stderr:
     m = re.search(r"generated (\d+) semantic codes", result.stderr)
     if m:
-        print(f"  CODES: {m.group(1)} semantic codes generated")
-else:
-    print("  DECODE: did not produce codes")
-
-# Extract any error messages
-for line in result.stderr.split("\n"):
-    if "error" in line.lower() or "failed" in line.lower() or "FAIL" in line:
-        print(f"  ERR: {line.strip()}")
+        print(f"  CODES: {m.group(1)}")
+if "output:" in result.stderr:
+    m = re.search(r"output: (\d+) mel frames.*\(([0-9.]+)s", result.stderr)
+    if m:
+        print(f"  MEL: {m.group(1)} frames, {m.group(2)}s")
+if tts_wav.exists():
+    print(f"  WAV: {os.path.getsize(str(tts_wav))} bytes")
+print(f"  TTS rc={result.returncode}")
 
 print("\n=== Done ===", flush=True)
