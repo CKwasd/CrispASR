@@ -61,18 +61,22 @@ tok_path = hf_hub_download(
 with open(tok_path) as f:
     tok_data = json.load(f)
 
-vocab_list = tok_data["model"]["vocab"]
-print(f"  vocab entries: {len(vocab_list)}")
+model = tok_data["model"]
+vocab_dict = model["vocab"]  # {token: id}
+merges_list = model.get("merges", [])  # list of "token1 token2" strings
+print(f"  model type: {model.get('type', 'unknown')}")
+print(f"  vocab entries: {len(vocab_dict)}")
+print(f"  merges: {len(merges_list)}")
 
-# Extract tokens and scores
-tokens = []
-scores = []
-for token, score in vocab_list:
-    tokens.append(token)
-    scores.append(score)
+# Build ordered token list (by ID)
+tokens = [""] * len(vocab_dict)
+scores = [0.0] * len(vocab_dict)
+for token, idx in vocab_dict.items():
+    tokens[idx] = token
+    scores[idx] = -float(idx)  # BPE: use negative ID as score (lower ID = higher priority)
 
 print(f"  tokens[0:5]: {tokens[:5]}")
-print(f"  scores[0:5]: {scores[:5]}")
+print(f"  merges[0:3]: {merges_list[:3]}")
 
 # ── Phase 2: Download existing T2S F16 GGUF ──────────────────────────────────
 kh.step("download T2S F16 GGUF")
@@ -118,9 +122,12 @@ for field_name in reader.fields:
             vals = [int(field.parts[p][0]) for p in field.data]
             writer.add_array(field_name, vals)
 
-# Add the new vocab arrays
+# Add the new vocab + merges arrays
 writer.add_array("tokenizer.ggml.tokens", tokens)
 writer.add_array("tokenizer.ggml.scores", scores)
+if merges_list:
+    writer.add_array("tokenizer.ggml.merges", merges_list)
+    print(f"  added tokenizer.ggml.merges ({len(merges_list)} entries)")
 print(f"  added tokenizer.ggml.tokens ({len(tokens)} entries)")
 print(f"  added tokenizer.ggml.scores ({len(scores)} entries)")
 
