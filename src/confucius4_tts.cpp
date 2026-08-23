@@ -827,7 +827,8 @@ static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::v
         semantic_codes.push_back(token);
 
         // Embed the new token (semantic_embed + position)
-        std::vector<float> tok_emb = embed_semantic_token(ctx, token, step + 1);
+        const int sem_pos = std::min(step + 1, hp.max_semantic_seq_lens - 1);
+        std::vector<float> tok_emb = embed_semantic_token(ctx, token, sem_pos);
         if (tok_emb.empty()) {
             fprintf(stderr, "confucius4: token embedding failed at step %d\n", step);
             break;

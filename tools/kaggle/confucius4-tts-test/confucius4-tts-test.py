@@ -196,9 +196,7 @@ else:
 kh.step("T2S decode")
 env = os.environ.copy()
 env["CRISPASR_CONFUCIUS4_TEXT_IDS"] = token_ids_str
-env["CRISPASR_CONFUCIUS4_GALLOCR"] = "1"  # use gallocr instead of sched for GPT-2 step
-env["CRISPASR_CONFUCIUS4_MAX_LAYERS"] = "1"  # single layer to isolate the crash
-env["CRISPASR_CONFUCIUS4_DUMP_GRAPH"] = "1"  # dump graph nodes to find get_rows source
+env["CRISPASR_CONFUCIUS4_GALLOCR"] = "1"  # use gallocr for GPT-2 step (validated working)
 
 result = subprocess.run(
     [str(crispasr_bin), "--backend", "confucius4-tts",
