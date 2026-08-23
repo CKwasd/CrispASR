@@ -490,15 +490,14 @@ static std::vector<float> build_prefix_embedding(confucius4_tts_context* ctx, co
     const int prefix_len = 1 + T_text + 1; // condition(1) + text(T) + BOS(1)
 
     // Build the text projector graph: embed → fc1 → silu → fc2
-    // Need enough slots for compute nodes + weight leafs (embed, fc1, fc2, pos, sem, biases)
-    const int n_tensors = 256;
-    size_t ctx_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead();
+    const int n_tensors = 64;
+    size_t ctx_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead_custom(256, false);
     ggml_init_params ip = {ctx_size, nullptr, true};
     ggml_context* ctx0 = ggml_init(ip);
     if (!ctx0)
         return {};
 
-    ggml_cgraph* gf = ggml_new_graph(ctx0);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 256, false);
 
     // Input: text token IDs
     ggml_tensor* ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_text);
@@ -591,13 +590,13 @@ static std::vector<float> embed_semantic_token(confucius4_tts_context* ctx, int3
     const auto& m = ctx->t2s;
     const int D = m.hp.model_dim;
 
-    size_t ctx_size = ggml_tensor_overhead() * 8 + ggml_graph_overhead();
+    size_t ctx_size = ggml_tensor_overhead() * 16 + ggml_graph_overhead_custom(64, false);
     ggml_init_params ip = {ctx_size, nullptr, true};
     ggml_context* ctx0 = ggml_init(ip);
     if (!ctx0)
         return {};
 
-    ggml_cgraph* gf = ggml_new_graph(ctx0);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 64, false);
 
     ggml_tensor* tok = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
     ggml_set_name(tok, "sem_tok");
