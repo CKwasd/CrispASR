@@ -303,9 +303,14 @@ static ggml_tensor* gpt2_forward(confucius4_tts_context* ctx, ggml_context* ctx0
     ap.head_dim = hp.head_dim();
     ap.rope_theta = 0.0f; // GPT-2 uses learned positional embeddings, not RoPE
 
+    // CRISPASR_CONFUCIUS4_MAX_LAYERS=N overrides num_layers for debugging.
+    int n_layers = hp.num_layers;
+    if (const char* env = std::getenv("CRISPASR_CONFUCIUS4_MAX_LAYERS"))
+        n_layers = std::min(n_layers, std::atoi(env));
+
     ggml_tensor* x = input_emb;
 
-    for (int il = 0; il < hp.num_layers; il++) {
+    for (int il = 0; il < n_layers; il++) {
         const auto& L = m.layers[il];
 
         // Pre-attention LayerNorm
@@ -700,6 +705,18 @@ static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float
     // Gate: CRISPASR_CONFUCIUS4_GALLOCR=1 uses gallocr (avoids sched index
     // corruption seen with quantized weight tensors); default uses sched.
     const bool use_gallocr = (std::getenv("CRISPASR_CONFUCIUS4_GALLOCR") != nullptr);
+
+    // Debug: dump graph node ops to find where get_rows comes from
+    if (std::getenv("CRISPASR_CONFUCIUS4_DUMP_GRAPH")) {
+        const int nn = ggml_graph_n_nodes(gf);
+        fprintf(stderr, "confucius4: GPT-2 graph: %d nodes\n", nn);
+        for (int i = 0; i < nn && i < 200; i++) {
+            ggml_tensor* node = ggml_graph_node(gf, i);
+            fprintf(stderr, "  [%3d] op=%d (%s) ne=[%lld,%lld,%lld,%lld] name=%s\n", i, (int)node->op,
+                    ggml_op_name(node->op), (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2],
+                    (long long)node->ne[3], ggml_get_name(node));
+        }
+    }
 
     const int V = hp.semantic_vocab_size;
     std::vector<float> out_logits(V);
