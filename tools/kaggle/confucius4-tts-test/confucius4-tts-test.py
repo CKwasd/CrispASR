@@ -196,6 +196,7 @@ else:
 kh.step("T2S decode")
 env = os.environ.copy()
 env["CRISPASR_CONFUCIUS4_TEXT_IDS"] = token_ids_str
+env["CRISPASR_CONFUCIUS4_GALLOCR"] = "1"  # use gallocr instead of sched for GPT-2 step
 
 result = subprocess.run(
     [str(crispasr_bin), "--backend", "confucius4-tts",

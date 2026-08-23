@@ -697,25 +697,41 @@ static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float
     ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
 
-    // Allocate with sched (weights are already loaded)
-    ggml_backend_sched_t sched = ggml_backend_sched_new(&ctx->backend, nullptr, 1, n_tensors, false, false);
-    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-        fprintf(stderr, "confucius4: GPT-2 graph alloc failed\n");
-        ggml_backend_sched_free(sched);
-        ggml_free(ctx0);
-        return {};
-    }
+    // Gate: CRISPASR_CONFUCIUS4_GALLOCR=1 uses gallocr (avoids sched index
+    // corruption seen with quantized weight tensors); default uses sched.
+    const bool use_gallocr = (std::getenv("CRISPASR_CONFUCIUS4_GALLOCR") != nullptr);
 
-    ggml_backend_tensor_set(x, input_emb, 0, (size_t)D * T * sizeof(float));
-    ggml_backend_sched_graph_compute(sched, gf);
-
-    // Read last-token logits
     const int V = hp.semantic_vocab_size;
     std::vector<float> out_logits(V);
-    size_t offset = (T > 1) ? (size_t)(T - 1) * V * sizeof(float) : 0;
-    ggml_backend_tensor_get(logits, out_logits.data(), offset, V * sizeof(float));
 
-    ggml_backend_sched_free(sched);
+    if (use_gallocr) {
+        ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+            fprintf(stderr, "confucius4: GPT-2 gallocr alloc failed\n");
+            ggml_gallocr_free(galloc);
+            ggml_free(ctx0);
+            return {};
+        }
+        ggml_backend_tensor_set(x, input_emb, 0, (size_t)D * T * sizeof(float));
+        ggml_backend_graph_compute(ctx->backend, gf);
+        size_t offset = (T > 1) ? (size_t)(T - 1) * V * sizeof(float) : 0;
+        ggml_backend_tensor_get(logits, out_logits.data(), offset, V * sizeof(float));
+        ggml_gallocr_free(galloc);
+    } else {
+        ggml_backend_sched_t sched = ggml_backend_sched_new(&ctx->backend, nullptr, 1, n_tensors, false, false);
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            fprintf(stderr, "confucius4: GPT-2 sched alloc failed\n");
+            ggml_backend_sched_free(sched);
+            ggml_free(ctx0);
+            return {};
+        }
+        ggml_backend_tensor_set(x, input_emb, 0, (size_t)D * T * sizeof(float));
+        ggml_backend_sched_graph_compute(sched, gf);
+        size_t offset = (T > 1) ? (size_t)(T - 1) * V * sizeof(float) : 0;
+        ggml_backend_tensor_get(logits, out_logits.data(), offset, V * sizeof(float));
+        ggml_backend_sched_free(sched);
+    }
+
     ggml_free(ctx0);
     return out_logits;
 }
