@@ -102,6 +102,45 @@ struct confucius4_t2s_model {
 };
 
 // ---------------------------------------------------------------------------
+// S2A model weights (Semantic-to-Acoustic: flow-matching DiT + WaveNet)
+// ---------------------------------------------------------------------------
+
+struct confucius4_s2a_hparams {
+    int input_size = 512;
+    int output_size = 80; // mel bands
+    int spk_embed_dim = 192;
+    int semantic_embed_dim = 1024;
+    int lm_latent_dim = 1280;
+    int estimator_depth = 13; // DiT layers
+    int estimator_num_heads = 8;
+    int estimator_hidden_dim = 512;
+    int wavenet_num_layers = 8;
+};
+
+struct confucius4_s2a_model {
+    confucius4_s2a_hparams hp;
+
+    // Semantic token embedding: Embedding(8192,8) → Linear(8,1024)
+    struct ggml_tensor* input_embed_w = nullptr;
+    struct ggml_tensor* input_proj_w = nullptr;
+    struct ggml_tensor* input_proj_b = nullptr;
+
+    // Encoder projection: Linear(lm_latent_dim + semantic_embed_dim, lr_in_channels)
+    struct ggml_tensor* encoder_proj_w = nullptr;
+    struct ggml_tensor* encoder_proj_b = nullptr;
+
+    // Learned prompt condition
+    struct ggml_tensor* prompt_cond = nullptr;
+
+    // Weight context + buffer (separate from T2S)
+    ggml_context* ctx_w = nullptr;
+    ggml_backend_buffer_t buf_w = nullptr;
+    core_gguf::tensor_map tensors; // all tensors by name for DiT/WaveNet/LR access
+
+    bool loaded = false;
+};
+
+// ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
 
@@ -117,6 +156,7 @@ struct confucius4_kv_cache {
 struct confucius4_tts_context {
     confucius4_tts_params params;
     confucius4_t2s_model t2s;
+    confucius4_s2a_model s2a;
     confucius4_kv_cache kv;
 
     ggml_backend_t backend = nullptr;
@@ -373,10 +413,63 @@ confucius4_tts_context* confucius4_tts_init_from_file(const char* path_t2s, conf
     return ctx;
 }
 
-int confucius4_tts_set_s2a_path(confucius4_tts_context* /*ctx*/, const char* /*path_s2a*/) {
-    // TODO: load S2A model
-    fprintf(stderr, "confucius4: S2A loading not yet implemented\n");
-    return -1;
+int confucius4_tts_set_s2a_path(confucius4_tts_context* ctx, const char* path_s2a) {
+    if (!ctx || !path_s2a)
+        return -1;
+    auto& s = ctx->s2a;
+    auto& hp = s.hp;
+
+    gguf_context* meta = core_gguf::open_metadata(path_s2a);
+    if (!meta) {
+        fprintf(stderr, "confucius4: cannot open S2A GGUF '%s'\n", path_s2a);
+        return -1;
+    }
+
+    hp.input_size = core_gguf::kv_u32(meta, "confucius4.s2a.input_size", 512);
+    hp.output_size = core_gguf::kv_u32(meta, "confucius4.s2a.output_size", 80);
+    hp.spk_embed_dim = core_gguf::kv_u32(meta, "confucius4.s2a.spk_embed_dim", 192);
+    hp.semantic_embed_dim = core_gguf::kv_u32(meta, "confucius4.s2a.semantic_embed_dim", 1024);
+    hp.lm_latent_dim = core_gguf::kv_u32(meta, "confucius4.s2a.lm_latent_dim", 1280);
+    hp.estimator_depth = core_gguf::kv_u32(meta, "confucius4.s2a.estimator_depth", 13);
+    hp.estimator_num_heads = core_gguf::kv_u32(meta, "confucius4.s2a.estimator_num_heads", 8);
+    hp.estimator_hidden_dim = core_gguf::kv_u32(meta, "confucius4.s2a.estimator_hidden_dim", 512);
+    hp.wavenet_num_layers = core_gguf::kv_u32(meta, "confucius4.s2a.wavenet_num_layers", 8);
+    core_gguf::free_metadata(meta);
+
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "confucius4: S2A hparams: DiT %dL/%dd/%dh, WaveNet %dL, mel=%d\n", hp.estimator_depth,
+                hp.estimator_hidden_dim, hp.estimator_num_heads, hp.wavenet_num_layers, hp.output_size);
+
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights(path_s2a, ctx->backend, "confucius4-s2a", wl)) {
+        fprintf(stderr, "confucius4: failed to load S2A weights\n");
+        return -1;
+    }
+    s.ctx_w = wl.ctx;
+    s.buf_w = wl.buf;
+    s.tensors = std::move(wl.tensors);
+
+    auto find = [&](const char* name) -> ggml_tensor* {
+        auto it = s.tensors.find(name);
+        return it != s.tensors.end() ? it->second : nullptr;
+    };
+
+    s.input_embed_w = find("input_embedding.embedding.weight");
+    s.input_proj_w = find("input_embedding.out_project.weight");
+    s.input_proj_b = find("input_embedding.out_project.bias");
+    s.encoder_proj_w = find("encoder_proj.weight");
+    s.encoder_proj_b = find("encoder_proj.bias");
+    s.prompt_cond = find("prompt_cond");
+
+    if (!s.input_embed_w || !s.encoder_proj_w || !s.prompt_cond) {
+        fprintf(stderr, "confucius4: missing critical S2A tensors\n");
+        return -1;
+    }
+
+    s.loaded = true;
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "confucius4: S2A loaded %zu tensors OK\n", s.tensors.size());
+    return 0;
 }
 
 int confucius4_tts_set_speaker(confucius4_tts_context* ctx, const float* semantic_features, int n_frames,
@@ -899,6 +992,12 @@ void confucius4_tts_free(confucius4_tts_context* ctx) {
         return;
 
     kv_free(ctx->kv);
+    // Free S2A
+    if (ctx->s2a.buf_w)
+        ggml_backend_buffer_free(ctx->s2a.buf_w);
+    if (ctx->s2a.ctx_w)
+        ggml_free(ctx->s2a.ctx_w);
+    // Free T2S
     if (ctx->buf_w)
         ggml_backend_buffer_free(ctx->buf_w);
     if (ctx->ctx_w)
