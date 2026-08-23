@@ -491,7 +491,7 @@ static std::vector<float> build_prefix_embedding(confucius4_tts_context* ctx, co
 
     // Build the text projector graph: embed → fc1 → silu → fc2
     // Need enough slots for compute nodes + weight leafs (embed, fc1, fc2, pos, sem, biases)
-    const int n_tensors = 64;
+    const int n_tensors = 256;
     size_t ctx_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead();
     ggml_init_params ip = {ctx_size, nullptr, true};
     ggml_context* ctx0 = ggml_init(ip);
@@ -615,7 +615,7 @@ static std::vector<float> embed_semantic_token(confucius4_tts_context* ctx, int3
     ggml_set_output(out);
     ggml_build_forward_expand(gf, out);
 
-    ggml_backend_sched_t sched = ggml_backend_sched_new(&ctx->backend, nullptr, 1, 32, false, false);
+    ggml_backend_sched_t sched = ggml_backend_sched_new(&ctx->backend, nullptr, 1, 64, false, false);
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
         ggml_backend_sched_free(sched);
         ggml_free(ctx0);
