@@ -641,7 +641,9 @@ static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float
     const auto& hp = ctx->t2s.hp;
     const int D = hp.model_dim;
 
-    const int n_tensors = hp.num_layers * 20 + 32;
+    // kv_self_attn creates ~40 intermediates per layer (QKV split, views, permutes,
+    // cache writes, softmax, output permute, reshape) + FFN adds ~10.
+    const int n_tensors = hp.num_layers * 50 + 64;
     size_t ctx_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead_custom(8192, false);
     ggml_init_params ip = {ctx_size, nullptr, true};
     ggml_context* ctx0 = ggml_init(ip);
