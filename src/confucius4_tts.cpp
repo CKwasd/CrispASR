@@ -477,16 +477,225 @@ static int sample_top_p(const float* logits, int n_vocab, float temperature, flo
 // T2S decode: generate semantic codes from text token IDs
 // ---------------------------------------------------------------------------
 
-static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::vector<int32_t>& text_token_ids) {
+// Build and run the prefix embedding graph:
+//   text_ids → Embedding(32k,4096) → Linear(4096,4096) → SiLU → Linear(4096,1280) + pos_emb
+//   condition: zero vector (1, 1280) — speaker encoder not yet wired
+//   BOS: semantic_embedding[start_semantic_token]
+// Returns the concatenated prefix (prefix_len, model_dim) as float32.
+static std::vector<float> build_prefix_embedding(confucius4_tts_context* ctx, const std::vector<int32_t>& text_ids) {
+    const auto& m = ctx->t2s;
+    const auto& hp = m.hp;
+    const int D = hp.model_dim;
+    const int T_text = (int)text_ids.size();
+    const int prefix_len = 1 + T_text + 1; // condition(1) + text(T) + BOS(1)
+
+    // Build the text projector graph: embed → fc1 → silu → fc2
+    const int n_tensors = 16;
+    size_t ctx_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead();
+    ggml_init_params ip = {ctx_size, nullptr, true};
+    ggml_context* ctx0 = ggml_init(ip);
+    if (!ctx0)
+        return {};
+
+    ggml_cgraph* gf = ggml_new_graph(ctx0);
+
+    // Input: text token IDs
+    ggml_tensor* ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_text);
+    ggml_set_name(ids, "text_ids");
+    ggml_set_input(ids);
+
+    // Embedding lookup: (4096, T_text)
+    ggml_tensor* emb = ggml_get_rows(ctx0, m.text_embed_w, ids);
+
+    // MLP: fc1(4096→4096) → SiLU → fc2(4096→1280)
+    ggml_tensor* h = ggml_mul_mat(ctx0, m.text_proj_fc1_w, emb);
+    h = ggml_add(ctx0, h, m.text_proj_fc1_b);
+    h = ggml_silu(ctx0, h);
+    h = ggml_mul_mat(ctx0, m.text_proj_fc2_w, h);
+    h = ggml_add(ctx0, h, m.text_proj_fc2_b); // (D, T_text)
+
+    // Add text positional embedding: pos_emb[0..T_text-1]
+    ggml_tensor* pos_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_text);
+    ggml_set_name(pos_ids, "text_pos_ids");
+    ggml_set_input(pos_ids);
+
+    ggml_tensor* pos_emb = ggml_get_rows(ctx0, m.text_pos_embed_w, pos_ids);
+    ggml_tensor* text_emb = ggml_add(ctx0, h, pos_emb); // (D, T_text)
+    ggml_set_name(text_emb, "text_emb_out");
+    ggml_set_output(text_emb);
+
+    // BOS semantic embedding: semantic_embed[start_token]
+    ggml_tensor* bos_id = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(bos_id, "bos_id");
+    ggml_set_input(bos_id);
+
+    ggml_tensor* bos_emb = ggml_get_rows(ctx0, m.semantic_embed_w, bos_id);
+    // Add semantic position embedding at position 0
+    ggml_tensor* sem_pos0_id = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(sem_pos0_id, "sem_pos0_id");
+    ggml_set_input(sem_pos0_id);
+    ggml_tensor* sem_pos0 = ggml_get_rows(ctx0, m.sem_pos_embed_w, sem_pos0_id);
+    ggml_tensor* bos_out = ggml_add(ctx0, bos_emb, sem_pos0);
+    ggml_set_name(bos_out, "bos_emb_out");
+    ggml_set_output(bos_out);
+
+    ggml_build_forward_expand(gf, text_emb);
+    ggml_build_forward_expand(gf, bos_out);
+
+    // Allocate and compute
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        fprintf(stderr, "confucius4: prefix graph alloc failed\n");
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return {};
+    }
+
+    // Set inputs
+    ggml_backend_tensor_set(ids, text_ids.data(), 0, T_text * sizeof(int32_t));
+
+    std::vector<int32_t> pos_data(T_text);
+    for (int i = 0; i < T_text; i++)
+        pos_data[i] = i;
+    ggml_backend_tensor_set(pos_ids, pos_data.data(), 0, T_text * sizeof(int32_t));
+
+    int32_t bos_val = hp.start_semantic_token;
+    ggml_backend_tensor_set(bos_id, &bos_val, 0, sizeof(int32_t));
+
+    int32_t sem_pos0_val = 0;
+    ggml_backend_tensor_set(sem_pos0_id, &sem_pos0_val, 0, sizeof(int32_t));
+
+    ggml_backend_graph_compute(ctx->backend, gf);
+
+    // Read results
+    std::vector<float> result(prefix_len * D, 0.0f);
+
+    // Slot 0: condition_emb — zero for now (no speaker encoder)
+    // (already zeroed)
+
+    // Slot 1..T_text: text embeddings
+    ggml_backend_tensor_get(text_emb, result.data() + D, 0, (size_t)T_text * D * sizeof(float));
+
+    // Slot T_text+1: BOS embedding
+    ggml_backend_tensor_get(bos_out, result.data() + (1 + T_text) * D, 0, (size_t)D * sizeof(float));
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
+    return result;
+}
+
+// Build and run a single-token semantic embedding graph for decode step.
+// Returns (D,) float32.
+static std::vector<float> embed_semantic_token(confucius4_tts_context* ctx, int32_t token_id, int sem_pos) {
+    const auto& m = ctx->t2s;
+    const int D = m.hp.model_dim;
+
+    size_t ctx_size = ggml_tensor_overhead() * 8 + ggml_graph_overhead();
+    ggml_init_params ip = {ctx_size, nullptr, true};
+    ggml_context* ctx0 = ggml_init(ip);
+    if (!ctx0)
+        return {};
+
+    ggml_cgraph* gf = ggml_new_graph(ctx0);
+
+    ggml_tensor* tok = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(tok, "sem_tok");
+    ggml_set_input(tok);
+
+    ggml_tensor* emb = ggml_get_rows(ctx0, m.semantic_embed_w, tok);
+
+    ggml_tensor* pos_id = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(pos_id, "sem_pos");
+    ggml_set_input(pos_id);
+
+    ggml_tensor* pos = ggml_get_rows(ctx0, m.sem_pos_embed_w, pos_id);
+    ggml_tensor* out = ggml_add(ctx0, emb, pos);
+    ggml_set_name(out, "sem_emb_out");
+    ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        return {};
+    }
+
+    ggml_backend_tensor_set(tok, &token_id, 0, sizeof(int32_t));
+    int32_t pos_val = sem_pos;
+    ggml_backend_tensor_set(pos_id, &pos_val, 0, sizeof(int32_t));
+
+    ggml_backend_graph_compute(ctx->backend, gf);
+
+    std::vector<float> result(D);
+    ggml_backend_tensor_get(out, result.data(), 0, D * sizeof(float));
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
+    return result;
+}
+
+// Run a single GPT-2 forward step via ggml_backend_sched.
+// Input: (D, T) float embeddings. Output: last-token logits (semantic_vocab_size,).
+static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float* input_emb, int T, int n_past) {
     const auto& hp = ctx->t2s.hp;
     const int D = hp.model_dim;
+
+    const int n_tensors = hp.num_layers * 20 + 32;
+    size_t ctx_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead_custom(8192, false);
+    ggml_init_params ip = {ctx_size, nullptr, true};
+    ggml_context* ctx0 = ggml_init(ip);
+    if (!ctx0)
+        return {};
+
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
+
+    // Input embedding tensor
+    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, T);
+    ggml_set_name(x, "gpt2_input");
+    ggml_set_input(x);
+
+    // Forward pass
+    ggml_tensor* logits = gpt2_forward(ctx, ctx0, gf, x, &ctx->kv.k, &ctx->kv.v, n_past);
+    ggml_set_name(logits, "logits");
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
+
+    // Allocate with sched (weights are already loaded)
+    ggml_backend_sched_t sched = ggml_backend_sched_new(&ctx->backend, nullptr, 1, n_tensors, false, false);
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        fprintf(stderr, "confucius4: GPT-2 graph alloc failed\n");
+        ggml_backend_sched_free(sched);
+        ggml_free(ctx0);
+        return {};
+    }
+
+    ggml_backend_tensor_set(x, input_emb, 0, (size_t)D * T * sizeof(float));
+    ggml_backend_sched_graph_compute(sched, gf);
+
+    // Read last-token logits
+    const int V = hp.semantic_vocab_size;
+    std::vector<float> out_logits(V);
+    size_t offset = (T > 1) ? (size_t)(T - 1) * V * sizeof(float) : 0;
+    ggml_backend_tensor_get(logits, out_logits.data(), offset, V * sizeof(float));
+
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx0);
+    return out_logits;
+}
+
+static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::vector<int32_t>& text_token_ids) {
+    const auto& hp = ctx->t2s.hp;
     const int T_text = (int)text_token_ids.size();
-    // prefix: condition_emb(1) + text(T_text) + BOS(1)
-    const int prefix_len = 1 + T_text + 1;
+    const int prefix_len = 1 + T_text + 1; // condition(1) + text(T) + BOS(1)
     const int max_new =
         ctx->params.max_semantic_tokens > 0 ? ctx->params.max_semantic_tokens : hp.max_semantic_seq_lens;
     const int max_seq = prefix_len + max_new;
     const int vb = ctx->params.verbosity;
+
+    if (vb >= 1)
+        fprintf(stderr, "confucius4: T2S decode: text_len=%d, prefix_len=%d, max_new=%d\n", T_text, prefix_len,
+                max_new);
 
     // Allocate KV cache
     kv_free(ctx->kv);
@@ -498,39 +707,68 @@ static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::v
     // Seed RNG
     std::mt19937 rng(ctx->params.seed ? ctx->params.seed : 42);
 
-    // ── Build prefix embedding on CPU ──
-    // [condition_emb(1,D) | text_emb(T_text,D) | semantic_emb(BOS,D)]
-    std::vector<float> prefix_emb(prefix_len * D, 0.0f);
-
-    // condition_emb: speaker encoder output. For now, use a zero vector
-    // (no speaker conditioning — produces generic voice).
-    // TODO: run ECAPA-TDNN speaker encoder on Wav2Vec2-BERT features.
-
-    // text_emb: Embedding(text_ids) → fc1 → SiLU → fc2 + positional embedding
-    // This requires running the text projector subgraph. For now, use get_rows
-    // on the frozen embedding, then we'll need the MLP projection.
-    // Simplified: just embed the tokens (no MLP projection for now — needs graph).
-    // TODO: proper text embedding with MLP projection
-
-    // semantic BOS embedding
-    // TODO: get_rows for the BOS token from semantic_embedding.weight
-
-    (void)D;
-    (void)prefix_emb;
-
-    if (vb >= 1) {
-        fprintf(stderr, "confucius4: T2S decode: text_len=%d, prefix_len=%d, max_new=%d\n", T_text, prefix_len,
-                max_new);
+    // ── Step 1: Build prefix embedding via ggml graph ──
+    std::vector<float> prefix_emb = build_prefix_embedding(ctx, text_token_ids);
+    if (prefix_emb.empty()) {
+        fprintf(stderr, "confucius4: prefix embedding failed\n");
+        kv_free(ctx->kv);
+        return {};
     }
 
-    // For now, since we can't run the embedding subgraphs without a full
-    // ggml graph (the text projector has an MLP), report what we'd need:
-    fprintf(stderr, "confucius4: T2S autoregressive decode not yet functional "
-                    "(text projector MLP + speaker encoder need graph execution). "
-                    "Model loads and KV cache allocates OK.\n");
+    // ── Step 2: Prefill — run GPT-2 on the full prefix ──
+    std::vector<float> logits = run_gpt2_step(ctx, prefix_emb.data(), prefix_len, 0);
+    if (logits.empty()) {
+        fprintf(stderr, "confucius4: prefill failed\n");
+        kv_free(ctx->kv);
+        return {};
+    }
+
+    if (vb >= 2)
+        fprintf(stderr, "confucius4: prefill done, logits[0..3] = %.3f %.3f %.3f %.3f\n", logits[0], logits[1],
+                logits[2], logits[3]);
+
+    // ── Step 3: Autoregressive decode ──
+    std::vector<int32_t> semantic_codes;
+    int n_past = prefix_len;
+
+    for (int step = 0; step < max_new; step++) {
+        // Sample from logits
+        int token = sample_top_p(logits.data(), hp.semantic_vocab_size, ctx->params.temperature, ctx->params.top_p,
+                                 ctx->params.top_k, rng);
+
+        // Check for EOS
+        if (token == hp.stop_semantic_token) {
+            if (vb >= 1)
+                fprintf(stderr, "confucius4: EOS at step %d\n", step);
+            break;
+        }
+
+        semantic_codes.push_back(token);
+
+        // Embed the new token (semantic_embed + position)
+        std::vector<float> tok_emb = embed_semantic_token(ctx, token, step + 1);
+        if (tok_emb.empty()) {
+            fprintf(stderr, "confucius4: token embedding failed at step %d\n", step);
+            break;
+        }
+
+        // Run one GPT-2 step
+        logits = run_gpt2_step(ctx, tok_emb.data(), 1, n_past);
+        if (logits.empty()) {
+            fprintf(stderr, "confucius4: decode step %d failed\n", step);
+            break;
+        }
+        n_past++;
+
+        if (vb >= 2 && step < 5)
+            fprintf(stderr, "confucius4: step %d: token=%d\n", step, token);
+    }
+
+    if (vb >= 1)
+        fprintf(stderr, "confucius4: generated %zu semantic codes\n", semantic_codes.size());
 
     kv_free(ctx->kv);
-    return {};
+    return semantic_codes;
 }
 
 float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, const char* lang, int* out_n_samples) {
