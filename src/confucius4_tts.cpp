@@ -975,9 +975,26 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
         return nullptr;
     }
 
-    // Steps 3-4: S2A flow-matching → mel → BigVGAN → PCM
-    // TODO: implement S2A and vocoder
-    fprintf(stderr, "confucius4: generated %zu semantic codes (S2A + vocoder not yet implemented)\n",
+    // Step 3: S2A flow-matching → mel
+    // The S2A pipeline (when implemented) will:
+    //   1. Embed semantic codes: Embedding(8192,8) → Linear(8,1024)
+    //   2. Concat with LM latent: cat([lm_latent(1280), sem_emb(1024)]) → Linear(2304,1024)
+    //   3. Length regulate: conv upsample to target_mel_len = int(T_semantic * 1.72)
+    //   4. Prepend reference mel prompt condition
+    //   5. Run 25-step Euler ODE through DiT (13L, AdaLN, RoPE, U-Net skips)
+    //      with CFG (2× forward per step: cond + uncond)
+    //   6. WaveNet final layer (8L dilated conv, gated activation)
+    //   7. Strip prompt portion → mel (80, T_target)
+    //
+    // Step 4: BigVGAN vocoder → PCM @ 22050 Hz (external companion GGUF)
+    if (!ctx->s2a.loaded) {
+        fprintf(stderr, "confucius4: generated %zu semantic codes (S2A not loaded — pass --codec-model)\n",
+                semantic_codes.size());
+        *out_n_samples = 0;
+        return nullptr;
+    }
+
+    fprintf(stderr, "confucius4: generated %zu semantic codes, S2A loaded but forward not yet implemented\n",
             semantic_codes.size());
     *out_n_samples = 0;
     return nullptr;
