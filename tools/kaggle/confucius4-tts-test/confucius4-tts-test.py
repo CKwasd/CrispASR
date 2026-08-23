@@ -115,6 +115,83 @@ for line in result.stderr.split("\n"):
     if "confucius4" in line.lower() or "T2S" in line:
         print(f"  {line}")
 
+# ── Phase 7b: Standalone get_rows test ────────────────────────────────────────
+kh.step("get_rows smoke test")
+# Write a tiny C program that loads the GGUF, does get_rows on the text embedding, prints result
+smoke_code = f'''
+#include <stdio.h>
+#include <stdlib.h>
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "ggml-alloc.h"
+#include "core/gguf_loader.h"
+#include "core/ggml_cpu_backend.h"
+
+int main() {{
+    ggml_backend_t backend = core_cpu_backend::init();
+    core_gguf::WeightLoad wl;
+    if (!core_gguf::load_weights("{model_path}", backend, "smoke", wl)) {{
+        fprintf(stderr, "load failed\\n"); return 1;
+    }}
+    auto it = wl.tensors.find("text_projector.embed.weight");
+    if (it == wl.tensors.end()) {{ fprintf(stderr, "tensor not found\\n"); return 1; }}
+    ggml_tensor* embed = it->second;
+    fprintf(stderr, "embed: ne=[%lld,%lld] type=%d buffer=%p\\n",
+            (long long)embed->ne[0], (long long)embed->ne[1], (int)embed->type, (void*)embed->buffer);
+
+    // Build a tiny graph: get_rows(embed, [1])
+    size_t ctx_size = ggml_tensor_overhead() * 4 + ggml_graph_overhead_custom(16, false);
+    ggml_init_params ip = {{ctx_size, NULL, true}};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16, false);
+
+    ggml_tensor* ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(ids, "ids"); ggml_set_input(ids);
+    ggml_tensor* out = ggml_get_rows(ctx0, embed, ids);
+    ggml_set_name(out, "out"); ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t g = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(g, gf)) {{ fprintf(stderr, "alloc failed\\n"); return 1; }}
+
+    int32_t id_val = 1;
+    ggml_backend_tensor_set(ids, &id_val, 0, sizeof(int32_t));
+    fprintf(stderr, "ids: ne=[%lld,%lld] buffer=%p\\n",
+            (long long)ids->ne[0], (long long)ids->ne[1], (void*)ids->buffer);
+
+    ggml_backend_graph_compute(backend, gf);
+    float v;
+    ggml_backend_tensor_get(out, &v, 0, sizeof(float));
+    fprintf(stderr, "get_rows OK: out[0]=%.6f\\n", v);
+
+    ggml_gallocr_free(g);
+    ggml_free(ctx0);
+    ggml_backend_free(backend);
+    return 0;
+}}
+'''
+smoke_path = TEMP / "smoke_getrows.cpp"
+with open(smoke_path, "w") as f:
+    f.write(smoke_code)
+
+# Compile and run
+BUILD_bin = BUILD / "bin"
+kh.sh_with_progress(
+    f"cd {REPO} && /usr/bin/c++ -O2 -std=c++17 -I src -I ggml/include -I ggml/src "
+    f"-o {TEMP}/smoke_getrows {smoke_path} "
+    f"-L {BUILD}/src -L {BUILD}/ggml/src "
+    f"-lcrispasr-core -lggml -lggml-base -lggml-cpu "
+    f"-Wl,-rpath,{BUILD}/ggml/src "
+    f"-lm -lpthread -ldl -fopenmp 2>&1 || echo 'COMPILE FAILED'"
+)
+if (TEMP / "smoke_getrows").exists():
+    r = subprocess.run([str(TEMP / "smoke_getrows")], capture_output=True, text=True, timeout=30,
+                       env={**os.environ, "LD_LIBRARY_PATH": f"{BUILD}/ggml/src"})
+    print(f"  smoke rc={r.returncode}")
+    print(f"  smoke stderr: {r.stderr.strip()}")
+else:
+    print("  smoke test compile failed, skipping")
+
 # ── Phase 8: Run T2S decode ──────────────────────────────────────────────────
 kh.step("T2S decode")
 env = os.environ.copy()
