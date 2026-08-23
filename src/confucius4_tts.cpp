@@ -292,7 +292,7 @@ static bool load_t2s(confucius4_tts_context* ctx, const char* path) {
 // `n_past` is the KV cache position (0 for prefill).
 static ggml_tensor* gpt2_forward(confucius4_tts_context* ctx, ggml_context* ctx0, ggml_cgraph* gf,
                                  ggml_tensor* input_emb, // (model_dim, T)
-                                 ggml_tensor** kv_k, ggml_tensor** kv_v, int n_past) {
+                                 ggml_tensor* kv_k, ggml_tensor* kv_v, int n_past) {
     const auto& m = ctx->t2s;
     const auto& hp = m.hp;
 
@@ -317,7 +317,7 @@ static ggml_tensor* gpt2_forward(confucius4_tts_context* ctx, ggml_context* ctx0
             core_attn::kv_self_attn(ctx0, gf, ln1,
                                     /*q_w=*/nullptr, /*k_w=*/nullptr, /*v_w=*/nullptr, L.attn_proj_w,
                                     /*q_norm_w=*/nullptr, /*k_norm_w=*/nullptr,
-                                    /*positions=*/nullptr, /*causal_mask=*/nullptr, kv_k[il], kv_v[il], il, n_past, ap,
+                                    /*positions=*/nullptr, /*causal_mask=*/nullptr, kv_k, kv_v, il, n_past, ap,
                                     /*qkv_w=*/L.attn_qkv_w, /*fixed_kv_len=*/0,
                                     /*kv_indices=*/nullptr,
                                     /*q_b=*/nullptr, /*k_b=*/nullptr, /*v_b=*/nullptr,
@@ -657,7 +657,7 @@ static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float
     ggml_set_input(x);
 
     // Forward pass
-    ggml_tensor* logits = gpt2_forward(ctx, ctx0, gf, x, &ctx->kv.k, &ctx->kv.v, n_past);
+    ggml_tensor* logits = gpt2_forward(ctx, ctx0, gf, x, ctx->kv.k, ctx->kv.v, n_past);
     ggml_set_name(logits, "logits");
     ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
