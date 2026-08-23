@@ -551,6 +551,16 @@ static std::vector<float> build_prefix_embedding(confucius4_tts_context* ctx, co
         return {};
     }
 
+    // Debug: print shapes for diagnosis
+    if (ctx->params.verbosity >= 1) {
+        fprintf(stderr, "confucius4: prefix graph: text_embed_w ne=[%lld,%lld] type=%d\n",
+                (long long)m.text_embed_w->ne[0], (long long)m.text_embed_w->ne[1], (int)m.text_embed_w->type);
+        fprintf(stderr, "confucius4: prefix graph: T_text=%d, max_id=%d\n", T_text,
+                *std::max_element(text_ids.begin(), text_ids.end()));
+        fprintf(stderr, "confucius4: prefix graph: semantic_embed ne=[%lld,%lld], BOS=%d\n",
+                (long long)m.semantic_embed_w->ne[0], (long long)m.semantic_embed_w->ne[1], hp.start_semantic_token);
+    }
+
     // Set inputs
     ggml_backend_tensor_set(ids, text_ids.data(), 0, T_text * sizeof(int32_t));
 
