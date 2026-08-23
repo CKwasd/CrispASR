@@ -54,7 +54,7 @@ from huggingface_hub import hf_hub_download
 
 model_path = hf_hub_download(
     "cstr/confucius4-tts-GGUF",
-    "confucius4-tts-t2s-q4_k.gguf",
+    "confucius4-tts-t2s-f16.gguf",
     local_dir=str(TEMP / "models"),
     token=hf_token,
 )
