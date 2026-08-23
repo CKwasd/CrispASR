@@ -8,8 +8,24 @@
 
 ## NOW — active work
 
-**Status:** Python blueprint read, architecture fully traced, PLAN written.
-Converter + C++ backend not started.
+**Status:** T2S decode loop WORKING (1520 semantic codes on Kaggle). S2A loader
+done, forward pending. GGUFs on HF (6 files, T2S + S2A, F16/Q8/Q4K).
+
+### Completed
+- Python blueprint (full inference flow traced)
+- GGUF converter + Kaggle kernel (T2S transposed Conv1D weights)
+- T2S model loader (378 tensors, Q4_K)
+- Text projector MLP (embed → fc1 → SiLU → fc2 + pos_emb, gallocr)
+- GPT-2 24L forward with KV cache (gallocr, sched gated behind env var)
+- Autoregressive decode loop (top-p/top-k, 1520 steps validated)
+- S2A model loader (274 tensors, hparams from GGUF)
+- CLI adapter, CMake, arch_backend_map
+
+### Blocking
+- S2A forward: DiT 13L (RoPE + AdaLN + U-Net skips) + WaveNet 8L + ODE solver
+- BigVGAN vocoder (external companion GGUF)
+- Speaker conditioning (ECAPA-TDNN on Wav2Vec2-BERT, currently zero)
+- SentencePiece tokenizer from companion file
 
 ---
 

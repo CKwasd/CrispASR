@@ -34,6 +34,14 @@ public:
             return false;
         }
 
+        // Load the S2A companion model (--codec-model or auto-resolved sibling)
+        if (!p.tts_codec_model.empty()) {
+            if (confucius4_tts_set_s2a_path(ctx_, p.tts_codec_model.c_str()) != 0) {
+                fprintf(stderr, "crispasr[confucius4-tts]: failed to load S2A model '%s'\n", p.tts_codec_model.c_str());
+                // Non-fatal: T2S works without S2A (generates codes but no audio)
+            }
+        }
+
         return true;
     }
 
