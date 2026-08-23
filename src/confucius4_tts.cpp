@@ -500,9 +500,13 @@ static std::vector<float> build_prefix_embedding(confucius4_tts_context* ctx, co
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 256, false);
 
     // Input: text token IDs
+    // All index inputs marked as both input AND output to prevent gallocr from
+    // reusing their buffers before later get_rows ops consume them (#377 debug:
+    // gallocr aliased pos_ids with an intermediate, corrupting the index values).
     ggml_tensor* ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_text);
     ggml_set_name(ids, "text_ids");
     ggml_set_input(ids);
+    ggml_set_output(ids);
 
     // Embedding lookup: (4096, T_text)
     ggml_tensor* emb = ggml_get_rows(ctx0, m.text_embed_w, ids);
@@ -518,6 +522,7 @@ static std::vector<float> build_prefix_embedding(confucius4_tts_context* ctx, co
     ggml_tensor* pos_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_text);
     ggml_set_name(pos_ids, "text_pos_ids");
     ggml_set_input(pos_ids);
+    ggml_set_output(pos_ids);
 
     ggml_tensor* pos_emb = ggml_get_rows(ctx0, m.text_pos_embed_w, pos_ids);
     ggml_tensor* text_emb = ggml_add(ctx0, h, pos_emb); // (D, T_text)
@@ -528,12 +533,14 @@ static std::vector<float> build_prefix_embedding(confucius4_tts_context* ctx, co
     ggml_tensor* bos_id = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
     ggml_set_name(bos_id, "bos_id");
     ggml_set_input(bos_id);
+    ggml_set_output(bos_id);
 
     ggml_tensor* bos_emb = ggml_get_rows(ctx0, m.semantic_embed_w, bos_id);
     // Add semantic position embedding at position 0
     ggml_tensor* sem_pos0_id = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
     ggml_set_name(sem_pos0_id, "sem_pos0_id");
     ggml_set_input(sem_pos0_id);
+    ggml_set_output(sem_pos0_id);
     ggml_tensor* sem_pos0 = ggml_get_rows(ctx0, m.sem_pos_embed_w, sem_pos0_id);
     ggml_tensor* bos_out = ggml_add(ctx0, bos_emb, sem_pos0);
     ggml_set_name(bos_out, "bos_emb_out");
