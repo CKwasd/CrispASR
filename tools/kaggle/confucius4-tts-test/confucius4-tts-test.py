@@ -134,7 +134,7 @@ tts_wav = TEMP / "confucius4_output.wav"
 result = subprocess.run(
     [str(crispasr_bin), "--backend", "confucius4-tts",
      "-m", model_path, "--codec-model", s2a_path,
-     "--tts", test_text, "-of", str(tts_wav), "-v"],
+     "--tts", test_text, "--tts-output", str(tts_wav), "-v"],
     capture_output=True, text=True, timeout=180, env=env,
 )
 print(f"  TTS rc={result.returncode}")
