@@ -629,6 +629,18 @@ static std::vector<float> embed_semantic_token(confucius4_tts_context* ctx, int3
     const auto& m = ctx->t2s;
     const int D = m.hp.model_dim;
 
+    // Bounds check
+    if (token_id < 0 || token_id >= (int32_t)m.semantic_embed_w->ne[1]) {
+        fprintf(stderr, "confucius4: embed_semantic_token: token_id=%d OUT OF RANGE [0,%lld)\n", token_id,
+                (long long)m.semantic_embed_w->ne[1]);
+        return {};
+    }
+    if (sem_pos < 0 || sem_pos >= (int)m.sem_pos_embed_w->ne[1]) {
+        fprintf(stderr, "confucius4: embed_semantic_token: sem_pos=%d OUT OF RANGE [0,%lld)\n", sem_pos,
+                (long long)m.sem_pos_embed_w->ne[1]);
+        return {};
+    }
+
     size_t ctx_size = ggml_tensor_overhead() * 16 + ggml_graph_overhead_custom(64, false);
     ggml_init_params ip = {ctx_size, nullptr, true};
     ggml_context* ctx0 = ggml_init(ip);
@@ -792,7 +804,7 @@ static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::v
         return {};
     }
 
-    if (vb >= 2)
+    if (vb >= 1)
         fprintf(stderr, "confucius4: prefill done, logits[0..3] = %.3f %.3f %.3f %.3f\n", logits[0], logits[1],
                 logits[2], logits[3]);
 
@@ -829,8 +841,8 @@ static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::v
         }
         n_past++;
 
-        if (vb >= 2 && step < 5)
-            fprintf(stderr, "confucius4: step %d: token=%d\n", step, token);
+        if (vb >= 1 && step < 10)
+            fprintf(stderr, "confucius4: step %d: token=%d, n_past=%d\n", step, token, n_past);
     }
 
     if (vb >= 1)
