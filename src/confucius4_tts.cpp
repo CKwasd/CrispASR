@@ -581,7 +581,8 @@ static std::vector<float> build_prefix_embedding(confucius4_tts_context* ctx, co
         ggml_backend_tensor_get(ids, &id0, 0, sizeof(int32_t));
         fprintf(stderr, "confucius4: prefix graph: ids[0]=%d (expect %d), ids tensor ne=[%lld,%lld]\n", id0,
                 text_ids[0], (long long)ids->ne[0], (long long)ids->ne[1]);
-        fprintf(stderr, "confucius4: prefix graph: graph nodes=%d leafs=%d\n", gf->n_nodes, gf->n_leafs);
+        fprintf(stderr, "confucius4: prefix graph: graph nodes=%d leafs=%d\n", ggml_graph_n_nodes(gf),
+                ggml_graph_n_nodes(gf)); // leafs count not exposed, use nodes as proxy
     }
 
     ggml_backend_sched_graph_compute(sched, gf);
