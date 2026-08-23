@@ -105,9 +105,19 @@ struct confucius4_t2s_model {
 // Context
 // ---------------------------------------------------------------------------
 
+// KV cache for the GPT-2 T2S model.
+struct confucius4_kv_cache {
+    ggml_tensor* k = nullptr; // (hd, max_seq, n_heads, n_layers) F16
+    ggml_tensor* v = nullptr;
+    ggml_context* ctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    int max_seq_len = 0;
+};
+
 struct confucius4_tts_context {
     confucius4_tts_params params;
     confucius4_t2s_model t2s;
+    confucius4_kv_cache kv;
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
@@ -376,20 +386,197 @@ int confucius4_tts_set_speaker(confucius4_tts_context* ctx, const float* semanti
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// KV cache helpers
+// ---------------------------------------------------------------------------
+
+static bool kv_init(confucius4_kv_cache& kv, const confucius4_t2s_hparams& hp, int max_seq, ggml_backend_t backend) {
+    kv.max_seq_len = max_seq;
+    size_t ctx_size = 2 * ggml_tensor_overhead() + 64;
+    ggml_init_params ip = {ctx_size, nullptr, true};
+    kv.ctx = ggml_init(ip);
+    if (!kv.ctx)
+        return false;
+    kv.k = ggml_new_tensor_4d(kv.ctx, GGML_TYPE_F16, hp.head_dim(), max_seq, hp.num_heads, hp.num_layers);
+    kv.v = ggml_new_tensor_4d(kv.ctx, GGML_TYPE_F16, hp.head_dim(), max_seq, hp.num_heads, hp.num_layers);
+    ggml_set_name(kv.k, "kv_k");
+    ggml_set_name(kv.v, "kv_v");
+    kv.buf = ggml_backend_alloc_ctx_tensors(kv.ctx, backend);
+    if (!kv.buf)
+        return false;
+    ggml_backend_tensor_memset(kv.k, 0, 0, ggml_nbytes(kv.k));
+    ggml_backend_tensor_memset(kv.v, 0, 0, ggml_nbytes(kv.v));
+    return true;
+}
+
+static void kv_free(confucius4_kv_cache& kv) {
+    if (kv.buf)
+        ggml_backend_buffer_free(kv.buf);
+    if (kv.ctx)
+        ggml_free(kv.ctx);
+    kv = {};
+}
+
+// ---------------------------------------------------------------------------
+// Top-p sampling
+// ---------------------------------------------------------------------------
+
+static int sample_top_p(const float* logits, int n_vocab, float temperature, float top_p, int top_k,
+                        std::mt19937& rng) {
+    std::vector<std::pair<float, int>> candidates(n_vocab);
+    for (int i = 0; i < n_vocab; i++)
+        candidates[i] = {logits[i] / temperature, i};
+
+    // Top-k filter
+    if (top_k > 0 && top_k < n_vocab) {
+        std::partial_sort(candidates.begin(), candidates.begin() + top_k, candidates.end(),
+                          [](const auto& a, const auto& b) { return a.first > b.first; });
+        candidates.resize(top_k);
+    } else {
+        std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    }
+
+    // Softmax
+    float max_val = candidates[0].first;
+    float sum = 0.0f;
+    for (auto& c : candidates) {
+        c.first = expf(c.first - max_val);
+        sum += c.first;
+    }
+    for (auto& c : candidates)
+        c.first /= sum;
+
+    // Top-p nucleus filter
+    float cumsum = 0.0f;
+    int last = (int)candidates.size();
+    for (int i = 0; i < (int)candidates.size(); i++) {
+        cumsum += candidates[i].first;
+        if (cumsum >= top_p) {
+            last = i + 1;
+            break;
+        }
+    }
+    candidates.resize(last);
+
+    // Re-normalise and sample
+    sum = 0.0f;
+    for (auto& c : candidates)
+        sum += c.first;
+    std::uniform_real_distribution<float> dist(0.0f, sum);
+    float r = dist(rng);
+    cumsum = 0.0f;
+    for (auto& c : candidates) {
+        cumsum += c.first;
+        if (cumsum >= r)
+            return c.second;
+    }
+    return candidates.back().second;
+}
+
+// ---------------------------------------------------------------------------
+// T2S decode: generate semantic codes from text token IDs
+// ---------------------------------------------------------------------------
+
+static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::vector<int32_t>& text_token_ids) {
+    const auto& hp = ctx->t2s.hp;
+    const int D = hp.model_dim;
+    const int T_text = (int)text_token_ids.size();
+    // prefix: condition_emb(1) + text(T_text) + BOS(1)
+    const int prefix_len = 1 + T_text + 1;
+    const int max_new =
+        ctx->params.max_semantic_tokens > 0 ? ctx->params.max_semantic_tokens : hp.max_semantic_seq_lens;
+    const int max_seq = prefix_len + max_new;
+    const int vb = ctx->params.verbosity;
+
+    // Allocate KV cache
+    kv_free(ctx->kv);
+    if (!kv_init(ctx->kv, hp, max_seq, ctx->backend)) {
+        fprintf(stderr, "confucius4: KV cache allocation failed\n");
+        return {};
+    }
+
+    // Seed RNG
+    std::mt19937 rng(ctx->params.seed ? ctx->params.seed : 42);
+
+    // ── Build prefix embedding on CPU ──
+    // [condition_emb(1,D) | text_emb(T_text,D) | semantic_emb(BOS,D)]
+    std::vector<float> prefix_emb(prefix_len * D, 0.0f);
+
+    // condition_emb: speaker encoder output. For now, use a zero vector
+    // (no speaker conditioning — produces generic voice).
+    // TODO: run ECAPA-TDNN speaker encoder on Wav2Vec2-BERT features.
+
+    // text_emb: Embedding(text_ids) → fc1 → SiLU → fc2 + positional embedding
+    // This requires running the text projector subgraph. For now, use get_rows
+    // on the frozen embedding, then we'll need the MLP projection.
+    // Simplified: just embed the tokens (no MLP projection for now — needs graph).
+    // TODO: proper text embedding with MLP projection
+
+    // semantic BOS embedding
+    // TODO: get_rows for the BOS token from semantic_embedding.weight
+
+    (void)D;
+    (void)prefix_emb;
+
+    if (vb >= 1) {
+        fprintf(stderr, "confucius4: T2S decode: text_len=%d, prefix_len=%d, max_new=%d\n", T_text, prefix_len,
+                max_new);
+    }
+
+    // For now, since we can't run the embedding subgraphs without a full
+    // ggml graph (the text projector has an MLP), report what we'd need:
+    fprintf(stderr, "confucius4: T2S autoregressive decode not yet functional "
+                    "(text projector MLP + speaker encoder need graph execution). "
+                    "Model loads and KV cache allocates OK.\n");
+
+    kv_free(ctx->kv);
+    return {};
+}
+
 float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, const char* lang, int* out_n_samples) {
     if (!ctx || !text || !out_n_samples)
         return nullptr;
 
-    // TODO: implement the full pipeline:
-    // 1. Tokenize text with SentencePiece
-    // 2. Run speaker encoder on conditioning features → condition_emb
-    // 3. Build prefix: [condition_emb | text_emb | BOS]
-    // 4. Autoregressive GPT-2 decode → semantic codes
-    // 5. S2A flow-matching → mel
-    // 6. BigVGAN vocoder → PCM
-
     (void)lang;
-    fprintf(stderr, "confucius4: synthesis not yet implemented\n");
+    const int vb = ctx->params.verbosity;
+
+    // Step 1: Tokenize text. For now, use a hardcoded test sequence.
+    // TODO: wire SentencePiece tokenizer from companion file.
+    std::vector<int32_t> text_ids;
+    const char* env_ids = std::getenv("CRISPASR_CONFUCIUS4_TEXT_IDS");
+    if (env_ids) {
+        // Parse comma-separated token IDs from env var (testing path)
+        std::string s(env_ids);
+        size_t pos = 0;
+        while (pos < s.size()) {
+            size_t comma = s.find(',', pos);
+            if (comma == std::string::npos)
+                comma = s.size();
+            text_ids.push_back(std::stoi(s.substr(pos, comma - pos)));
+            pos = comma + 1;
+        }
+        if (vb >= 1)
+            fprintf(stderr, "confucius4: using %zu text IDs from CRISPASR_CONFUCIUS4_TEXT_IDS\n", text_ids.size());
+    } else {
+        fprintf(stderr, "confucius4: no tokenizer available yet. Set CRISPASR_CONFUCIUS4_TEXT_IDS=id1,id2,... "
+                        "to test with pre-tokenized input.\n");
+        *out_n_samples = 0;
+        return nullptr;
+    }
+
+    // Step 2: T2S decode → semantic codes
+    std::vector<int32_t> semantic_codes = t2s_decode(ctx, text_ids);
+    if (semantic_codes.empty()) {
+        if (vb >= 1)
+            fprintf(stderr, "confucius4: T2S produced no semantic codes\n");
+        *out_n_samples = 0;
+        return nullptr;
+    }
+
+    // Steps 3-4: S2A flow-matching → mel → BigVGAN → PCM
+    // TODO: implement S2A and vocoder
+    fprintf(stderr, "confucius4: generated %zu semantic codes (S2A + vocoder not yet implemented)\n",
+            semantic_codes.size());
     *out_n_samples = 0;
     return nullptr;
 }
@@ -402,6 +589,7 @@ void confucius4_tts_free(confucius4_tts_context* ctx) {
     if (!ctx)
         return;
 
+    kv_free(ctx->kv);
     if (ctx->buf_w)
         ggml_backend_buffer_free(ctx->buf_w);
     if (ctx->ctx_w)
