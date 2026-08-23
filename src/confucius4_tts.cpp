@@ -489,127 +489,132 @@ static std::vector<float> build_prefix_embedding(confucius4_tts_context* ctx, co
     const int T_text = (int)text_ids.size();
     const int prefix_len = 1 + T_text + 1; // condition(1) + text(T) + BOS(1)
 
-    // Build the text projector graph: embed → fc1 → silu → fc2
-    const int n_tensors = 64;
-    size_t ctx_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead_custom(256, false);
-    ggml_init_params ip = {ctx_size, nullptr, true};
-    ggml_context* ctx0 = ggml_init(ip);
-    if (!ctx0)
-        return {};
+    // Helper: run a small embedding graph via gallocr
+    auto run_embed_graph = [&](auto build_fn) -> bool {
+        const int nt = 32;
+        size_t cs = ggml_tensor_overhead() * nt + ggml_graph_overhead_custom(64, false);
+        ggml_init_params ip2 = {cs, nullptr, true};
+        ggml_context* c = ggml_init(ip2);
+        if (!c)
+            return false;
+        ggml_cgraph* g = ggml_new_graph_custom(c, 64, false);
+        build_fn(c, g);
+        ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        bool ok = ggml_gallocr_alloc_graph(ga, g);
+        if (!ok) {
+            ggml_gallocr_free(ga);
+            ggml_free(c);
+            return false;
+        }
+        return true; // caller must set inputs, compute, read outputs, then free ga+c
+    };
+    (void)run_embed_graph; // suppress unused warning — used below
 
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 256, false);
-
-    // Input: text token IDs
-    // All index inputs marked as both input AND output to prevent gallocr from
-    // reusing their buffers before later get_rows ops consume them (#377 debug:
-    // gallocr aliased pos_ids with an intermediate, corrupting the index values).
-    ggml_tensor* ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_text);
-    ggml_set_name(ids, "text_ids");
-    ggml_set_input(ids);
-    ggml_set_output(ids);
-
-    // Embedding lookup: (4096, T_text)
-    ggml_tensor* emb = ggml_get_rows(ctx0, m.text_embed_w, ids);
-
-    // MLP: fc1(4096→4096) → SiLU → fc2(4096→1280)
-    ggml_tensor* h = ggml_mul_mat(ctx0, m.text_proj_fc1_w, emb);
-    h = ggml_add(ctx0, h, m.text_proj_fc1_b);
-    h = ggml_silu(ctx0, h);
-    h = ggml_mul_mat(ctx0, m.text_proj_fc2_w, h);
-    h = ggml_add(ctx0, h, m.text_proj_fc2_b); // (D, T_text)
-
-    // Add text positional embedding: pos_emb[0..T_text-1]
-    ggml_tensor* pos_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_text);
-    ggml_set_name(pos_ids, "text_pos_ids");
-    ggml_set_input(pos_ids);
-    ggml_set_output(pos_ids);
-
-    ggml_tensor* pos_emb = ggml_get_rows(ctx0, m.text_pos_embed_w, pos_ids);
-    ggml_tensor* text_emb = ggml_add(ctx0, h, pos_emb); // (D, T_text)
-    ggml_set_name(text_emb, "text_emb_out");
-    ggml_set_output(text_emb);
-
-    // BOS semantic embedding: semantic_embed[start_token]
-    ggml_tensor* bos_id = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
-    ggml_set_name(bos_id, "bos_id");
-    ggml_set_input(bos_id);
-    ggml_set_output(bos_id);
-
-    ggml_tensor* bos_emb = ggml_get_rows(ctx0, m.semantic_embed_w, bos_id);
-    // Add semantic position embedding at position 0
-    ggml_tensor* sem_pos0_id = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
-    ggml_set_name(sem_pos0_id, "sem_pos0_id");
-    ggml_set_input(sem_pos0_id);
-    ggml_set_output(sem_pos0_id);
-    ggml_tensor* sem_pos0 = ggml_get_rows(ctx0, m.sem_pos_embed_w, sem_pos0_id);
-    ggml_tensor* bos_out = ggml_add(ctx0, bos_emb, sem_pos0);
-    ggml_set_name(bos_out, "bos_emb_out");
-    ggml_set_output(bos_out);
-
-    ggml_build_forward_expand(gf, text_emb);
-    ggml_build_forward_expand(gf, bos_out);
-
-    // Allocate compute buffers with gallocr. Weight tensors already have valid
-    // buffers from load_weights — gallocr skips them and only allocates the new
-    // compute intermediates + inputs.
-    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
-    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
-        fprintf(stderr, "confucius4: prefix graph alloc failed\n");
-        ggml_gallocr_free(galloc);
-        ggml_free(ctx0);
-        return {};
-    }
-
-    // Debug: print shapes for diagnosis
-    if (ctx->params.verbosity >= 1) {
-        fprintf(stderr, "confucius4: prefix graph: text_embed_w ne=[%lld,%lld] type=%d\n",
-                (long long)m.text_embed_w->ne[0], (long long)m.text_embed_w->ne[1], (int)m.text_embed_w->type);
-        fprintf(stderr, "confucius4: prefix graph: T_text=%d, max_id=%d\n", T_text,
-                *std::max_element(text_ids.begin(), text_ids.end()));
-        fprintf(stderr, "confucius4: prefix graph: semantic_embed ne=[%lld,%lld], BOS=%d\n",
-                (long long)m.semantic_embed_w->ne[0], (long long)m.semantic_embed_w->ne[1], hp.start_semantic_token);
-    }
-
-    // Set inputs
-    ggml_backend_tensor_set(ids, text_ids.data(), 0, T_text * sizeof(int32_t));
-
-    std::vector<int32_t> pos_data(T_text);
-    for (int i = 0; i < T_text; i++)
-        pos_data[i] = i;
-    ggml_backend_tensor_set(pos_ids, pos_data.data(), 0, T_text * sizeof(int32_t));
-
-    int32_t bos_val = hp.start_semantic_token;
-    ggml_backend_tensor_set(bos_id, &bos_val, 0, sizeof(int32_t));
-
-    int32_t sem_pos0_val = 0;
-    ggml_backend_tensor_set(sem_pos0_id, &sem_pos0_val, 0, sizeof(int32_t));
-
-    // Debug: verify index tensor contents before compute
-    if (ctx->params.verbosity >= 1) {
-        int32_t id0 = -1;
-        ggml_backend_tensor_get(ids, &id0, 0, sizeof(int32_t));
-        fprintf(stderr, "confucius4: prefix graph: ids[0]=%d (expect %d), ids tensor ne=[%lld,%lld]\n", id0,
-                text_ids[0], (long long)ids->ne[0], (long long)ids->ne[1]);
-        fprintf(stderr, "confucius4: prefix graph: graph nodes=%d leafs=%d\n", ggml_graph_n_nodes(gf),
-                ggml_graph_n_nodes(gf)); // leafs count not exposed, use nodes as proxy
-    }
-
-    ggml_backend_graph_compute(ctx->backend, gf);
-
-    // Read results
     std::vector<float> result(prefix_len * D, 0.0f);
 
-    // Slot 0: condition_emb — zero for now (no speaker encoder)
-    // (already zeroed)
+    // ── Sub-graph 1: text projector MLP ──
+    {
+        const int nt = 32;
+        size_t cs = ggml_tensor_overhead() * nt + ggml_graph_overhead_custom(64, false);
+        ggml_init_params ip2 = {cs, nullptr, true};
+        ggml_context* c = ggml_init(ip2);
+        ggml_cgraph* g = ggml_new_graph_custom(c, 64, false);
 
-    // Slot 1..T_text: text embeddings
-    ggml_backend_tensor_get(text_emb, result.data() + D, 0, (size_t)T_text * D * sizeof(float));
+        ggml_tensor* ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, T_text);
+        ggml_set_name(ids, "ids");
+        ggml_set_input(ids);
 
-    // Slot T_text+1: BOS embedding
-    ggml_backend_tensor_get(bos_out, result.data() + (1 + T_text) * D, 0, (size_t)D * sizeof(float));
+        ggml_tensor* emb = ggml_get_rows(c, m.text_embed_w, ids);
+        ggml_tensor* h = ggml_mul_mat(c, m.text_proj_fc1_w, emb);
+        h = ggml_add(c, h, m.text_proj_fc1_b);
+        h = ggml_silu(c, h);
+        h = ggml_mul_mat(c, m.text_proj_fc2_w, h);
+        h = ggml_add(c, h, m.text_proj_fc2_b);
 
-    ggml_gallocr_free(galloc);
-    ggml_free(ctx0);
+        ggml_tensor* pos_ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, T_text);
+        ggml_set_name(pos_ids, "pos");
+        ggml_set_input(pos_ids);
+
+        ggml_tensor* pos_emb = ggml_get_rows(c, m.text_pos_embed_w, pos_ids);
+        ggml_tensor* out = ggml_add(c, h, pos_emb);
+        ggml_set_name(out, "text_emb");
+        ggml_set_output(out);
+        ggml_build_forward_expand(g, out);
+
+        ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        if (!ggml_gallocr_alloc_graph(ga, g)) {
+            fprintf(stderr, "confucius4: text projector graph alloc failed\n");
+            ggml_gallocr_free(ga);
+            ggml_free(c);
+            return {};
+        }
+
+        ggml_backend_tensor_set(ids, text_ids.data(), 0, T_text * sizeof(int32_t));
+        std::vector<int32_t> pos_data(T_text);
+        for (int i = 0; i < T_text; i++)
+            pos_data[i] = i;
+        ggml_backend_tensor_set(pos_ids, pos_data.data(), 0, T_text * sizeof(int32_t));
+
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "confucius4: text projector: computing %d tokens...\n", T_text);
+
+        ggml_backend_graph_compute(ctx->backend, g);
+        ggml_backend_tensor_get(out, result.data() + D, 0, (size_t)T_text * D * sizeof(float));
+
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "confucius4: text projector: OK\n");
+
+        ggml_gallocr_free(ga);
+        ggml_free(c);
+    }
+
+    // ── Sub-graph 2: BOS semantic embedding ──
+    {
+        const int nt = 16;
+        size_t cs = ggml_tensor_overhead() * nt + ggml_graph_overhead_custom(32, false);
+        ggml_init_params ip2 = {cs, nullptr, true};
+        ggml_context* c = ggml_init(ip2);
+        ggml_cgraph* g = ggml_new_graph_custom(c, 32, false);
+
+        ggml_tensor* bos_id = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);
+        ggml_set_name(bos_id, "bos");
+        ggml_set_input(bos_id);
+        ggml_tensor* bos_emb = ggml_get_rows(c, m.semantic_embed_w, bos_id);
+
+        ggml_tensor* sem_pos_id = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);
+        ggml_set_name(sem_pos_id, "spos");
+        ggml_set_input(sem_pos_id);
+        ggml_tensor* sem_pos = ggml_get_rows(c, m.sem_pos_embed_w, sem_pos_id);
+
+        ggml_tensor* out = ggml_add(c, bos_emb, sem_pos);
+        ggml_set_name(out, "bos_emb");
+        ggml_set_output(out);
+        ggml_build_forward_expand(g, out);
+
+        ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        if (!ggml_gallocr_alloc_graph(ga, g)) {
+            fprintf(stderr, "confucius4: BOS graph alloc failed\n");
+            ggml_gallocr_free(ga);
+            ggml_free(c);
+            return {};
+        }
+
+        int32_t bos_val = hp.start_semantic_token;
+        ggml_backend_tensor_set(bos_id, &bos_val, 0, sizeof(int32_t));
+        int32_t sem_pos0_val = 0;
+        ggml_backend_tensor_set(sem_pos_id, &sem_pos0_val, 0, sizeof(int32_t));
+
+        ggml_backend_graph_compute(ctx->backend, g);
+        ggml_backend_tensor_get(out, result.data() + (1 + T_text) * D, 0, (size_t)D * sizeof(float));
+
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "confucius4: BOS embed: OK\n");
+
+        ggml_gallocr_free(ga);
+        ggml_free(c);
+    }
+
+    // Slot 0: condition_emb — zero for now (already zeroed)
     return result;
 }
 
