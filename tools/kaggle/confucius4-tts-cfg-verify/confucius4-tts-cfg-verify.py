@@ -56,7 +56,8 @@ kh.init_progress()
 
 # ── Phase 1: deps + HF token ────────────────────────────────────────────────
 kh.step("install deps")
-kh.sh_with_progress("pip install -q huggingface_hub hf_transfer tokenizers pyyaml librosa scipy")
+kh.sh_with_progress("pip install -q huggingface_hub hf_transfer tokenizers pyyaml librosa scipy "
+                    "torchaudio safetensors transformers")
 
 kh.step("resolve HF token")
 hf_token = kh.resolve_hf_token()
@@ -158,6 +159,68 @@ wav_ok = runs["q4_k"]["ok"]
 tts_wav = runs["q4_k"]["wav"]
 
 
+# ── Phase 6b: speaker conditioning ──────────────────────────────────────────
+# The model is zero-shot -- run 3 showed the PyTorch reference itself babbles
+# with zero conditioning.  Feed real conditioning derived from a reference wav
+# and see whether the roundtrip passes.  Two arms, cheap one first:
+#   s2a-only : CAMPPlus style + reference mel  (needs only campplus, ~28 MB)
+#   full     : + the T2S condition_emb         (needs w2v-BERT 2.4 GB + T2S 2.6 GB)
+# If s2a-only already yields speech, the semantic codes were fine all along and
+# the T2S condition_emb is a voice-identity refinement rather than a blocker.
+kh.step("speaker conditioning")
+dumper = REPO / "tools" / "confucius4_dump_conditioning.py"
+prompt_wav = REPO / "samples" / "jfk.wav"
+w2v_stats = None
+
+cond_runs = {}
+for arm in ("s2a-only", "full"):
+    cdir = TEMP / f"cond_{arm}"
+    cmd = [sys.executable, str(dumper), "--ref-repo", str(REF),
+           "--prompt-wav", str(prompt_wav), "--out-dir", str(cdir)]
+    if arm == "s2a-only":
+        cmd.append("--no-w2v")
+    else:
+        if w2v_stats is None:
+            w2v_stats = grab("netease-youdao/Confucius4-TTS", "wav2vec2bert_stats.pt",
+                             d=str(TEMP / "torch"))
+        t2s_ckpt = grab("netease-youdao/Confucius4-TTS", "t2s_model.safetensors",
+                        d=str(TEMP / "torch"))
+        cmd += ["--t2s-ckpt", t2s_ckpt, "--w2v-stats", w2v_stats]
+
+    dres = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+    print(f"  [{arm}] dumper rc={dres.returncode}")
+    for line in dres.stdout.split("\n"):
+        if line.strip():
+            print(f"  [{arm}] " + line.strip())
+    if dres.returncode != 0:
+        for line in [l for l in dres.stderr.split("\n") if l.strip()][-20:]:
+            print(f"  [{arm}] ! " + line.strip())
+        continue
+
+    wav = TEMP / f"confucius4_cond_{arm}.wav"
+    dump = TEMP / f"dump_cond_{arm}"
+    dump.mkdir(parents=True, exist_ok=True)
+    env = dict(env_base)
+    env["CRISPASR_CONFUCIUS4_COND_DIR"] = str(cdir)
+    env["CRISPASR_CONFUCIUS4_DUMP_S2A"] = str(dump)
+    r = subprocess.run(
+        [crispasr_bin, "--backend", "confucius4-tts", "-m", t2s_path,
+         "--codec-model", s2a_f16, "--tts", TEST_TEXT,
+         "--tts-output", str(wav), "--tts-steps", str(ODE_STEPS), "-v"],
+        capture_output=True, text=True, timeout=7200, env=env,
+    )
+    ok = wav.exists() and os.path.getsize(str(wav)) > 100
+    print(f"  [{arm}] TTS rc={r.returncode} wav={'%d B' % os.path.getsize(str(wav)) if ok else 'NONE'}")
+    for line in r.stderr.split("\n"):
+        if any(k in line for k in ("conditioning set", "flow-matching:", "EOS at", "semantic codes",
+                                   "BigVGAN:")):
+            print(f"  [{arm}] " + line.strip())
+    if r.returncode != 0:
+        for line in [l for l in r.stderr.split("\n") if l.strip()][-20:]:
+            print(f"  [{arm}] ! " + line.strip())
+    cond_runs[arm] = {"wav": wav, "ok": ok}
+
+
 # ── Phase 7: per-stage parity against the real PyTorch S2A ──────────────────
 kh.step("S2A parity vs PyTorch reference")
 parity = REPO / "tools" / "s2a_parity.py"
@@ -214,8 +277,10 @@ def asr_score(tag, path):
     return len(hit)
 
 
-asr_score("cpp-cli-q4_k", str(runs["q4_k"]["wav"]) if runs["q4_k"]["ok"] else None)
-asr_score("cpp-cli-f16", str(runs["f16"]["wav"]) if runs["f16"]["ok"] else None)
+asr_score("nocond-q4_k", str(runs["q4_k"]["wav"]) if runs["q4_k"]["ok"] else None)
+asr_score("nocond-f16", str(runs["f16"]["wav"]) if runs["f16"]["ok"] else None)
+for _arm, _r in cond_runs.items():
+    asr_score(f"COND-{_arm}", str(_r["wav"]) if _r["ok"] else None)
 asr_score("cpp-mel/torch-voc", str(TEMP / "vocoded" / "cpp_mel.wav"))
 asr_score("REF-mel/torch-voc", str(TEMP / "vocoded" / "ref_mel.wav"))
 print("  NOTE: if REF-mel is also ~0%, the port is not the blocker -- the model is")

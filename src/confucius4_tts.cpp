@@ -208,6 +208,18 @@ struct confucius4_tts_context {
     std::vector<float> speaker_style_embedding; // (192,)
     bool has_speaker = false;
 
+    // Pre-computed T2S condition embedding: speaker_encoder(w2v_bert_layer17)
+    // in the reference, i.e. the (1, model_dim) vector prepended to the GPT-2
+    // prefix.  Injecting it directly avoids porting the 600M w2v-BERT and the
+    // ECAPA-TDNN speaker encoder just to prove the pipeline.
+    std::vector<float> condition_embedding; // (model_dim,)
+    bool has_condition_emb = false;
+
+    // Reference mel prompt for the S2A stage (prompt_feat in the blueprint):
+    // (n_prompt_frames, mel_dim), prepended to the flow-matching state.
+    std::vector<float> prompt_mel;
+    int prompt_n_frames = 0;
+
     // BPE tokenizer (loaded from GGUF tokenizer.ggml.tokens + merges)
     std::vector<std::string> bpe_id_to_token;
     std::unordered_map<std::string, int32_t> bpe_token_to_id;
@@ -650,6 +662,89 @@ int confucius4_tts_set_vocoder_path(confucius4_tts_context* ctx, const char* pat
     return 0;
 }
 
+int confucius4_tts_set_conditioning(confucius4_tts_context* ctx, const float* condition_embedding, int cond_dim,
+                                    const float* style_embedding, int style_dim, const float* prompt_mel,
+                                    int n_prompt_frames, int mel_dim) {
+    if (!ctx)
+        return -1;
+
+    if (condition_embedding && cond_dim > 0) {
+        if (cond_dim != ctx->t2s.hp.model_dim) {
+            fprintf(stderr, "confucius4: condition embedding dim %d != model_dim %d\n", cond_dim,
+                    ctx->t2s.hp.model_dim);
+            return -1;
+        }
+        ctx->condition_embedding.assign(condition_embedding, condition_embedding + cond_dim);
+        ctx->has_condition_emb = true;
+    }
+
+    if (style_embedding && style_dim > 0) {
+        if (style_dim != ctx->s2a.hp.spk_embed_dim) {
+            fprintf(stderr, "confucius4: style embedding dim %d != spk_embed_dim %d\n", style_dim,
+                    ctx->s2a.hp.spk_embed_dim);
+            return -1;
+        }
+        ctx->speaker_style_embedding.assign(style_embedding, style_embedding + style_dim);
+        ctx->has_speaker = true;
+    }
+
+    if (prompt_mel && n_prompt_frames > 0 && mel_dim > 0) {
+        if (mel_dim != ctx->s2a.hp.estimator_mel_dim) {
+            fprintf(stderr, "confucius4: prompt mel dim %d != estimator mel_dim %d\n", mel_dim,
+                    ctx->s2a.hp.estimator_mel_dim);
+            return -1;
+        }
+        ctx->prompt_mel.assign(prompt_mel, prompt_mel + (size_t)n_prompt_frames * mel_dim);
+        ctx->prompt_n_frames = n_prompt_frames;
+    }
+
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "confucius4: conditioning set: cond_emb=%s style=%s prompt_mel=%d frames\n",
+                ctx->has_condition_emb ? "yes" : "no", ctx->has_speaker ? "yes" : "no", ctx->prompt_n_frames);
+    return 0;
+}
+
+// Testing path: load pre-computed conditioning from raw float32 files in <dir>
+// (condition_emb.bin, style_embedding.bin, prompt_mel.bin), mirroring the
+// CRISPASR_CONFUCIUS4_TEXT_IDS escape hatch.  Sizes are inferred from the file
+// lengths, so a wrong-sized dump is reported rather than silently reshaped.
+static void load_conditioning_from_env(confucius4_tts_context* ctx) {
+    const char* dir = std::getenv("CRISPASR_CONFUCIUS4_COND_DIR");
+    if (!dir || !*dir)
+        return;
+
+    auto read_f32 = [&](const char* fname, std::vector<float>& out) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dir, fname);
+        FILE* f = fopen(path, "rb");
+        if (!f)
+            return false;
+        fseek(f, 0, SEEK_END);
+        long nbytes = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        out.resize((size_t)nbytes / sizeof(float));
+        size_t got = fread(out.data(), sizeof(float), out.size(), f);
+        fclose(f);
+        if (got != out.size()) {
+            out.clear();
+            return false;
+        }
+        return true;
+    };
+
+    std::vector<float> cond_emb, style, pmel;
+    read_f32("condition_emb.bin", cond_emb);
+    read_f32("style_embedding.bin", style);
+    read_f32("prompt_mel.bin", pmel);
+
+    const int mel_dim = ctx->s2a.hp.estimator_mel_dim > 0 ? ctx->s2a.hp.estimator_mel_dim : 80;
+    const int n_prompt = pmel.empty() ? 0 : (int)(pmel.size() / mel_dim);
+
+    confucius4_tts_set_conditioning(ctx, cond_emb.empty() ? nullptr : cond_emb.data(), (int)cond_emb.size(),
+                                    style.empty() ? nullptr : style.data(), (int)style.size(),
+                                    pmel.empty() ? nullptr : pmel.data(), n_prompt, mel_dim);
+}
+
 int confucius4_tts_set_speaker(confucius4_tts_context* ctx, const float* semantic_features, int n_frames,
                                const float* style_embedding) {
     if (!ctx || !semantic_features || !style_embedding || n_frames <= 0)
@@ -890,7 +985,14 @@ static std::vector<float> build_prefix_embedding(confucius4_tts_context* ctx, co
         ggml_free(c);
     }
 
-    // Slot 0: condition_emb — zero for now (already zeroed)
+    // Slot 0: condition_emb.  In the reference this is
+    // speaker_encoder(w2v_bert_layer17), a (1, model_dim) vector prepended to
+    // the prefix.  Without a reference wav it stays zero -- note that is NOT
+    // what the reference computes for "no speaker" (the ECAPA-TDNN has biases),
+    // it simply has no such mode.
+    if (ctx->has_condition_emb && (int)ctx->condition_embedding.size() == D)
+        std::memcpy(result.data(), ctx->condition_embedding.data(), (size_t)D * sizeof(float));
+
     return result;
 }
 
@@ -2098,8 +2200,13 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
     const auto& s = ctx->s2a;
     const auto& hp = s.hp;
     const int T_sem = (int)semantic_codes.size();
-    const int T_mel = (int)(T_sem * 1.72);    // heuristic from Python
+    const int T_mel = (int)(T_sem * 1.72);    // heuristic from Python (target length)
     const int mel_dim = hp.estimator_mel_dim; // detected from weights (may be 80 or 512)
+    // Reference-mel prompt.  MaskedDiffWithXvec.inference prepends T_ref frames
+    // of the learned prompt_cond to the conditioning, solves over T_ref + T_mel,
+    // and strips the prompt span off the result.
+    const int T_ref = (int)ctx->prompt_mel.size() / (mel_dim > 0 ? mel_dim : 1);
+    const int T_total = T_ref + T_mel;
     const int vb = ctx->params.verbosity;
     const int n_steps = ctx->params.ode_steps > 0 ? ctx->params.ode_steps : 25;
 
@@ -2112,8 +2219,10 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
             cfg_rate = strtof(env_cfg, nullptr);
 
     if (vb >= 1)
-        fprintf(stderr, "confucius4: S2A flow-matching: T_sem=%d → T_mel=%d, mel_dim=%d, %d ODE steps, cfg=%.2f\n",
-                T_sem, T_mel, mel_dim, n_steps, cfg_rate);
+        fprintf(stderr,
+                "confucius4: S2A flow-matching: T_sem=%d → T_mel=%d (+%d prompt), mel_dim=%d, %d ODE steps, "
+                "cfg=%.2f\n",
+                T_sem, T_mel, T_ref, mel_dim, n_steps, cfg_rate);
 
     if (s2a_dump_dir()) {
         char shp[64];
@@ -2126,9 +2235,24 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
     }
 
     // Build semantic conditioning → (T_mel, cond_dim=512) row-major
-    std::vector<float> cond = s2a_build_conditioning(ctx, semantic_codes, T_mel, lm_latent);
-    if (cond.empty())
+    std::vector<float> cond_target = s2a_build_conditioning(ctx, semantic_codes, T_mel, lm_latent);
+    if (cond_target.empty())
         return {};
+
+    const int cond_dim = (int)(cond_target.size() / (size_t)T_mel);
+
+    // cat([prompt_cond expanded to T_ref, cond_target]) → (T_total, cond_dim)
+    std::vector<float> cond;
+    if (T_ref > 0) {
+        auto pc = s2a_read_f32(s.prompt_cond); // learned (1, 1, cond_dim) parameter
+        cond.assign((size_t)T_total * cond_dim, 0.0f);
+        for (int t = 0; t < T_ref; t++)
+            if ((int)pc.size() >= cond_dim)
+                std::memcpy(cond.data() + (size_t)t * cond_dim, pc.data(), (size_t)cond_dim * sizeof(float));
+        std::memcpy(cond.data() + (size_t)T_ref * cond_dim, cond_target.data(), cond_target.size() * sizeof(float));
+    } else {
+        cond = std::move(cond_target);
+    }
 
     // Initialize noise: z ~ N(0, 1) of shape (T_mel, mel_dim) row-major
     std::mt19937 rng(ctx->params.seed ? ctx->params.seed : 42);
@@ -2139,18 +2263,23 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
     if (const char* env_t = std::getenv("CRISPASR_CONFUCIUS4_S2A_TEMP"))
         if (*env_t)
             temperature = strtof(env_t, nullptr);
-    std::vector<float> z((size_t)T_mel * mel_dim);
+    std::vector<float> z((size_t)T_total * mel_dim);
     for (auto& v : z)
         v = dist(rng) * temperature;
+    // solve_euler zeroes x over the prompt span before the loop and again after
+    // every step.
+    std::fill(z.begin(), z.begin() + (size_t)T_ref * mel_dim, 0.0f);
 
     if (s2a_dump_dir()) {
         char shp[64];
-        snprintf(shp, sizeof(shp), "%d,%d", T_mel, mel_dim);
+        snprintf(shp, sizeof(shp), "%d,%d", T_total, mel_dim);
         s2a_dump_raw("z_init", z.data(), z.size() * sizeof(float), shp);
     }
 
-    // Reference mel conditioning (zeros — no speaker prompt)
-    std::vector<float> cond_ref((size_t)T_mel * mel_dim, 0.0f);
+    // prompt_x: the reference mel over the prompt span, zero elsewhere.
+    std::vector<float> cond_ref((size_t)T_total * mel_dim, 0.0f);
+    if (T_ref > 0)
+        std::memcpy(cond_ref.data(), ctx->prompt_mel.data(), ctx->prompt_mel.size() * sizeof(float));
 
     // Zeroed conditioning for the unconditioned CFG pass.  cond_ref is already
     // zero while there is no reference mel, but keep the two distinct so the
@@ -2186,7 +2315,7 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
         float t = t_span[step - 1];
 
         // Conditioned pass.
-        auto velocity = s2a_dit_forward(ctx, z.data(), T_mel, mel_dim, cond.data(), cond_ref.data(), t);
+        auto velocity = s2a_dit_forward(ctx, z.data(), T_total, mel_dim, cond.data(), cond_ref.data(), t);
         if (velocity.empty()) {
             fprintf(stderr, "confucius4: DiT forward failed at step %d\n", step);
             return {};
@@ -2213,7 +2342,7 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
         // divergence, instead of only seeing accumulated error in the mel.
         if (s2a_dump_dir()) {
             char nm[64], shp[64];
-            snprintf(shp, sizeof(shp), "%d,%d", T_mel, mel_dim);
+            snprintf(shp, sizeof(shp), "%d,%d", T_total, mel_dim);
             snprintf(nm, sizeof(nm), "z_step_%02d", step);
             s2a_dump_raw(nm, z.data(), z.size() * sizeof(float), shp);
             snprintf(nm, sizeof(nm), "v_step_%02d", step);
@@ -2222,6 +2351,10 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
 
         for (size_t i = 0; i < z.size(); i++)
             z[i] += dt * velocity[i];
+
+        // solve_euler: x[:, :, :prompt_len] = 0 after every step
+        if (T_ref > 0)
+            std::fill(z.begin(), z.begin() + (size_t)T_ref * mel_dim, 0.0f);
 
         if (vb >= 2 && (step <= 3 || step == n_steps)) {
             // Log first few velocity magnitudes for debugging
@@ -2234,6 +2367,10 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
 
     if (vb >= 1)
         fprintf(stderr, "confucius4: S2A flow-matching done (%d steps, mel_dim=%d)\n", n_steps, mel_dim);
+
+    // Strip the prompt span: generated_mel = generated_mel[:, :, T_ref:]
+    if (T_ref > 0)
+        z.erase(z.begin(), z.begin() + (size_t)T_ref * mel_dim);
 
     if (s2a_dump_dir()) {
         char shp[64];
@@ -2250,6 +2387,8 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
 
     (void)lang;
     const int vb = ctx->params.verbosity;
+
+    load_conditioning_from_env(ctx);
 
     // Step 1: Tokenize text
     std::vector<int32_t> text_ids;

@@ -66,6 +66,18 @@ int confucius4_tts_set_vocoder_path(struct confucius4_tts_context* ctx, const ch
 int confucius4_tts_set_speaker(struct confucius4_tts_context* ctx, const float* semantic_features, int n_frames,
                                const float* style_embedding);
 
+// Set pre-computed speaker conditioning directly, bypassing the (unported)
+// Wav2Vec2-BERT and ECAPA-TDNN speaker encoders.
+//   condition_embedding: (model_dim,) = speaker_encoder(w2v_bert layer 17) in
+//                        the reference; prepended to the GPT-2 prefix.
+//   style_embedding:     (spk_embed_dim,) from CAMPPlus; the DiT's `spks`.
+//   prompt_mel:          (n_prompt_frames, mel_dim) reference mel; prepended to
+//                        the flow-matching state and stripped from the output.
+// Any pointer may be null to leave that part unset. Returns 0 on success.
+int confucius4_tts_set_conditioning(struct confucius4_tts_context* ctx, const float* condition_embedding, int cond_dim,
+                                    const float* style_embedding, int style_dim, const float* prompt_mel,
+                                    int n_prompt_frames, int mel_dim);
+
 // Synthesize text to 22050 Hz mono float32 PCM.
 // `lang` is a language code (e.g. "en", "zh", "ja", "ko").
 // Returns malloc'd float[*out_n_samples]. Caller frees with confucius4_tts_pcm_free().
