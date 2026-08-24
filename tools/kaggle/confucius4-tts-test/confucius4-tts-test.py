@@ -131,16 +131,24 @@ env["CRISPASR_CONFUCIUS4_TEXT_IDS"] = token_ids_str
 # gallocr is now the default for GPT-2 step (sched has index corruption)
 
 tts_wav = TEMP / "confucius4_output.wav"
+# Use 10 ODE steps instead of 25 for faster Kaggle test; no WaveNet yet
 result = subprocess.run(
     [str(crispasr_bin), "--backend", "confucius4-tts",
      "-m", model_path, "--codec-model", s2a_path,
-     "--tts", test_text, "--tts-output", str(tts_wav), "-v"],
-    capture_output=True, text=True, timeout=180, env=env,
+     "--tts", test_text, "--tts-output", str(tts_wav),
+     "--tts-steps", "10", "-v"],
+    capture_output=True, text=True, timeout=600, env=env,
 )
 print(f"  TTS rc={result.returncode}")
 for line in result.stderr.split("\n"):
-    if "confucius4:" in line or "output:" in line:
+    if "confucius4:" in line or "output:" in line or "DiT" in line or "ODE" in line:
         print(f"  {line.strip()}")
+# Also print last 20 lines of stderr for debugging
+stderr_lines = [l for l in result.stderr.split("\n") if l.strip()]
+if len(stderr_lines) > 20:
+    print("  --- last 20 stderr lines ---")
+for line in stderr_lines[-20:]:
+    print(f"  {line.strip()}")
 
 if tts_wav.exists():
     print(f"  WAV: {tts_wav} ({os.path.getsize(str(tts_wav))} bytes)")

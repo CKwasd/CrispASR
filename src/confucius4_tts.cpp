@@ -115,6 +115,7 @@ struct confucius4_s2a_hparams {
     int estimator_num_heads = 8;
     int estimator_hidden_dim = 512;
     int wavenet_num_layers = 8;
+    int estimator_mel_dim = 0; // detected from weights; 0 = use output_size
 };
 
 struct confucius4_s2a_model {
@@ -140,6 +141,35 @@ struct confucius4_s2a_model {
     bool loaded = false;
 };
 
+// DiT graph cache for S2A flow-matching estimator (cached across ODE steps).
+struct confucius4_dit_cache {
+    ggml_context* gctx = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    ggml_cgraph* gf = nullptr;
+    ggml_tensor* hidden_in = nullptr; // (dim, T)   — input embedding
+    ggml_tensor* t_emb_in = nullptr;  // (dim,)     — timestep embedding
+    ggml_tensor* x_mel_in = nullptr;  // (mel_dim, T) — original x for skip_linear
+    ggml_tensor* pos_in = nullptr;    // (T,) I32   — RoPE position indices
+    ggml_tensor* output = nullptr;    // (mel_dim, T) — velocity output
+    int T_cached = 0;
+    int mel_dim_cached = 0;
+
+    void reset() {
+        if (galloc) {
+            ggml_gallocr_free(galloc);
+            galloc = nullptr;
+        }
+        if (gctx) {
+            ggml_free(gctx);
+            gctx = nullptr;
+        }
+        gf = nullptr;
+        hidden_in = t_emb_in = x_mel_in = pos_in = output = nullptr;
+        T_cached = mel_dim_cached = 0;
+    }
+    ~confucius4_dit_cache() { reset(); }
+};
+
 // ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
@@ -158,6 +188,7 @@ struct confucius4_tts_context {
     confucius4_t2s_model t2s;
     confucius4_s2a_model s2a;
     confucius4_kv_cache kv;
+    confucius4_dit_cache dit_cache;
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
@@ -465,6 +496,20 @@ int confucius4_tts_set_s2a_path(confucius4_tts_context* ctx, const char* path_s2
         fprintf(stderr, "confucius4: missing critical S2A tensors\n");
         return -1;
     }
+
+    // Detect DiT mel_dim from input_embed.proj weight: proj_in = dim + 2*mel_dim + spk_dim
+    auto proj_w = find("estimator.input_embed.proj.weight");
+    if (proj_w) {
+        int proj_in = (int)proj_w->ne[0];
+        int det = (proj_in - hp.estimator_hidden_dim - hp.spk_embed_dim) / 2;
+        if (det > 0) {
+            hp.estimator_mel_dim = det;
+            if (ctx->params.verbosity >= 1)
+                fprintf(stderr, "confucius4: detected DiT mel_dim=%d from proj weight (proj_in=%d)\n", det, proj_in);
+        }
+    }
+    if (hp.estimator_mel_dim <= 0)
+        hp.estimator_mel_dim = hp.output_size;
 
     s.loaded = true;
     if (ctx->params.verbosity >= 1)
@@ -936,6 +981,498 @@ static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::v
 }
 
 // ---------------------------------------------------------------------------
+// S2A CPU helpers — dequantize + matmul on F32 (following the f5-tts pattern)
+// ---------------------------------------------------------------------------
+
+// Read a tensor's data as F32 from the backend. For quantized tensors, this
+// dequantizes via ggml's type traits. Returns (ne[0] * ne[1]) floats for 2D,
+// (ne[0]) for 1D. Caller owns the returned vector.
+static std::vector<float> s2a_read_f32(ggml_tensor* t) {
+    if (!t)
+        return {};
+    const int64_t n = ggml_nelements(t);
+    std::vector<float> out(n);
+
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
+    } else {
+        // Dequantize: read raw bytes, convert via type traits
+        std::vector<uint8_t> raw(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+        const auto* tt = ggml_get_type_traits(t->type);
+        // Dequant in blocks of ne[0] (one row at a time)
+        const int64_t row_size = t->ne[0];
+        const int64_t n_rows = n / row_size;
+        for (int64_t r = 0; r < n_rows; r++) {
+            tt->to_float(raw.data() + r * t->nb[1], out.data() + r * row_size, row_size);
+        }
+    }
+    return out;
+}
+
+// y[T,N] = x[T,K] @ W[K,N] + bias[N]  (row-major, W already transposed for matmul)
+// This mirrors f5_linear but without BLAS — pure scalar for correctness first.
+static void s2a_linear(const float* x, const float* W, const float* bias, float* y, int T, int K, int N) {
+    for (int t = 0; t < T; t++) {
+        const float* xr = x + (size_t)t * K;
+        float* yr = y + (size_t)t * N;
+        for (int o = 0; o < N; o++) {
+            const float* wr = W + (size_t)o * K;
+            float s = bias ? bias[o] : 0.0f;
+            for (int k = 0; k < K; k++)
+                s += xr[k] * wr[k];
+            yr[o] = s;
+        }
+    }
+}
+
+// RMSNorm: y = x / rms(x) * weight
+static void s2a_rms_norm(const float* x, const float* weight, float* y, int T, int D, float eps = 1e-6f) {
+    for (int t = 0; t < T; t++) {
+        const float* xr = x + (size_t)t * D;
+        float* yr = y + (size_t)t * D;
+        float ss = 0.0f;
+        for (int d = 0; d < D; d++)
+            ss += xr[d] * xr[d];
+        float rms = 1.0f / sqrtf(ss / D + eps);
+        for (int d = 0; d < D; d++)
+            yr[d] = xr[d] * rms * weight[d];
+    }
+}
+
+// AdaLN: norm(x) * (1 + scale) + shift, where [scale, shift] = Linear(cond)
+static void s2a_adaln(const float* x, const float* norm_w, const float* mod_w, const float* mod_b, const float* cond,
+                      float* y, int T, int D) {
+    // modulation: (D,) → (2*D,) via Linear
+    std::vector<float> mod(2 * D);
+    s2a_linear(cond, mod_w, mod_b, mod.data(), 1, D, 2 * D);
+
+    // RMSNorm then modulate
+    std::vector<float> normed(T * D);
+    s2a_rms_norm(x, norm_w, normed.data(), T, D);
+
+    for (int t = 0; t < T; t++) {
+        for (int d = 0; d < D; d++) {
+            float scale = mod[d];
+            float shift = mod[D + d];
+            y[t * D + d] = normed[t * D + d] * scale + shift;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S2A DiT estimator — ggml graph for transformer, CPU for I/O layers
+// ---------------------------------------------------------------------------
+
+// Look up an S2A tensor by name, returns nullptr if missing.
+static ggml_tensor* s2a_find(const confucius4_s2a_model& s, const std::string& name) {
+    auto it = s.tensors.find(name);
+    return it != s.tensors.end() ? it->second : nullptr;
+}
+
+// SiLU activation in-place: x *= sigmoid(x)
+static void s2a_silu_inplace(float* x, int n) {
+    for (int i = 0; i < n; i++)
+        x[i] = x[i] / (1.0f + expf(-x[i]));
+}
+
+// Sinusoidal position embedding for a scalar timestep (SinusPositionEmbedding).
+static void s2a_sinusoidal_embed(float t, float* out, int freq_dim) {
+    const int half = freq_dim / 2;
+    for (int i = 0; i < half; i++) {
+        float freq = expf(-logf(10000.0f) * 2.0f * i / freq_dim);
+        out[i] = sinf(t * freq);
+        out[half + i] = cosf(t * freq);
+    }
+}
+
+// Compute timestep embedding on CPU: sinusoidal → Linear → SiLU → Linear.
+// `prefix` is "estimator.t_embedder" or "estimator.t_embedder2".
+static std::vector<float> s2a_timestep_embed_cpu(const confucius4_s2a_model& s, float t, const std::string& prefix,
+                                                 int dim) {
+    const int freq_dim = 256;
+    std::vector<float> sin_emb(freq_dim);
+    s2a_sinusoidal_embed(t, sin_emb.data(), freq_dim);
+
+    auto mlp0_w = s2a_read_f32(s2a_find(s, prefix + ".time_mlp.0.weight"));
+    auto mlp0_b = s2a_read_f32(s2a_find(s, prefix + ".time_mlp.0.bias"));
+    if (mlp0_w.empty())
+        return {};
+
+    std::vector<float> h(dim);
+    s2a_linear(sin_emb.data(), mlp0_w.data(), mlp0_b.data(), h.data(), 1, freq_dim, dim);
+    s2a_silu_inplace(h.data(), dim);
+
+    auto mlp2_w = s2a_read_f32(s2a_find(s, prefix + ".time_mlp.2.weight"));
+    auto mlp2_b = s2a_read_f32(s2a_find(s, prefix + ".time_mlp.2.bias"));
+
+    std::vector<float> out(dim);
+    s2a_linear(h.data(), mlp2_w.data(), mlp2_b.data(), out.data(), 1, dim, dim);
+    return out;
+}
+
+// Compute input embedding on CPU:
+//   mu_proj = Linear(mu, cond_dim→hidden_dim)
+//   cat(x, cond_ref, mu_proj, spks) → Linear → hidden
+// x: (T, mel_dim) row-major   cond_ref: (T, mel_dim) row-major (zeros if no ref)
+// mu: (T, cond_dim) row-major  — conditioning from s2a_build_conditioning
+static std::vector<float> s2a_input_embed_cpu(confucius4_tts_context* ctx, const float* x, const float* cond_ref,
+                                              const float* mu, int T, int mel_dim) {
+    const auto& s = ctx->s2a;
+    const int dim = s.hp.estimator_hidden_dim;
+    const int cond_dim = dim; // mu_projection: Linear(cond_dim=dim, dim)
+    const int spk_dim = s.hp.spk_embed_dim;
+
+    auto mu_w = s2a_read_f32(s2a_find(s, "estimator.input_embed.mu_projection.weight"));
+    auto mu_b = s2a_read_f32(s2a_find(s, "estimator.input_embed.mu_projection.bias"));
+    if (mu_w.empty())
+        return {};
+
+    std::vector<float> mu_proj((size_t)T * dim);
+    s2a_linear(mu, mu_w.data(), mu_b.data(), mu_proj.data(), T, cond_dim, dim);
+
+    // cat(x, cond_ref, mu_proj, spks) → (T, cat_dim)
+    const int cat_dim = mel_dim * 2 + dim + spk_dim;
+    std::vector<float> cat_in((size_t)T * cat_dim, 0.0f);
+    for (int t = 0; t < T; t++) {
+        float* row = cat_in.data() + (size_t)t * cat_dim;
+        std::memcpy(row, x + (size_t)t * mel_dim, mel_dim * sizeof(float));
+        std::memcpy(row + mel_dim, cond_ref + (size_t)t * mel_dim, mel_dim * sizeof(float));
+        std::memcpy(row + mel_dim * 2, mu_proj.data() + (size_t)t * dim, dim * sizeof(float));
+        if (ctx->has_speaker && spk_dim > 0)
+            std::memcpy(row + mel_dim * 2 + dim, ctx->speaker_style_embedding.data(), spk_dim * sizeof(float));
+    }
+
+    auto proj_w = s2a_read_f32(s2a_find(s, "estimator.input_embed.proj.weight"));
+    auto proj_b = s2a_read_f32(s2a_find(s, "estimator.input_embed.proj.bias"));
+    if (proj_w.empty())
+        return {};
+
+    std::vector<float> out((size_t)T * dim);
+    s2a_linear(cat_in.data(), proj_w.data(), proj_b.data(), out.data(), T, cat_dim, dim);
+    return out; // (T * dim) row-major = ggml (dim, T) data layout
+}
+
+// Build the DiT ggml graph for transformer blocks + final output.
+// Produces velocity (mel_dim, T) from hidden input + timestep embedding.
+static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim) {
+    auto& cache = ctx->dit_cache;
+    if (cache.T_cached == T && cache.mel_dim_cached == mel_dim && cache.galloc)
+        return true;
+    cache.reset();
+
+    const auto& s = ctx->s2a;
+    const int dim = s.hp.estimator_hidden_dim;
+    const int n_heads = s.hp.estimator_num_heads;
+    const int head_dim = dim / n_heads;
+    const int depth = s.hp.estimator_depth;
+    const int half = depth / 2;
+    const int vb = ctx->params.verbosity;
+
+    // Determine FFN intermediate size from w1 weight shape
+    auto w1_0 = s2a_find(s, "estimator.transformer_blocks.0.feed_forward.w1.weight");
+    const int inter_dim = w1_0 ? (int)w1_0->ne[1] : dim * 4;
+
+    if (vb >= 1)
+        fprintf(stderr, "confucius4: DiT graph: depth=%d dim=%d heads=%d inter=%d mel=%d T=%d\n", depth, dim, n_heads,
+                inter_dim, mel_dim, T);
+
+    // Allocate graph context: ~35 ops per block × depth + ~20 finals
+    struct ggml_init_params p = {4 * 1024 * 1024, nullptr, true};
+    cache.gctx = ggml_init(p);
+    if (!cache.gctx)
+        return false;
+
+    // Graph inputs
+    cache.hidden_in = ggml_new_tensor_2d(cache.gctx, GGML_TYPE_F32, dim, T);
+    ggml_set_name(cache.hidden_in, "dit_in");
+    ggml_set_input(cache.hidden_in);
+
+    cache.t_emb_in = ggml_new_tensor_1d(cache.gctx, GGML_TYPE_F32, dim);
+    ggml_set_name(cache.t_emb_in, "dit_t");
+    ggml_set_input(cache.t_emb_in);
+
+    cache.x_mel_in = ggml_new_tensor_2d(cache.gctx, GGML_TYPE_F32, mel_dim, T);
+    ggml_set_name(cache.x_mel_in, "dit_xmel");
+    ggml_set_input(cache.x_mel_in);
+
+    cache.pos_in = ggml_new_tensor_1d(cache.gctx, GGML_TYPE_I32, T);
+    ggml_set_name(cache.pos_in, "dit_pos");
+    ggml_set_input(cache.pos_in);
+
+    // Helper to find a DiT tensor by formatted name
+    char nbuf[256];
+    auto tn = [&](const char* fmt, int layer) -> ggml_tensor* {
+        snprintf(nbuf, sizeof(nbuf), fmt, layer);
+        return s2a_find(s, nbuf);
+    };
+
+    // U-Net skip connection stack (LIFO): emit layers 0..half-1, receive half+1..depth-1
+    std::vector<ggml_tensor*> skip_stack;
+    ggml_tensor* x = cache.hidden_in;
+
+    for (int i = 0; i < depth; i++) {
+        // Receive skip connection
+        if (i > half && !skip_stack.empty()) {
+            ggml_tensor* skip = skip_stack.back();
+            skip_stack.pop_back();
+            ggml_tensor* cat = ggml_concat(cache.gctx, x, skip, 0);
+            auto sw = tn("estimator.transformer_blocks.%d.skip_in_linear.weight", i);
+            auto sb = tn("estimator.transformer_blocks.%d.skip_in_linear.bias", i);
+            if (sw) {
+                x = ggml_mul_mat(cache.gctx, sw, cat);
+                if (sb)
+                    x = ggml_add(cache.gctx, x, sb);
+            }
+        }
+
+        // AdaLN attention norm: modulation(t_emb) → [weight, bias]; RMSNorm(x)*w + b
+        {
+            auto nw = tn("estimator.transformer_blocks.%d.attention_norm.norm.weight", i);
+            auto mw = tn("estimator.transformer_blocks.%d.attention_norm.modulation.weight", i);
+            auto mb = tn("estimator.transformer_blocks.%d.attention_norm.modulation.bias", i);
+
+            ggml_tensor* mod = ggml_mul_mat(cache.gctx, mw, cache.t_emb_in);
+            if (mb)
+                mod = ggml_add(cache.gctx, mod, mb);
+            ggml_tensor* aw = ggml_view_1d(cache.gctx, mod, dim, 0);
+            ggml_tensor* ab = ggml_view_1d(cache.gctx, mod, dim, dim * sizeof(float));
+
+            ggml_tensor* normed = ggml_rms_norm(cache.gctx, x, 1e-5f);
+            if (nw)
+                normed = ggml_mul(cache.gctx, normed, nw);
+            normed = ggml_mul(cache.gctx, normed, aw);
+            normed = ggml_add(cache.gctx, normed, ab);
+
+            // Attention: fused wqkv → Q,K,V → RoPE → flash_attn → wo
+            auto wqkv = tn("estimator.transformer_blocks.%d.attention.wqkv.weight", i);
+            auto wo = tn("estimator.transformer_blocks.%d.attention.wo.weight", i);
+
+            ggml_tensor* qkv = ggml_mul_mat(cache.gctx, wqkv, normed);
+            int esz = (int)ggml_element_size(qkv);
+            ggml_tensor* q = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, qkv, dim, T, 3 * dim * esz, 0));
+            ggml_tensor* k = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, qkv, dim, T, 3 * dim * esz, dim * esz));
+            ggml_tensor* v = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, qkv, dim, T, 3 * dim * esz, 2 * dim * esz));
+
+            q = ggml_reshape_3d(cache.gctx, q, head_dim, n_heads, T);
+            k = ggml_reshape_3d(cache.gctx, k, head_dim, n_heads, T);
+            v = ggml_reshape_3d(cache.gctx, v, head_dim, n_heads, T);
+
+            q = ggml_rope_ext(cache.gctx, q, cache.pos_in, nullptr, head_dim, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f,
+                              0.0f);
+            k = ggml_rope_ext(cache.gctx, k, cache.pos_in, nullptr, head_dim, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f,
+                              0.0f);
+
+            q = ggml_permute(cache.gctx, q, 0, 2, 1, 3);
+            k = ggml_permute(cache.gctx, k, 0, 2, 1, 3);
+            v = ggml_permute(cache.gctx, v, 0, 2, 1, 3);
+
+            float scale = 1.0f / sqrtf((float)head_dim);
+            ggml_tensor* attn = ggml_flash_attn_ext(cache.gctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
+            attn = ggml_reshape_2d(cache.gctx, attn, dim, T);
+
+            ggml_tensor* attn_proj = ggml_mul_mat(cache.gctx, wo, attn);
+            x = ggml_add(cache.gctx, x, attn_proj);
+        }
+
+        // AdaLN FFN norm → SwiGLU FFN
+        {
+            auto nw = tn("estimator.transformer_blocks.%d.ffn_norm.norm.weight", i);
+            auto mw = tn("estimator.transformer_blocks.%d.ffn_norm.modulation.weight", i);
+            auto mb = tn("estimator.transformer_blocks.%d.ffn_norm.modulation.bias", i);
+
+            ggml_tensor* mod = ggml_mul_mat(cache.gctx, mw, cache.t_emb_in);
+            if (mb)
+                mod = ggml_add(cache.gctx, mod, mb);
+            ggml_tensor* fw = ggml_view_1d(cache.gctx, mod, dim, 0);
+            ggml_tensor* fb = ggml_view_1d(cache.gctx, mod, dim, dim * sizeof(float));
+
+            ggml_tensor* fn = ggml_rms_norm(cache.gctx, x, 1e-5f);
+            if (nw)
+                fn = ggml_mul(cache.gctx, fn, nw);
+            fn = ggml_mul(cache.gctx, fn, fw);
+            fn = ggml_add(cache.gctx, fn, fb);
+
+            // SwiGLU: w2(silu(w1(x)) * w3(x))
+            auto w1 = tn("estimator.transformer_blocks.%d.feed_forward.w1.weight", i);
+            auto w2 = tn("estimator.transformer_blocks.%d.feed_forward.w2.weight", i);
+            auto w3 = tn("estimator.transformer_blocks.%d.feed_forward.w3.weight", i);
+
+            ggml_tensor* gate = ggml_silu(cache.gctx, ggml_mul_mat(cache.gctx, w1, fn));
+            ggml_tensor* up = ggml_mul_mat(cache.gctx, w3, fn);
+            ggml_tensor* ff = ggml_mul_mat(cache.gctx, w2, ggml_mul(cache.gctx, gate, up));
+
+            x = ggml_add(cache.gctx, x, ff);
+        }
+
+        // Emit skip
+        if (i < half)
+            skip_stack.push_back(x);
+    }
+
+    // Final AdaLN (transformer_norm)
+    {
+        auto nw = s2a_find(s, "estimator.transformer_norm.norm.weight");
+        auto mw = s2a_find(s, "estimator.transformer_norm.modulation.weight");
+        auto mb = s2a_find(s, "estimator.transformer_norm.modulation.bias");
+
+        ggml_tensor* mod = ggml_mul_mat(cache.gctx, mw, cache.t_emb_in);
+        if (mb)
+            mod = ggml_add(cache.gctx, mod, mb);
+        ggml_tensor* tw = ggml_view_1d(cache.gctx, mod, dim, 0);
+        ggml_tensor* tb = ggml_view_1d(cache.gctx, mod, dim, dim * sizeof(float));
+
+        x = ggml_rms_norm(cache.gctx, x, 1e-5f);
+        if (nw)
+            x = ggml_mul(cache.gctx, x, nw);
+        x = ggml_mul(cache.gctx, x, tw);
+        x = ggml_add(cache.gctx, x, tb);
+    }
+
+    // skip_linear: cat(x_res, x_mel) → Linear(dim + mel_dim → dim)
+    auto sl_w = s2a_find(s, "estimator.skip_linear.weight");
+    auto sl_b = s2a_find(s, "estimator.skip_linear.bias");
+    ggml_tensor* x_res = x; // save for res_projection
+    if (sl_w) {
+        ggml_tensor* cat = ggml_concat(cache.gctx, x, cache.x_mel_in, 0);
+        x = ggml_mul_mat(cache.gctx, sl_w, cat);
+        if (sl_b)
+            x = ggml_add(cache.gctx, x, sl_b);
+        x_res = x;
+    }
+
+    // Output path: conv1 → (skip WaveNet) → res_projection → final_layer → conv2
+    // The WaveNet is gated behind CRISPASR_CONFUCIUS4_WAVENET=1 (not yet implemented).
+    // Without WaveNet: output = res_projection(x_res) → final_layer → conv2
+    auto res_w = s2a_find(s, "estimator.res_projection.weight");
+    auto res_b = s2a_find(s, "estimator.res_projection.bias");
+    if (res_w) {
+        x = ggml_mul_mat(cache.gctx, res_w, x_res);
+        if (res_b)
+            x = ggml_add(cache.gctx, x, res_b);
+    }
+
+    // FinalLayer: LayerNorm(no affine) → (1+scale)*x + shift → Linear
+    auto fl_w = s2a_find(s, "estimator.final_layer.linear.weight");
+    auto fl_b = s2a_find(s, "estimator.final_layer.linear.bias");
+    auto fm_w = s2a_find(s, "estimator.final_layer.adaLN_modulation.1.weight");
+    auto fm_b = s2a_find(s, "estimator.final_layer.adaLN_modulation.1.bias");
+    if (fl_w && fm_w) {
+        ggml_tensor* silu_t = ggml_silu(cache.gctx, cache.t_emb_in);
+        ggml_tensor* fmod = ggml_mul_mat(cache.gctx, fm_w, silu_t);
+        if (fm_b)
+            fmod = ggml_add(cache.gctx, fmod, fm_b);
+
+        int wn_dim = (int)fl_w->ne[0]; // wavenet_hidden_dim (might be dim)
+        ggml_tensor* fsh = ggml_view_1d(cache.gctx, fmod, wn_dim, 0);
+        ggml_tensor* fsc = ggml_view_1d(cache.gctx, fmod, wn_dim, wn_dim * sizeof(float));
+
+        ggml_tensor* xn = ggml_norm(cache.gctx, x, 1e-6f); // LayerNorm, no affine
+        // x = x_norm * (1 + scale) + shift = x_norm + x_norm*scale + shift
+        ggml_tensor* xs = ggml_mul(cache.gctx, xn, fsc);
+        xn = ggml_add(cache.gctx, xn, xs);
+        xn = ggml_add(cache.gctx, xn, fsh);
+
+        x = ggml_mul_mat(cache.gctx, fl_w, xn);
+        if (fl_b)
+            x = ggml_add(cache.gctx, x, fl_b);
+    }
+
+    // conv2: Conv1d(wn_dim, mel_dim, 1) = Linear projection to output dim
+    auto c2_w = s2a_find(s, "estimator.conv2.weight");
+    auto c2_b = s2a_find(s, "estimator.conv2.bias");
+    if (c2_w) {
+        // Conv1d weight is 3D (ne=[1, in, out]); reshape to 2D for mul_mat
+        ggml_tensor* c2_2d = ggml_reshape_2d(cache.gctx, c2_w, c2_w->ne[0] * c2_w->ne[1], c2_w->ne[2]);
+        x = ggml_mul_mat(cache.gctx, c2_2d, x);
+        if (c2_b)
+            x = ggml_add(cache.gctx, x, c2_b);
+    }
+
+    ggml_set_name(x, "velocity");
+    ggml_set_output(x);
+    cache.output = x;
+
+    // Build and allocate graph
+    cache.gf = ggml_new_graph_custom(cache.gctx, 8192, false);
+    ggml_build_forward_expand(cache.gf, cache.output);
+
+    cache.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ggml_gallocr_reserve(cache.galloc, cache.gf) || !ggml_gallocr_alloc_graph(cache.galloc, cache.gf)) {
+        fprintf(stderr, "confucius4: DiT graph allocation failed\n");
+        cache.reset();
+        return false;
+    }
+
+    cache.T_cached = T;
+    cache.mel_dim_cached = mel_dim;
+
+    if (vb >= 1)
+        fprintf(stderr, "confucius4: DiT graph built: %d nodes\n", ggml_graph_n_nodes(cache.gf));
+
+    return true;
+}
+
+// Run one DiT forward pass. hidden: (T*dim) row-major, t_emb: (dim), x_mel: (T*mel_dim).
+// Returns velocity as (T*mel_dim) row-major, or empty on failure.
+static std::vector<float> s2a_dit_run(confucius4_tts_context* ctx, const float* hidden, const float* t_emb,
+                                      const float* x_mel, int T, int mel_dim) {
+    auto& cache = ctx->dit_cache;
+    if (!s2a_dit_cache_build(ctx, T, mel_dim))
+        return {};
+
+    if (!ggml_gallocr_alloc_graph(cache.galloc, cache.gf))
+        return {};
+
+    const int dim = ctx->s2a.hp.estimator_hidden_dim;
+
+    ggml_backend_tensor_set(cache.hidden_in, hidden, 0, (size_t)T * dim * sizeof(float));
+    ggml_backend_tensor_set(cache.t_emb_in, t_emb, 0, (size_t)dim * sizeof(float));
+    ggml_backend_tensor_set(cache.x_mel_in, x_mel, 0, (size_t)T * mel_dim * sizeof(float));
+
+    // Position indices must be re-set each call (gallocr may alias input buffers)
+    std::vector<int32_t> pos(T);
+    for (int i = 0; i < T; i++)
+        pos[i] = i;
+    ggml_backend_tensor_set(cache.pos_in, pos.data(), 0, (size_t)T * sizeof(int32_t));
+
+    if (ggml_backend_graph_compute(ctx->backend, cache.gf) != GGML_STATUS_SUCCESS)
+        return {};
+
+    int out_dim = (int)cache.output->ne[0];
+    std::vector<float> vel((size_t)T * out_dim);
+    ggml_backend_tensor_get(cache.output, vel.data(), 0, vel.size() * sizeof(float));
+    return vel;
+}
+
+// Full DiT estimator forward: timestep embed + input embed (CPU) → DiT graph → velocity.
+// x_flat: (T*mel_dim) row-major (noisy data), cond: (T*cond_dim) row-major (semantic cond),
+// cond_ref: (T*mel_dim) row-major (reference mel, zeros if none).
+// Returns velocity (T*mel_dim) row-major.
+static std::vector<float> s2a_dit_forward(confucius4_tts_context* ctx, const float* x_flat, int T, int mel_dim,
+                                          const float* cond, const float* cond_ref, float timestep) {
+    const auto& s = ctx->s2a;
+    const int dim = s.hp.estimator_hidden_dim;
+
+    // Timestep embedding
+    auto t_emb = s2a_timestep_embed_cpu(s, timestep, "estimator.t_embedder", dim);
+    if (t_emb.empty()) {
+        fprintf(stderr, "confucius4: timestep embedding failed\n");
+        return {};
+    }
+
+    // Input embedding: cat(x, cond_ref, mu_proj(cond), spks) → proj
+    auto hidden = s2a_input_embed_cpu(ctx, x_flat, cond_ref, cond, T, mel_dim);
+    if (hidden.empty()) {
+        fprintf(stderr, "confucius4: input embedding failed\n");
+        return {};
+    }
+
+    // Run DiT graph
+    return s2a_dit_run(ctx, hidden.data(), t_emb.data(), x_flat, T, mel_dim);
+}
+
+// ---------------------------------------------------------------------------
 // S2A: run flow-matching to produce mel from semantic codes
 // ---------------------------------------------------------------------------
 
@@ -948,68 +1485,134 @@ static std::vector<float> s2a_build_conditioning(confucius4_tts_context* ctx,
     const int T_sem = (int)semantic_codes.size();
     const int vb = ctx->params.verbosity;
 
-    // Step 1: embed semantic codes → (semantic_embed_dim, T_sem)
-    // Step 2: concat with zero LM latent → project → (lr_in, T_sem)
-    // Step 3: length regulate → (lr_out, T_mel)
-    // For now, return zeros (stub) — the DiT will get random noise as velocity
-    // which produces noise mel, but the pipeline shape is complete.
+    const int sem_emb_dim = hp.semantic_embed_dim; // 1024
+    const int lm_dim = hp.lm_latent_dim;           // 1280
+    const int lr_in = sem_emb_dim + lm_dim;        // 2304
+    const int lr_out = hp.input_size;              // 512
 
     if (vb >= 1)
-        fprintf(stderr, "confucius4: S2A conditioning: T_sem=%d, T_mel=%d (stub — returning zeros)\n", T_sem, T_mel);
+        fprintf(stderr, "confucius4: S2A conditioning: T_sem=%d, T_mel=%d\n", T_sem, T_mel);
 
-    // The conditioning should be (input_size=512, T_mel) — lr_out_channels
-    return std::vector<float>((size_t)hp.input_size * T_mel, 0.0f);
+    // Step 1: embed semantic codes → (T_sem, sem_emb_dim)
+    // input_embedding: Embedding(8192, 8) → Linear(8, sem_emb_dim) via conv1d
+    auto embed_w = s2a_read_f32(s.input_embed_w); // (8192, 8)
+    auto proj_w = s2a_read_f32(s.input_proj_w);   // (1, 8, sem_emb_dim) conv1d
+    auto proj_b = s2a_read_f32(s.input_proj_b);   // (sem_emb_dim,)
+
+    std::vector<float> sem_emb((size_t)T_sem * sem_emb_dim, 0.0f);
+    for (int t = 0; t < T_sem; t++) {
+        int code = semantic_codes[t];
+        if (code < 0 || code >= 8192)
+            code = 0;
+        // Lookup embedding: (8,)
+        const float* emb_row = embed_w.data() + code * 8;
+        // Project 8 → sem_emb_dim via conv1d(kernel=1) = Linear
+        for (int d = 0; d < sem_emb_dim; d++) {
+            float v = proj_b.empty() ? 0.0f : proj_b[d];
+            for (int k = 0; k < 8; k++)
+                v += emb_row[k] * proj_w[d * 8 + k];
+            sem_emb[t * sem_emb_dim + d] = v;
+        }
+    }
+
+    // Step 2: concat with zero LM latent → (T_sem, lr_in=2304)
+    // LM latent should come from T2S hidden states, but we don't pass them yet.
+    std::vector<float> concat_in((size_t)T_sem * lr_in, 0.0f);
+    for (int t = 0; t < T_sem; t++) {
+        // First lm_dim slots: zeros (no LM latent)
+        // Next sem_emb_dim slots: semantic embedding
+        std::memcpy(concat_in.data() + t * lr_in + lm_dim, sem_emb.data() + t * sem_emb_dim,
+                    sem_emb_dim * sizeof(float));
+    }
+
+    // Step 3: project → (T_sem, lr_out=512)
+    auto enc_w = s2a_read_f32(s.encoder_proj_w); // (lr_out, lr_in)
+    auto enc_b = s2a_read_f32(s.encoder_proj_b); // (lr_out,)
+    std::vector<float> projected((size_t)T_sem * lr_out);
+    s2a_linear(concat_in.data(), enc_w.data(), enc_b.data(), projected.data(), T_sem, lr_in, lr_out);
+
+    // Step 4: length regulate → (T_mel, lr_out) via simple linear interpolation
+    // The real length regulator uses learned conv upsampling, but interpolation
+    // gives the right shape for now.
+    std::vector<float> cond((size_t)T_mel * lr_out, 0.0f);
+    for (int t = 0; t < T_mel; t++) {
+        float src = (float)t * T_sem / T_mel;
+        int s0 = std::min((int)src, T_sem - 1);
+        int s1 = std::min(s0 + 1, T_sem - 1);
+        float frac = src - s0;
+        for (int d = 0; d < lr_out; d++)
+            cond[t * lr_out + d] = (1.0f - frac) * projected[s0 * lr_out + d] + frac * projected[s1 * lr_out + d];
+    }
+
+    if (vb >= 1)
+        fprintf(stderr, "confucius4: S2A conditioning: embed+project+interpolate OK\n");
+
+    return cond;
 }
 
 // Run the full S2A flow-matching ODE to produce mel.
-// Returns (output_size, T_mel) mel spectrogram as float32, or empty on failure.
+// Returns (mel_dim, T_mel) mel spectrogram as float32, or empty on failure.
 static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const std::vector<int32_t>& semantic_codes) {
     const auto& s = ctx->s2a;
     const auto& hp = s.hp;
     const int T_sem = (int)semantic_codes.size();
-    const int T_mel = (int)(T_sem * 1.72); // heuristic from Python
-    const int mel_dim = hp.output_size;    // 80
+    const int T_mel = (int)(T_sem * 1.72);    // heuristic from Python
+    const int mel_dim = hp.estimator_mel_dim; // detected from weights (may be 80 or 512)
     const int vb = ctx->params.verbosity;
     const int n_steps = ctx->params.ode_steps > 0 ? ctx->params.ode_steps : 25;
 
     if (vb >= 1)
-        fprintf(stderr, "confucius4: S2A flow-matching: T_sem=%d → T_mel=%d, %d ODE steps\n", T_sem, T_mel, n_steps);
+        fprintf(stderr, "confucius4: S2A flow-matching: T_sem=%d → T_mel=%d, mel_dim=%d, %d ODE steps\n", T_sem, T_mel,
+                mel_dim, n_steps);
 
-    // Build conditioning (stub: zeros for now)
+    // Build semantic conditioning → (T_mel, cond_dim=512) row-major
     std::vector<float> cond = s2a_build_conditioning(ctx, semantic_codes, T_mel);
     if (cond.empty())
         return {};
 
-    // Initialize noise: z ~ N(0, 1) of shape (mel_dim, T_mel)
+    // Initialize noise: z ~ N(0, 1) of shape (T_mel, mel_dim) row-major
     std::mt19937 rng(ctx->params.seed ? ctx->params.seed : 42);
     std::normal_distribution<float> dist(0.0f, 1.0f);
-    std::vector<float> z((size_t)mel_dim * T_mel);
+    const float temperature = ctx->params.temperature > 0.0f ? ctx->params.temperature : 1.0f;
+    std::vector<float> z((size_t)T_mel * mel_dim);
     for (auto& v : z)
-        v = dist(rng);
+        v = dist(rng) * temperature;
+
+    // Reference mel conditioning (zeros — no speaker prompt)
+    std::vector<float> cond_ref((size_t)T_mel * mel_dim, 0.0f);
 
     // Cosine time schedule: t_span[i] = 1 - cos(i/(n_steps) * pi/2)
     std::vector<float> t_span(n_steps + 1);
     for (int i = 0; i <= n_steps; i++)
         t_span[i] = 1.0f - cosf((float)i / n_steps * 1.5707963f);
 
-    // Euler ODE: for each step, compute velocity via DiT, then x = x + dt * v
-    // TODO: implement the actual DiT forward graph here. For now, use zero
-    // velocity (produces the initial noise as mel — garbage but validates shape).
+    // Euler ODE: z = z + dt * velocity_from_DiT
     for (int step = 1; step <= n_steps; step++) {
         float dt = t_span[step] - t_span[step - 1];
-        // velocity = DiT(z, cond, t_span[step-1], spks=0)
-        // For now: velocity = 0 → z stays as noise
-        // z[i] += dt * velocity[i];
-        (void)dt;
-        if (vb >= 2 && step <= 3)
-            fprintf(stderr, "confucius4: S2A ODE step %d/%d: t=%.4f dt=%.4f (stub)\n", step, n_steps, t_span[step - 1],
-                    dt);
+        float t = t_span[step - 1];
+
+        auto velocity = s2a_dit_forward(ctx, z.data(), T_mel, mel_dim, cond.data(), cond_ref.data(), t);
+        if (velocity.empty()) {
+            fprintf(stderr, "confucius4: DiT forward failed at step %d\n", step);
+            return {};
+        }
+
+        for (size_t i = 0; i < z.size(); i++)
+            z[i] += dt * velocity[i];
+
+        if (vb >= 2 && (step <= 3 || step == n_steps)) {
+            // Log first few velocity magnitudes for debugging
+            float vmax = 0.0f;
+            for (size_t i = 0; i < std::min(velocity.size(), (size_t)1000); i++)
+                vmax = std::max(vmax, fabsf(velocity[i]));
+            fprintf(stderr, "confucius4: ODE step %d/%d: t=%.4f dt=%.4f |v|_max=%.4f\n", step, n_steps, t, dt, vmax);
+        }
     }
 
     if (vb >= 1)
-        fprintf(stderr, "confucius4: S2A flow-matching done (stub — noise mel)\n");
+        fprintf(stderr, "confucius4: S2A flow-matching done (%d steps, mel_dim=%d)\n", n_steps, mel_dim);
 
-    return z; // (mel_dim, T_mel) — noise for now
+    return z; // (T_mel * mel_dim) row-major
 }
 
 float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, const char* lang, int* out_n_samples) {
@@ -1079,7 +1682,7 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
         return nullptr;
     }
 
-    const int mel_dim = ctx->s2a.hp.output_size;
+    const int mel_dim = ctx->s2a.hp.estimator_mel_dim;
     const int T_mel = (int)(mel.size() / mel_dim);
 
     // Step 4: BigVGAN vocoder → PCM @ 22050 Hz

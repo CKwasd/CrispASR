@@ -388,7 +388,7 @@ std::pair<ggml_tensor*, ggml_tensor*> llm_build_delta_net_base::build_delta_net_
     // state, which is exactly the pre-v0.17 layout — and exactly what the two
     // views below assume (scores at offset 0, one state block after them). Do not
     // raise it without also reworking new_state's offset.
-    ggml_tensor* result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K =*/1);
+    ggml_tensor* result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s);
     if (n_tokens == 1) {
         cb(result, LLAMA_TENSOR_NAME_FGDN_AR, il);
     } else {
