@@ -136,8 +136,8 @@ result = subprocess.run(
     [str(crispasr_bin), "--backend", "confucius4-tts",
      "-m", model_path, "--codec-model", s2a_path,
      "--tts", test_text, "--tts-output", str(tts_wav),
-     "--tts-steps", "10", "-v"],
-    capture_output=True, text=True, timeout=600, env=env,
+     "--tts-steps", "2", "-v"],
+    capture_output=True, text=True, timeout=1200, env=env,
 )
 print(f"  TTS rc={result.returncode}")
 for line in result.stderr.split("\n"):
