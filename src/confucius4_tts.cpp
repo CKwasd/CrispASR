@@ -431,12 +431,19 @@ static ggml_tensor* gpt2_forward(confucius4_tts_context* ctx, ggml_context* ctx0
     const auto& m = ctx->t2s;
     const auto& hp = m.hp;
 
-    core_attn::KvSelfAttnParams ap;
+    // Value-initialize: KvSelfAttnParams has no default member initializers
+    // for the leading fields, and `soft_max_ext` uses attn_scale VERBATIM —
+    // the old `KvSelfAttnParams ap;` left attn_scale (and n_ctx_orig,
+    // gqa_mode, ...) as indeterminate stack garbage, which is exactly the
+    // "plausible activations, wrong numbers" T2S signature.
+    core_attn::KvSelfAttnParams ap{};
     ap.n_heads = hp.num_heads;
     ap.n_kv_heads = hp.num_heads; // GPT-2: no GQA
     ap.n_kv_grp = 1;
     ap.head_dim = hp.head_dim();
     ap.rope_theta = 0.0f; // GPT-2 uses learned positional embeddings, not RoPE
+    ap.attn_scale = 1.0f / std::sqrt((float)hp.head_dim());
+    ap.gqa_mode = core_attn::GQA_NATIVE; // moot at n_kv_grp==1, but defined
 
     // CRISPASR_CONFUCIUS4_MAX_LAYERS=N overrides num_layers for debugging.
     int n_layers = hp.num_layers;
@@ -1373,6 +1380,10 @@ static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::v
         s2a_dump_raw("text_ids_i32", text_token_ids.data(), text_token_ids.size() * sizeof(int32_t), shp);
         snprintf(shp, sizeof(shp), "%d", (int)logits.size());
         s2a_dump_raw("prefill_logits", logits.data(), logits.size() * sizeof(float), shp);
+        // Pre-block-0 structural gate: the full prefix embedding
+        // [cond | text+pos | BOS+sem_pos0] as fed to the GPT-2.
+        snprintf(shp, sizeof(shp), "%d,%d", prefix_len, hp.model_dim);
+        s2a_dump_raw("prefix_emb", prefix_emb.data(), prefix_emb.size() * sizeof(float), shp);
     }
 
     // ── Step 3: Autoregressive decode ──

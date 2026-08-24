@@ -100,6 +100,13 @@ def main():
         logits = model.semantic_head(model.final_norm(h))
 
         prefix_len = 1 + ti.shape[1]     # condition(1) + text
+        # pre-block-0 structural gate: the concatenated prefix embedding
+        # [cond | text+pos | BOS+sem_pos0] BEFORE any transformer block.
+        # cos < 0.99999 here means the bug is in the embeds, not the stack.
+        if "prefix_emb" in shp:
+            cmp("prefix_emb (pre-blk0)", load(d, "prefix_emb", shp),
+                embeds[0, :prefix_len + 1].numpy())
+
         # the runtime's prefill logits come from the LAST prefix position (BOS),
         # i.e. the distribution that predicts the first semantic code
         if "prefill_logits" in shp:
