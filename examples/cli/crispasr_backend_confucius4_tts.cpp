@@ -42,6 +42,24 @@ public:
             }
         }
 
+        // Auto-discover BigVGAN vocoder: look for *bigvgan* sibling next to T2S or S2A model
+        auto try_vocoder = [&](const std::string& base) {
+            if (base.empty())
+                return;
+            std::string dir = base.substr(0, base.find_last_of("/\\") + 1);
+            for (const char* pat : {"confucius4-tts-bigvgan-22k-f16.gguf", "confucius4-tts-bigvgan-22k-q8_0.gguf"}) {
+                std::string path = dir + pat;
+                FILE* f = fopen(path.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    if (confucius4_tts_set_vocoder_path(ctx_, path.c_str()) == 0)
+                        return;
+                }
+            }
+        };
+        try_vocoder(p.tts_codec_model);
+        try_vocoder(p.model);
+
         return true;
     }
 

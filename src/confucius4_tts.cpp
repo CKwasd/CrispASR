@@ -5,9 +5,10 @@
 // Generates semantic codes (vocab 8194) autoregressively.
 //
 // S2A: Flow-matching DiT(13L) + WaveNet(8L) → 80-band mel.
-// Vocoder: BigVGAN → 22050 Hz PCM (external, not yet ported).
+// Vocoder: BigVGAN → 22050 Hz PCM (via indextts_voc with 22kHz hparams).
 
 #include "confucius4_tts.h"
+#include "indextts_voc.h"
 
 #include "core/attention.h"
 #include "core/bpe.h"
@@ -212,6 +213,9 @@ struct confucius4_tts_context {
     std::unordered_map<std::string, int32_t> bpe_token_to_id;
     std::unordered_map<std::string, int32_t> bpe_merge_rank;
     bool has_bpe_tokenizer = false;
+
+    // BigVGAN vocoder (loaded from separate companion GGUF)
+    indextts_voc_context* vocoder = nullptr;
 
     // w2v-bert normalisation stats
     std::vector<float> w2v_mean; // (1024,)
@@ -621,6 +625,23 @@ int confucius4_tts_set_s2a_path(confucius4_tts_context* ctx, const char* path_s2
     s.loaded = true;
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "confucius4: S2A loaded %zu tensors OK\n", s.tensors.size());
+    return 0;
+}
+
+int confucius4_tts_set_vocoder_path(confucius4_tts_context* ctx, const char* path_vocoder) {
+    if (!ctx || !path_vocoder)
+        return -1;
+    if (ctx->vocoder) {
+        indextts_voc_free(ctx->vocoder);
+        ctx->vocoder = nullptr;
+    }
+    ctx->vocoder = indextts_voc_init(path_vocoder, ctx->params.n_threads, ctx->params.use_gpu);
+    if (!ctx->vocoder) {
+        fprintf(stderr, "confucius4: failed to load BigVGAN vocoder '%s'\n", path_vocoder);
+        return -1;
+    }
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "confucius4: BigVGAN vocoder loaded OK\n");
     return 0;
 }
 
@@ -1911,20 +1932,33 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
     const int T_mel = (int)(mel.size() / mel_dim);
 
     // Step 4: BigVGAN vocoder → PCM @ 22050 Hz
-    // TODO: load and run BigVGAN. For now, output silence at the right duration.
     const int sr = ctx->t2s.hp.sample_rate; // 22050
-    const int hop = 256;                    // BigVGAN hop_length
-    const int n_pcm = T_mel * hop;
-    float* pcm = (float*)calloc(n_pcm, sizeof(float)); // silence
-    if (!pcm) {
-        *out_n_samples = 0;
-        return nullptr;
+    float* pcm = nullptr;
+    int n_pcm = 0;
+
+    if (ctx->vocoder) {
+        // mel is (T_mel * mel_dim) row-major = (T_mel, mel_dim).
+        // indextts_voc_generate expects [T, gpt_dim] row-major, where gpt_dim=80 (mel_dim).
+        pcm = indextts_voc_generate(ctx->vocoder, mel.data(), T_mel, nullptr, &n_pcm);
+        if (pcm && vb >= 1)
+            fprintf(stderr, "confucius4: BigVGAN: %d mel frames → %d PCM samples @ %d Hz (%.2fs)\n", T_mel, n_pcm, sr,
+                    (float)n_pcm / sr);
     }
 
-    if (vb >= 1)
-        fprintf(stderr,
-                "confucius4: output: %d mel frames → %d PCM samples @ %d Hz (%.2fs, silence — vocoder pending)\n",
-                T_mel, n_pcm, sr, (float)n_pcm / sr);
+    if (!pcm) {
+        // Fallback: output silence at the right duration
+        const int hop = 256;
+        n_pcm = T_mel * hop;
+        pcm = (float*)calloc(n_pcm, sizeof(float));
+        if (!pcm) {
+            *out_n_samples = 0;
+            return nullptr;
+        }
+        if (vb >= 1)
+            fprintf(stderr,
+                    "confucius4: output: %d mel frames → %d PCM samples @ %d Hz (%.2fs, silence — no vocoder)\n", T_mel,
+                    n_pcm, sr, (float)n_pcm / sr);
+    }
 
     *out_n_samples = n_pcm;
     return pcm;
@@ -1939,6 +1973,9 @@ void confucius4_tts_free(confucius4_tts_context* ctx) {
         return;
 
     kv_free(ctx->kv);
+    // Free vocoder
+    if (ctx->vocoder)
+        indextts_voc_free(ctx->vocoder);
     // Free S2A
     if (ctx->s2a.buf_wn)
         ggml_backend_buffer_free(ctx->s2a.buf_wn);

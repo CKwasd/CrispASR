@@ -52,6 +52,11 @@ struct confucius4_tts_context* confucius4_tts_init_from_file(const char* path_t2
 // Load the S2A model (required before synthesis). Returns 0 on success.
 int confucius4_tts_set_s2a_path(struct confucius4_tts_context* ctx, const char* path_s2a);
 
+// Load the BigVGAN vocoder (optional companion GGUF for mel → PCM).
+// Without this, synthesis outputs silence at the correct duration.
+// Returns 0 on success.
+int confucius4_tts_set_vocoder_path(struct confucius4_tts_context* ctx, const char* path_vocoder);
+
 // Set reference speaker conditioning from pre-computed Wav2Vec2-BERT features.
 // `semantic_features` is (n_frames, 1024) float32 — layer-17 hidden states,
 // z-normalised with the baked mean/var. `style_embedding` is (192,) float32
