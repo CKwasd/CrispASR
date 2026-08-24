@@ -6,12 +6,43 @@
 
 ---
 
-## NOW — active work
+## NOW — active work (2026-08-24)
 
 **Branch:** `feat/confucius4-cfg` (worktree `.claude/worktrees/feat-confucius4-cfg`)
-**Status:** four S2A/T2S correctness bugs found by re-reading the Python blueprint
-line-by-line; fixes written and compile-clean, end-to-end run pending (the VPS is
-heavily contended, the full build is queued).
+**Kernel:** `chr1s4/crispasr-confucius4-cfg-verify`
+
+**S2A is exact** (cos 1.000000 end-to-end, kernel runs 7–9). **T2S was the bug**:
+kernel run 9 measured `prefill_logits cos=0.175` and `lm_latent cos=0.097,
+ratio 1.77` vs the PyTorch reference. Three T2S divergences found by
+line-by-line reading and fixed on the branch (run 10+ validates):
+
+- **Bug 9 — `transformer.ln_f` skipped.** The reference stacks TWO final
+  LayerNorms: GPT2Model's internal `ln_f` (its output IS the `lm_latent` that
+  conditions S2A), then the model's own `final_norm` before `semantic_head`.
+  The runtime bound only `final_norm` — wrong logits AND wrong latents. Both
+  norms were always in the GGUF. (`39b09d8c`)
+- **Bug 10 — repetition penalty never applied.** The reference generates with
+  `repetition_penalty=10.0` via HF's processor (per-unique-token, before the
+  temperature/top-k/top-p warpers, BOS penalized from step 0). The runtime
+  parsed the param and ignored it. Override: `CRISPASR_CONFUCIUS4_REP_PEN`.
+  (`39b09d8c`)
+- **Bug 11 — missing `</s>` on the text ids.** The reference tokenizes via
+  `AutoTokenizer` → `LlamaTokenizerFast` with `add_bos_token=True` AND
+  `add_eos_token=True` (tokenizer_config.json), so text ids end with `</s>`
+  (id 2). The verify kernel's raw `tokenizers.Tokenizer` post-processor only
+  prepends `<s>` — T2S never saw the end-of-text marker. (`339a970a`)
+
+Also on the branch: native ECAPA `condition_emb` from `w2v_features.bin` when
+`CRISPASR_CONFUCIUS4_COND_DIR` is set (finally exercises + parity-checks the
+ggml ECAPA port; `CRISPASR_CONFUCIUS4_COND_PYEMB=1` forces the Python
+embedding), the real 93-entry `LANGUAGE_TOKEN_MAP` (Chinese prompts for every
+language), and a faithful LlamaTokenizer SP-BPE native tokenizer
+(`core/spm_bpe.h`, hoisted from irodori; irodori adopts the shared header).
+
+**Not yet done:** reference beam-sample is `num_beams=3` (runtime is pure
+sampling — quality knob, revisit if roundtrip is marginal); converter re-run
+for baked vocab + CAMPPlus; native w2v-BERT (sidon.cpp adaptation) for fully
+standalone zero-shot conditioning; registry/tests/checklist.
 
 ### Bugs found and fixed on this branch
 
