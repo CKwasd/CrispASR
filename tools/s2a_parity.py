@@ -75,13 +75,19 @@ def main():
     T_mel, mel_dim = z_init.shape
     print(f"T_sem={T_sem} T_mel={T_mel} mel_dim={mel_dim}")
 
-    model = MaskedDiffWithXvec(MaskedDiffWithXvecConfig())
+    # Build from the SHIPPED config, not the dataclass defaults: the checkpoint
+    # has estimator_mlp_ratio=3.0 (ff 1536, not 2048), and cfm_t_scheduler stays
+    # at its dataclass default "linear" -- ConditionalCFM's own signature says
+    # "cosine", but flow.py passes the config value.
+    import yaml
+    cfg_path = os.path.join(a.ref_repo, "config", "inference_config.yaml")
+    s2a_cfg = yaml.safe_load(open(cfg_path))["s2a_model"]
+    cfg = MaskedDiffWithXvecConfig(**s2a_cfg)
+    print(f"config: ff_intermediate={int(cfg.estimator_hidden_dim * cfg.estimator_mlp_ratio)} "
+          f"t_scheduler={cfg.cfm_t_scheduler!r} cfg_rate={cfg.cfm_inference_cfg_rate}")
+    model = MaskedDiffWithXvec(cfg)
     state = torch.load(a.s2a_ckpt, map_location="cpu", weights_only=False)
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        print("MISSING keys:", missing[:8], "..." if len(missing) > 8 else "")
-    if unexpected:
-        print("UNEXPECTED keys:", unexpected[:8], "..." if len(unexpected) > 8 else "")
+    missing, unexpected = model.load_state_dict(state, strict=True)
     model.eval()
 
     sem = torch.from_numpy(codes.astype(np.int64)).unsqueeze(0)
@@ -104,7 +110,8 @@ def main():
         prompt_x = torch.zeros_like(x)
 
         t_span = torch.linspace(0, 1, a.steps + 1)
-        t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+        if cfg.cfm_t_scheduler == "cosine":
+            t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
         t, dt = t_span[0], t_span[1] - t_span[0]
 
         for step in range(1, len(t_span)):

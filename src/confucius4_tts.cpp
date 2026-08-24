@@ -2091,10 +2091,23 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
         cond_ref_zeros.assign(cond_ref.size(), 0.0f);
     }
 
-    // Cosine time schedule: t_span[i] = 1 - cos(i/(n_steps) * pi/2)
+    // Time schedule.  MaskedDiffWithXvecConfig.cfm_t_scheduler defaults to
+    // "linear" and config/inference_config.yaml does not override it, so the
+    // shipped model solves over a plain linspace(0, 1, n_steps + 1).  (The
+    // ConditionalCFM.__init__ signature says "cosine", but flow.py passes the
+    // config value, not the signature default.)  The cosine schedule stays
+    // available for A/B behind CRISPASR_CONFUCIUS4_T_SCHEDULE=cosine.
+    bool cosine_schedule = false;
+    if (const char* env_sched = std::getenv("CRISPASR_CONFUCIUS4_T_SCHEDULE"))
+        cosine_schedule = (std::strcmp(env_sched, "cosine") == 0);
+
     std::vector<float> t_span(n_steps + 1);
-    for (int i = 0; i <= n_steps; i++)
-        t_span[i] = 1.0f - cosf((float)i / n_steps * 1.5707963f);
+    for (int i = 0; i <= n_steps; i++) {
+        float lin = (float)i / (float)n_steps;
+        t_span[i] = cosine_schedule ? 1.0f - cosf(lin * 1.5707963f) : lin;
+    }
+    if (vb >= 1)
+        fprintf(stderr, "confucius4: S2A time schedule: %s\n", cosine_schedule ? "cosine" : "linear");
 
     // Euler ODE: z = z + dt * velocity_from_DiT
     for (int step = 1; step <= n_steps; step++) {
