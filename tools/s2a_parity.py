@@ -142,6 +142,34 @@ def main():
 
         mel_ref = x[0].numpy().T   # back to (T_mel, mel_dim) row-major
         cmp("mel (final)", mel_cpp, mel_ref)
+
+        # --- stage 3: per-step, TEACHER-FORCED velocity ---------------------
+        # Recompute each step's velocity from the C++'s OWN state at that step,
+        # so no error accumulates between steps.  A first step that already
+        # diverges points at the estimator; a smooth decay points at
+        # quantization compounding through the ODE.
+        have_steps = sorted(k for k in shp if k.startswith("v_step_"))
+        if have_steps:
+            print("  per-step teacher-forced velocity (no accumulation):")
+            for k in have_steps:
+                step = int(k.split("_")[-1])
+                z_k = load(d, f"z_step_{step:02d}", shp)
+                v_k = load(d, f"v_step_{step:02d}", shp)
+                t_k = float(t_span[step - 1])
+                xk = torch.from_numpy(z_k.T.copy()).unsqueeze(0)
+                if a.cfg > 0:
+                    v = dec.estimator(torch.cat([xk, xk], 0),
+                                      torch.cat([mask, mask], 0),
+                                      torch.cat([mu, torch.zeros_like(mu)], 0),
+                                      torch.full((2,), t_k),
+                                      torch.cat([spks, torch.zeros_like(spks)], 0),
+                                      torch.zeros(2, model.output_size, T_mel))
+                    vc, vu = torch.split(v, [1, 1], dim=0)
+                    v = (1.0 + a.cfg) * vc - a.cfg * vu
+                else:
+                    v = dec.estimator(xk, mask, mu, torch.tensor([t_k]), spks,
+                                      torch.zeros_like(xk))
+                cmp(f"  v step {step:2d} (t={t_k:.3f})", v_k, v[0].numpy().T)
         np.save(os.path.join(d, "mel_ref.npy"), mel_ref)
         print("wrote", os.path.join(d, "mel_ref.npy"))
 
@@ -159,10 +187,21 @@ def main():
         # speaker conditioning is (the model is zero-shot and always has a prompt).
         os.makedirs(a.vocode_out, exist_ok=True)
         sys.path.insert(0, a.ref_repo)
-        from external.bigvgan.bigvgan import BigVGAN
+        import json as _json
         import scipy.io.wavfile as wavfile
+        from huggingface_hub import hf_hub_download
+        from external.bigvgan.bigvgan import BigVGAN
+        from external.bigvgan.env import AttrDict
 
-        voc = BigVGAN.from_pretrained("nvidia/bigvgan_v2_22khz_80band_256x", use_cuda_kernel=False)
+        # Build from config + state dict directly: BigVGAN's PyTorchModelHubMixin
+        # predates the current huggingface_hub, whose _from_pretrained passes
+        # proxies/resume_download that its override does not accept.
+        repo = "nvidia/bigvgan_v2_22khz_80band_256x"
+        h = AttrDict(_json.load(open(hf_hub_download(repo, "config.json"))))
+        voc = BigVGAN(h)
+        ckpt = torch.load(hf_hub_download(repo, "bigvgan_generator.pt"),
+                          map_location="cpu", weights_only=False)
+        voc.load_state_dict(ckpt["generator"])
         voc.remove_weight_norm()
         voc.eval()
         with torch.no_grad():

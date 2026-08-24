@@ -2136,6 +2136,19 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
                 velocity[i] = (1.0f + cfg_rate) * velocity[i] - cfg_rate * v_uncond[i];
         }
 
+        // Per-step dump: the state the velocity was computed FROM, and the
+        // (post-CFG) velocity itself.  Lets the parity harness recompute each
+        // step's velocity from the identical input and find the FIRST
+        // divergence, instead of only seeing accumulated error in the mel.
+        if (s2a_dump_dir()) {
+            char nm[64], shp[64];
+            snprintf(shp, sizeof(shp), "%d,%d", T_mel, mel_dim);
+            snprintf(nm, sizeof(nm), "z_step_%02d", step);
+            s2a_dump_raw(nm, z.data(), z.size() * sizeof(float), shp);
+            snprintf(nm, sizeof(nm), "v_step_%02d", step);
+            s2a_dump_raw(nm, velocity.data(), velocity.size() * sizeof(float), shp);
+        }
+
         for (size_t i = 0; i < z.size(); i++)
             z[i] += dt * velocity[i];
 

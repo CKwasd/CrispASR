@@ -87,6 +87,9 @@ def grab(repo, fname, **kw):
 
 t2s_path = grab("cstr/confucius4-tts-GGUF", "confucius4-tts-t2s-q4_k.gguf")
 s2a_path = grab("cstr/confucius4-tts-GGUF", "confucius4-tts-s2a-q4_k.gguf")
+# F16 too: running the S2A at F16 separates quantization error compounding
+# through the 25-step ODE from a genuine remaining port bug.
+s2a_f16 = grab("cstr/confucius4-tts-GGUF", "confucius4-tts-s2a-f16.gguf")
 voc_path = grab("cstr/confucius4-tts-GGUF", "confucius4-tts-bigvgan-22k-f16.gguf")
 s2a_ckpt = grab("netease-youdao/Confucius4-TTS", "s2a_model.pt", d=str(TEMP / "torch"))
 
@@ -122,47 +125,54 @@ crispasr_bin = str(BUILD / "bin" / "crispasr")
 print(f"  binary: {crispasr_bin} ({os.path.getsize(crispasr_bin) / 1024**2:.0f} MB)")
 
 # ── Phase 6: synthesize, dumping the S2A stages ─────────────────────────────
-kh.step(f"TTS ({ODE_STEPS} ODE steps, CFG on)")
-DUMP.mkdir(parents=True, exist_ok=True)
-tts_wav = TEMP / "confucius4_cfg.wav"
+kh.step(f"TTS ({ODE_STEPS} ODE steps, CFG on) -- q4_k and f16")
 
-env = os.environ.copy()
-env["CRISPASR_CONFUCIUS4_TEXT_IDS"] = token_ids_str
-env["CRISPASR_CONFUCIUS4_DUMP_S2A"] = str(DUMP)
+env_base = os.environ.copy()
+env_base["CRISPASR_CONFUCIUS4_TEXT_IDS"] = token_ids_str
 
-res = subprocess.run(
-    [crispasr_bin, "--backend", "confucius4-tts", "-m", t2s_path,
-     "--codec-model", s2a_path, "--tts", TEST_TEXT,
-     "--tts-output", str(tts_wav), "--tts-steps", str(ODE_STEPS), "-v"],
-    capture_output=True, text=True, timeout=7200, env=env,
-)
-print(f"  TTS rc={res.returncode}")
-for line in res.stderr.split("\n"):
-    if any(k in line for k in ("confucius4:", "output:", "DiT", "ODE", "schedule", "cfg=")):
-        print("  " + line.strip())
-if res.returncode != 0:
-    print("  --- last 30 stderr lines ---")
-    for line in [l for l in res.stderr.split("\n") if l.strip()][-30:]:
-        print("  " + line.strip())
+runs = {}
+for tag, s2a in (("q4_k", s2a_path), ("f16", s2a_f16)):
+    dump = TEMP / f"dump_{tag}"
+    dump.mkdir(parents=True, exist_ok=True)
+    wav = TEMP / f"confucius4_{tag}.wav"
+    env = dict(env_base)
+    env["CRISPASR_CONFUCIUS4_DUMP_S2A"] = str(dump)
+    r = subprocess.run(
+        [crispasr_bin, "--backend", "confucius4-tts", "-m", t2s_path,
+         "--codec-model", s2a, "--tts", TEST_TEXT,
+         "--tts-output", str(wav), "--tts-steps", str(ODE_STEPS), "-v"],
+        capture_output=True, text=True, timeout=7200, env=env,
+    )
+    ok = wav.exists() and os.path.getsize(str(wav)) > 100
+    print(f"  [{tag}] rc={r.returncode}  wav={'%d B' % os.path.getsize(str(wav)) if ok else 'NONE'}")
+    for line in r.stderr.split("\n"):
+        if any(k in line for k in ("flow-matching:", "regulator OK", "time schedule", "BigVGAN:")):
+            print(f"  [{tag}] " + line.strip())
+    if r.returncode != 0:
+        for line in [l for l in r.stderr.split("\n") if l.strip()][-20:]:
+            print(f"  [{tag}] ! " + line.strip())
+    runs[tag] = {"rc": r.returncode, "stderr": r.stderr, "wav": wav, "ok": ok, "dump": dump}
 
-wav_ok = tts_wav.exists() and os.path.getsize(str(tts_wav)) > 100
-print(f"  WAV: {'%d bytes' % os.path.getsize(str(tts_wav)) if wav_ok else 'NOT PRODUCED'}")
+res = runs["q4_k"]["stderr"]
+wav_ok = runs["q4_k"]["ok"]
+tts_wav = runs["q4_k"]["wav"]
+
 
 # ── Phase 7: per-stage parity against the real PyTorch S2A ──────────────────
 kh.step("S2A parity vs PyTorch reference")
 parity = REPO / "tools" / "s2a_parity.py"
-if not (DUMP / "shapes.txt").exists():
-    print("  SKIP: no dump produced (TTS failed before the S2A stage)")
-elif not parity.exists():
-    print(f"  SKIP: {parity} missing on this branch")
-else:
-    pres = subprocess.run(
-        [sys.executable, str(parity), "--dump-dir", str(DUMP),
-         "--ref-repo", str(REF), "--s2a-ckpt", s2a_ckpt,
-         "--steps", str(ODE_STEPS), "--cfg", "0.7",
-         "--vocode-out", str(TEMP / "vocoded")],
-        capture_output=True, text=True, timeout=7200,
-    )
+for tag in ("q4_k", "f16"):
+    dump = runs[tag]["dump"]
+    print(f"  --- {tag} ---")
+    if not (dump / "shapes.txt").exists():
+        print("  SKIP: no dump produced")
+        continue
+    cmd = [sys.executable, str(parity), "--dump-dir", str(dump),
+           "--ref-repo", str(REF), "--s2a-ckpt", s2a_ckpt,
+           "--steps", str(ODE_STEPS), "--cfg", "0.7"]
+    if tag == "q4_k":                       # vocode once, from the shipped quant
+        cmd += ["--vocode-out", str(TEMP / "vocoded")]
+    pres = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
     print(f"  parity rc={pres.returncode}")
     for line in pres.stdout.split("\n"):
         if line.strip():
@@ -170,6 +180,7 @@ else:
     if pres.returncode != 0:
         for line in [l for l in pres.stderr.split("\n") if l.strip()][-25:]:
             print("  ! " + line.strip())
+
 
 # ── Phase 8: ASR roundtrip (the acceptance gate) ────────────────────────────
 kh.step("ASR roundtrip")
@@ -203,7 +214,8 @@ def asr_score(tag, path):
     return len(hit)
 
 
-asr_score("cpp-cli", str(tts_wav) if wav_ok else None)
+asr_score("cpp-cli-q4_k", str(runs["q4_k"]["wav"]) if runs["q4_k"]["ok"] else None)
+asr_score("cpp-cli-f16", str(runs["f16"]["wav"]) if runs["f16"]["ok"] else None)
 asr_score("cpp-mel/torch-voc", str(TEMP / "vocoded" / "cpp_mel.wav"))
 asr_score("REF-mel/torch-voc", str(TEMP / "vocoded" / "ref_mel.wav"))
 print("  NOTE: if REF-mel is also ~0%, the port is not the blocker -- the model is")
