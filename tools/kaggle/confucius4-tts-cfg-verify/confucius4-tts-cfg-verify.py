@@ -228,6 +228,47 @@ for arm in ("s2a-only", "full"):
     cond_runs[arm] = {"wav": wav, "ok": ok}
 
 
+# ── Phase 6c: REFERENCE end-to-end control ──────────────────────────────────
+# T2S parity now passes (prefill argmax matches, lm_latent cos 0.999) yet the
+# roundtrip still fails — including the reference-S2A-on-runtime-codes arm.
+# The missing control: does the FULL reference pipeline (beam-sample T2S +
+# reference S2A + torch BigVGAN) pass the roundtrip on THIS text and THIS
+# prompt wav? If yes, the remaining delta is the decode strategy
+# (num_beams=3 beam-sample vs pure sampling). If no, the harness/conditioning
+# is the problem and the C++ is off the hook.
+kh.step("REFERENCE end-to-end control")
+ref_e2e_wav = TEMP / "confucius4_ref_e2e.wav"
+# transformers pinned to the reference release: beam-sample internals moved
+# across HF versions, and this arm defines the ground-truth decode behavior.
+kh.sh_with_progress("pip install -q regex inflect pykakasi 'transformers==4.52.4'")
+_driver = TEMP / "ref_e2e_driver.py"
+_driver.write_text(f"""
+import sys, torch, torchaudio
+sys.path.insert(0, {str(REF)!r})
+import os
+os.chdir({str(REF)!r})   # config uses relative ./checkpoints paths
+from confuciustts.cli.inference import ConfuciusTTS
+m = ConfuciusTTS(config_path="config/inference_config.yaml", device="cpu")
+audio = m.generate({TEST_TEXT!r}, {LANG!r}, {str(prompt_wav)!r}, raw=True, verbose=True)
+if audio.dim() == 1:
+    audio = audio.unsqueeze(0)
+torchaudio.save({str(ref_e2e_wav)!r}, audio.cpu(), m.sample_rate)
+print("saved", {str(ref_e2e_wav)!r})
+""")
+try:
+    eres = subprocess.run([sys.executable, str(_driver)], capture_output=True,
+                          text=True, timeout=7200)
+    print(f"  ref e2e rc={eres.returncode}")
+    for line in eres.stdout.split("\n")[-15:]:
+        if line.strip():
+            print("  " + line.rstrip())
+    if eres.returncode != 0:
+        for line in [l for l in eres.stderr.split("\n") if l.strip()][-25:]:
+            print("  ! " + line.strip())
+except Exception as e:  # noqa: BLE001 — control arm must never sink the run
+    print(f"  ref e2e failed: {e}")
+
+
 # ── Phase 7: per-stage parity against the real PyTorch S2A ──────────────────
 kh.step("S2A parity vs PyTorch reference")
 parity = REPO / "tools" / "s2a_parity.py"
@@ -314,6 +355,7 @@ for _arm, _r in cond_runs.items():
     asr_score(f"COND-{_arm}", str(_r["wav"]) if _r["ok"] else None)
 asr_score("cpp-mel/torch-voc", str(TEMP / "vocoded" / "cpp_mel.wav"))
 asr_score("REF-mel/torch-voc", str(TEMP / "vocoded" / "ref_mel.wav"))
+asr_score("REF-E2E-control", str(ref_e2e_wav) if ref_e2e_wav.exists() else None)
 print("  NOTE: if REF-mel is also ~0%, the port is not the blocker -- the model is")
 print("        zero-shot and always has a speaker prompt, which is still all zeros.")
 
