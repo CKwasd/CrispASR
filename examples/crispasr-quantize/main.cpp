@@ -785,6 +785,13 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             // embeddings, and the tiny FM input projection at F16/F32.
             !(arch == "voxtral_tts" &&
               (sname == "codec.semantic_cb.weight" || sname.find("voice.") == 0 || sname.find("fm.input_proj") == 0)) &&
+            // Confucius4-TTS: keep the baked speaker encoders at source precision.
+            // T2S ECAPA (speaker_encoder.*) makes the single condition_emb prefix
+            // slot; S2A CAMPPlus (campplus.*) makes the 192-d style vector — both
+            // are tiny and load-bearing (a wrong style vector shifts the whole
+            // CFG-conditioned ODE).
+            !(arch.find("confucius4") != std::string::npos &&
+              (sname.find("speaker_encoder.") == 0 || sname.find("campplus.") == 0)) &&
             !(sname.find("cls.") == 0 && ggml_nelements(t) < 65536) && (sname.find("enc_proj.") != 0) &&
             (allow_lmhead || (sname.find("lm_head.") != 0)) && (sname.find("tok_emb.") != 0) &&
             (sname.find("lang_emb.") != 0) &&

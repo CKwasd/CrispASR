@@ -363,6 +363,32 @@ for name in sorted(s2a_state.keys()):
         print(f"  wrote {n_written} tensors...", flush=True)
 
 print(f"  wrote {n_written} S2A tensors total")
+
+# ── CAMPPlus style encoder baked into the S2A GGUF ──────────────────────────
+# The reference's style_embedding comes from funasr/campplus
+# (campplus_cn_common.bin, CAMPPlus(feat_dim=80, embedding_size=192)); the
+# runtime rebinds it through chatterbox_campplus with the `campplus.` prefix
+# (dots-tts pattern). BN running stats and 1-D tensors stay F32; the F16
+# 2-D+ weights must be excluded from quantization (quantize rule: keep
+# `campplus.` at F16 — the whole encoder is ~28 MB).
+from huggingface_hub import hf_hub_download as _dl
+campplus_path = _dl("funasr/campplus", filename="campplus_cn_common.bin", token=hf_token)
+spk_state = torch.load(campplus_path, map_location="cpu", weights_only=True)
+if isinstance(spk_state, dict) and "state_dict" in spk_state:
+    spk_state = spk_state["state_dict"]
+n_spk = 0
+for name in sorted(spk_state.keys()):
+    if name.endswith("num_batches_tracked"):
+        continue
+    t = spk_state[name].float().numpy()
+    if t.ndim == 1:
+        s2a_writer.add_tensor("campplus." + name, t)
+    else:
+        s2a_writer.add_tensor("campplus." + name, t.astype(np.float16))
+    n_spk += 1
+print(f"  baked {n_spk} CAMPPlus tensors under campplus.*")
+del spk_state
+
 s2a_writer.write_header_to_file()
 s2a_writer.write_kv_data_to_file()
 s2a_writer.write_tensors_to_file()
