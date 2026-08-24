@@ -223,13 +223,13 @@ print("        zero-shot and always has a speaker prompt, which is still all zer
 
 # ── Phase 9: summary ────────────────────────────────────────────────────────
 kh.step("summary")
-m = re.search(r"generated (\d+) semantic codes", res.stderr)
+m = re.search(r"generated (\d+) semantic codes", res)
 print(f"  semantic codes : {m.group(1) if m else '?'}")
-m = re.search(r"time schedule: (\w+)", res.stderr)
+m = re.search(r"time schedule: (\w+)", res)
 print(f"  time schedule  : {m.group(1) if m else '?'}   (expect linear)")
-m = re.search(r"cfg=([0-9.]+)", res.stderr)
+m = re.search(r"cfg=([0-9.]+)", res)
 print(f"  cfg rate       : {m.group(1) if m else '?'}   (expect 0.70)")
-m = re.search(r"regulator OK \(([0-9]+)→([0-9]+)→([0-9]+) dims\)", res.stderr)
+m = re.search(r"regulator OK \(([0-9]+)→([0-9]+)→([0-9]+) dims\)", res)
 print(f"  regulator dims : {'->'.join(m.groups()) if m else '?'}   (expect 2304->1024->512)")
-print(f"  TTS rc         : {res.returncode}")
+print(f"  TTS rc         : q4_k={runs['q4_k']['rc']} f16={runs['f16']['rc']}")
 print("\n=== Done ===", flush=True)

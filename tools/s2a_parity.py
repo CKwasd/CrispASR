@@ -143,6 +143,25 @@ def main():
         mel_ref = x[0].numpy().T   # back to (T_mel, mel_dim) row-major
         cmp("mel (final)", mel_cpp, mel_ref)
 
+        # --- stage 2b: inside the estimator, at step 1 ----------------------
+        # cond is exact at F16 and t=0 makes the timestep embedding trivially
+        # identical, so any divergence here is the estimator itself.  Split the
+        # hand-written CPU stages (timestep MLP, input_embed) from the ggml
+        # graph, so we know which side to bisect next.
+        est = dec.estimator
+        if "dit_t1" in shp:
+            t1_ref = est.t_embedder(torch.tensor([0.0]))[0].numpy()
+            cmp("dit t1 (timestep)", load(d, "dit_t1", shp), t1_ref)
+        if "dit_t2" in shp and hasattr(est, "t_embedder2"):
+            t2_ref = est.t_embedder2(torch.tensor([0.0]))[0].numpy()
+            cmp("dit t2 (wavenet ts)", load(d, "dit_t2", shp), t2_ref)
+        if "dit_x_in" in shp:
+            z0 = torch.from_numpy(load(d, "z_init", shp).T.copy()).unsqueeze(0)
+            x_in_ref = est.input_embed(z0.transpose(1, 2),
+                                       torch.zeros_like(z0).transpose(1, 2),
+                                       mu, spks)
+            cmp("dit x_in (input_embed)", load(d, "dit_x_in", shp), x_in_ref[0].numpy())
+
         # --- stage 3: per-step, TEACHER-FORCED velocity ---------------------
         # Recompute each step's velocity from the C++'s OWN state at that step,
         # so no error accumulates between steps.  A first step that already

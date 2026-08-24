@@ -1742,6 +1742,22 @@ static std::vector<float> s2a_dit_forward(confucius4_tts_context* ctx, const flo
         return {};
     }
 
+    // Bisect the estimator: dump the CPU-side stages once, on the first
+    // conditioned call, so the harness can tell an input_embed / timestep bug
+    // from one inside the ggml graph.
+    if (s2a_dump_dir() && use_spk) {
+        static bool dumped_once = false;
+        if (!dumped_once) {
+            dumped_once = true;
+            char shp[64];
+            snprintf(shp, sizeof(shp), "%d,%d", T, dim);
+            s2a_dump_raw("dit_x_in", hidden.data(), hidden.size() * sizeof(float), shp);
+            snprintf(shp, sizeof(shp), "%d", dim);
+            s2a_dump_raw("dit_t1", t1.data(), t1.size() * sizeof(float), shp);
+            s2a_dump_raw("dit_t2", t2.data(), t2.size() * sizeof(float), shp);
+        }
+    }
+
     // Full ggml graph: DiT blocks + WaveNet + final_layer + conv2 → velocity
     return s2a_dit_run(ctx, hidden.data(), t1.data(), t2.data(), x_flat, T, mel_dim);
 }
