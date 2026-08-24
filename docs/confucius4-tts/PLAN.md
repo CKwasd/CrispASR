@@ -6,43 +6,55 @@
 
 ---
 
-## NOW — active work (2026-08-24)
+## NOW — active work (2026-08-24, late)
 
 **Branch:** `feat/confucius4-cfg` (worktree `.claude/worktrees/feat-confucius4-cfg`)
-**Kernel:** `chr1s4/crispasr-confucius4-cfg-verify`
+**Kernel:** `chr1s4/crispasr-confucius4-cfg-verify` — run 14 in flight (beam decode)
 
-**S2A is exact** (cos 1.000000 end-to-end, kernel runs 7–9). **T2S was the bug**:
-kernel run 9 measured `prefill_logits cos=0.175` and `lm_latent cos=0.097,
-ratio 1.77` vs the PyTorch reference. Three T2S divergences found by
-line-by-line reading and fixed on the branch (run 10+ validates):
+**T2S graph is now EXACT** (kernel run 12): `prefix_emb` cos=0.999998,
+`prefill_logits` cos=0.998 **argmax match** (1527==1527), `lm_latent`
+cos=0.999, `condition_emb` (native ggml ECAPA) cos=1.000000. Residual is Q4_K
+quantization noise. Three more bugs fixed to get here (bugs 9–12 below).
 
-- **Bug 9 — `transformer.ln_f` skipped.** The reference stacks TWO final
-  LayerNorms: GPT2Model's internal `ln_f` (its output IS the `lm_latent` that
-  conditions S2A), then the model's own `final_norm` before `semantic_head`.
-  The runtime bound only `final_norm` — wrong logits AND wrong latents. Both
-  norms were always in the GGUF. (`39b09d8c`)
-- **Bug 10 — repetition penalty never applied.** The reference generates with
-  `repetition_penalty=10.0` via HF's processor (per-unique-token, before the
-  temperature/top-k/top-p warpers, BOS penalized from step 0). The runtime
-  parsed the param and ignored it. Override: `CRISPASR_CONFUCIUS4_REP_PEN`.
-  (`39b09d8c`)
-- **Bug 11 — missing `</s>` on the text ids.** The reference tokenizes via
-  `AutoTokenizer` → `LlamaTokenizerFast` with `add_bos_token=True` AND
-  `add_eos_token=True` (tokenizer_config.json), so text ids end with `</s>`
-  (id 2). The verify kernel's raw `tokenizers.Tokenizer` post-processor only
-  prepends `<s>` — T2S never saw the end-of-text marker. (`339a970a`)
+**Run 13 control: the reference end-to-end pipeline (beam-sample T2S +
+reference S2A + BigVGAN, transformers pinned 4.52.4) scores 8/8 = 100% on the
+same text + jfk.wav prompt.** So model + conditioning + harness are all fine;
+the only remaining delta was the decode strategy. The C++ pure-sampling decode
+still babbles (0/8) — the reference decode is `num_beams=3` beam-sample.
 
-Also on the branch: native ECAPA `condition_emb` from `w2v_features.bin` when
-`CRISPASR_CONFUCIUS4_COND_DIR` is set (finally exercises + parity-checks the
-ggml ECAPA port; `CRISPASR_CONFUCIUS4_COND_PYEMB=1` forces the Python
-embedding), the real 93-entry `LANGUAGE_TOKEN_MAP` (Chinese prompts for every
-language), and a faithful LlamaTokenizer SP-BPE native tokenizer
-(`core/spm_bpe.h`, hoisted from irodori; irodori adopts the shared header).
+**Now on the branch:** a beam-sample decoder faithful to transformers 4.52.4
+`_beam_search(do_sample=True)` (processors/warpers on LOG-PROBS in order
+rep-pen → temp → top-k → top-p; joint multinomial 2·beams w/o replacement;
+first-beams-only EOS finishing, length-penalized; early stop when beams
+finished; teacher-forced latent pass over the winner). Default beams=3;
+`CRISPASR_CONFUCIUS4_BEAMS=1` restores sampling. Run 14 verdict pending.
 
-**Not yet done:** reference beam-sample is `num_beams=3` (runtime is pure
-sampling — quality knob, revisit if roundtrip is marginal); converter re-run
-for baked vocab + CAMPPlus; native w2v-BERT (sidon.cpp adaptation) for fully
-standalone zero-shot conditioning; registry/tests/checklist.
+### Bugs 9–12 (this session, all found by line-by-line reading + parity)
+
+9.  **`transformer.ln_f` skipped** — reference stacks GPT2's own ln_f (its
+    output IS the S2A lm_latent) then `final_norm` before `semantic_head`;
+    runtime bound only `final_norm`. Both always in the GGUF.
+10. **Repetition penalty parsed but never applied** (reference: 10.0 via HF
+    processor). Env `CRISPASR_CONFUCIUS4_REP_PEN`.
+11. **Missing `</s>`** — LlamaTokenizerFast has `add_eos_token=True`; the
+    kernel's raw `tokenizers.Tokenizer` only prepends `<s>`. T2S never saw
+    the end-of-text marker.
+12. **`KvSelfAttnParams` uninitialized** — `attn_scale` (and gqa_mode etc.)
+    was stack garbage passed verbatim to `soft_max_ext`; plus the prefill ran
+    maskless (= FULL attention, HARD RULE #5) until a causal mask landed.
+    This was the prefill cos≈0.2 that survived fixes 9–11.
+
+Also landed: native ECAPA from `w2v_features.bin` under
+`CRISPASR_CONFUCIUS4_COND_DIR` (validates the port; `_COND_PYEMB=1` forces the
+Python embedding), real 93-entry LANGUAGE_TOKEN_MAP, LlamaTokenizer SP-BPE
+native tokenizer (`core/spm_bpe.h`, shared with irodori), reference
+`max_length` TOTAL-length semantics, reference e2e control arm in the kernel.
+
+**Queue after roundtrip passes:** converter re-run (vocab already baked by
+converter; ADD CAMPPlus into S2A GGUF) · native conditioning (CAMPPlus bind =
+dots pattern, prompt mel 22k via core/mel.h, w2v-BERT layer-17 via sidon.cpp
+adaptation) · registry/tests/checklist · perf (BigVGAN raw path, persistent
+decode graph for the 3-beam T2S).
 
 ### Bugs found and fixed on this branch
 
