@@ -10,6 +10,7 @@
 #include "confucius4_tts.h"
 
 #include "core/attention.h"
+#include "core/bpe.h"
 #include "core/ggml_cpu_backend.h"
 #include "core/gpu_backend_pref.h"
 #include "core/gguf_loader.h"
@@ -138,6 +139,10 @@ struct confucius4_s2a_model {
     ggml_backend_buffer_t buf_w = nullptr;
     core_gguf::tensor_map tensors; // all tensors by name for DiT/WaveNet/LR access
 
+    // Fused WaveNet weights (weight_norm folded at load time for ggml graph use)
+    ggml_context* ctx_wn = nullptr;
+    ggml_backend_buffer_t buf_wn = nullptr;
+
     bool loaded = false;
 };
 
@@ -147,7 +152,8 @@ struct confucius4_dit_cache {
     ggml_gallocr_t galloc = nullptr;
     ggml_cgraph* gf = nullptr;
     ggml_tensor* hidden_in = nullptr; // (dim, T)   — input embedding
-    ggml_tensor* t_emb_in = nullptr;  // (dim,)     — timestep embedding
+    ggml_tensor* t_emb_in = nullptr;  // (dim,)     — timestep embedding (t1 for DiT)
+    ggml_tensor* t2_emb_in = nullptr; // (dim,)     — timestep embedding (t2 for WaveNet)
     ggml_tensor* x_mel_in = nullptr;  // (mel_dim, T) — original x for skip_linear
     ggml_tensor* pos_in = nullptr;    // (T,) I32   — RoPE position indices
     ggml_tensor* output = nullptr;    // (mel_dim, T) — velocity output
@@ -164,7 +170,7 @@ struct confucius4_dit_cache {
             gctx = nullptr;
         }
         gf = nullptr;
-        hidden_in = t_emb_in = x_mel_in = pos_in = output = nullptr;
+        hidden_in = t_emb_in = t2_emb_in = x_mel_in = pos_in = output = nullptr;
         T_cached = mel_dim_cached = 0;
     }
     ~confucius4_dit_cache() { reset(); }
@@ -201,8 +207,11 @@ struct confucius4_tts_context {
     std::vector<float> speaker_style_embedding; // (192,)
     bool has_speaker = false;
 
-    // Tokenizer (SentencePiece model bytes, baked in GGUF)
-    std::vector<uint8_t> tokenizer_model;
+    // BPE tokenizer (loaded from GGUF tokenizer.ggml.tokens + merges)
+    std::vector<std::string> bpe_id_to_token;
+    std::unordered_map<std::string, int32_t> bpe_token_to_id;
+    std::unordered_map<std::string, int32_t> bpe_merge_rank;
+    bool has_bpe_tokenizer = false;
 
     // w2v-bert normalisation stats
     std::vector<float> w2v_mean; // (1024,)
@@ -228,6 +237,10 @@ confucius4_tts_params confucius4_tts_default_params(void) {
     p.seed = 0;
     return p;
 }
+
+// Forward declarations for helpers used during loading
+static std::vector<float> s2a_read_f32(ggml_tensor* t);
+static ggml_tensor* s2a_find(const confucius4_s2a_model& s, const std::string& name);
 
 // ---------------------------------------------------------------------------
 // Load T2S model from GGUF
@@ -260,9 +273,22 @@ static bool load_t2s(confucius4_tts_context* ctx, const char* path) {
     // Read w2v-bert normalisation stats
     ctx->w2v_mean = core_gguf::kv_f32_array(meta, "confucius4.w2v_bert.mean");
     ctx->w2v_var = core_gguf::kv_f32_array(meta, "confucius4.w2v_bert.var");
-    // Tokenizer: loaded separately from companion tokenizer.json or .model file.
-    // The GGUF carries the raw bytes in "tokenizer.model" but loading them
-    // requires a SentencePiece protobuf parser — deferred to the synthesis path.
+
+    // BPE tokenizer from GGUF (baked by the converter or vocab-baking kernel)
+    auto tok = core_gguf::kv_str_array(meta, "tokenizer.ggml.tokens");
+    if (!tok.empty()) {
+        ctx->bpe_id_to_token = std::move(tok);
+        ctx->bpe_token_to_id.reserve(ctx->bpe_id_to_token.size());
+        for (int i = 0; i < (int)ctx->bpe_id_to_token.size(); i++)
+            ctx->bpe_token_to_id[ctx->bpe_id_to_token[i]] = i;
+        auto merges = core_gguf::kv_str_array(meta, "tokenizer.ggml.merges");
+        for (size_t i = 0; i < merges.size(); i++)
+            ctx->bpe_merge_rank[merges[i]] = (int32_t)i;
+        ctx->has_bpe_tokenizer = true;
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "confucius4: BPE tokenizer loaded: %zu tokens, %zu merges\n", ctx->bpe_id_to_token.size(),
+                    ctx->bpe_merge_rank.size());
+    }
 
     core_gguf::free_metadata(meta);
 
@@ -511,23 +537,90 @@ int confucius4_tts_set_s2a_path(confucius4_tts_context* ctx, const char* path_s2
     if (hp.estimator_mel_dim <= 0)
         hp.estimator_mel_dim = hp.output_size;
 
-    s.loaded = true;
-    if (ctx->params.verbosity >= 1) {
-        fprintf(stderr, "confucius4: S2A loaded %zu tensors OK\n", s.tensors.size());
-        // Print first few estimator tensor names for debugging
-        int n_printed = 0;
-        for (const auto& kv : s.tensors) {
-            if (kv.first.find("estimator") != std::string::npos || kv.first.find("t_embedder") != std::string::npos ||
-                kv.first.find("time_mlp") != std::string::npos) {
-                fprintf(stderr, "confucius4:   S2A tensor: %s [%lld", kv.first.c_str(), (long long)kv.second->ne[0]);
-                for (int d = 1; d < ggml_n_dims(kv.second); d++)
-                    fprintf(stderr, ",%lld", (long long)kv.second->ne[d]);
-                fprintf(stderr, "]\n");
-                if (++n_printed >= 15)
-                    break;
+    // Fold WaveNet weight_norm tensors (weight_g + weight_v → fused weight)
+    // into new ggml tensors on the backend, so the ggml graph can use them.
+    {
+        // Collect weight_norm pairs: cond_layer + 8×in_layers + 8×res_skip_layers
+        struct wn_pair {
+            std::string base; // tensor name base (without .weight_g/.weight_v)
+        };
+        std::vector<wn_pair> wn_pairs;
+        wn_pairs.push_back({"decoder.estimator.wavenet.cond_layer.conv"});
+        for (int i = 0; i < hp.wavenet_num_layers; i++) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "decoder.estimator.wavenet.in_layers.%d.conv", i);
+            wn_pairs.push_back({buf});
+            snprintf(buf, sizeof(buf), "decoder.estimator.wavenet.res_skip_layers.%d.conv", i);
+            wn_pairs.push_back({buf});
+        }
+
+        // Count how many tensors we need to create
+        size_t total_bytes = 0;
+        int n_wn = 0;
+        for (const auto& p : wn_pairs) {
+            auto wv = find((p.base + ".weight_v").c_str());
+            if (wv) {
+                total_bytes += ggml_nelements(wv) * sizeof(float);
+                n_wn++;
             }
         }
+
+        if (n_wn > 0) {
+            // Create a ggml context for the fused weight tensors
+            size_t ctx_size = (size_t)n_wn * ggml_tensor_overhead() + 64;
+            ggml_init_params ip = {ctx_size, nullptr, true};
+            s.ctx_wn = ggml_init(ip);
+
+            // Allocate backend buffer for the fused weights
+            s.buf_wn = ggml_backend_alloc_buffer(ctx->backend, total_bytes + 256);
+
+            ggml_tallocr talloc = ggml_tallocr_new(s.buf_wn);
+            int n_folded = 0;
+
+            for (const auto& p : wn_pairs) {
+                auto wg = find((p.base + ".weight_g").c_str());
+                auto wv = find((p.base + ".weight_v").c_str());
+                if (!wg || !wv)
+                    continue;
+
+                // Create fused tensor with same shape as weight_v
+                std::string fused_name = p.base + ".weight";
+                ggml_tensor* fused;
+                if (ggml_n_dims(wv) == 3)
+                    fused = ggml_new_tensor_3d(s.ctx_wn, GGML_TYPE_F32, wv->ne[0], wv->ne[1], wv->ne[2]);
+                else
+                    fused = ggml_new_tensor_2d(s.ctx_wn, GGML_TYPE_F32, wv->ne[0], wv->ne[1]);
+                ggml_set_name(fused, fused_name.c_str());
+                ggml_tallocr_alloc(&talloc, fused);
+
+                // Read weight_v and weight_g, fold, write to backend
+                auto v = s2a_read_f32(wv);
+                auto g = s2a_read_f32(wg);
+                int64_t ne2 = ggml_n_dims(wv) >= 3 ? wv->ne[2] : wv->ne[1];
+                int64_t vec_len = (int64_t)v.size() / ne2;
+                for (int64_t co = 0; co < ne2; co++) {
+                    float norm_sq = 0.0f;
+                    size_t off = (size_t)(co * vec_len);
+                    for (int64_t i = 0; i < vec_len; i++)
+                        norm_sq += v[off + (size_t)i] * v[off + (size_t)i];
+                    float scale = g[(size_t)co] / (std::sqrt(norm_sq) + 1e-12f);
+                    for (int64_t i = 0; i < vec_len; i++)
+                        v[off + (size_t)i] *= scale;
+                }
+                ggml_backend_tensor_set(fused, v.data(), 0, v.size() * sizeof(float));
+
+                // Register in tensor map under the fused name
+                s.tensors[fused_name] = fused;
+                n_folded++;
+            }
+            if (ctx->params.verbosity >= 1)
+                fprintf(stderr, "confucius4: folded %d WaveNet weight_norm pairs\n", n_folded);
+        }
     }
+
+    s.loaded = true;
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "confucius4: S2A loaded %zu tensors OK\n", s.tensors.size());
     return 0;
 }
 
@@ -1356,10 +1449,145 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
             x = ggml_add(cache.gctx, x, sl_b);
     }
 
-    // Graph outputs x_res (dim=512, T) after skip_linear.
-    // The output path (conv1 → WaveNet → res_proj → final_layer → conv2)
-    // runs on CPU so we can include weight_norm WaveNet convolutions.
-    ggml_set_name(x, "x_res");
+    // Full output path in ggml graph (WaveNet weight_norm folded at load time).
+    ggml_tensor* x_res = x; // save for res_projection
+
+    // conv1: Linear(dim→dim)
+    auto c1_w = s2a_find(s, "decoder.estimator.conv1.weight");
+    auto c1_b = s2a_find(s, "decoder.estimator.conv1.bias");
+    ggml_tensor* x_conv1 = c1_w ? ggml_mul_mat(cache.gctx, c1_w, x_res) : x_res;
+    if (c1_b)
+        x_conv1 = ggml_add(cache.gctx, x_conv1, c1_b);
+
+    // WaveNet: gated dilated residual network with timestep conditioning (t2)
+    // Uses fused weight_norm tensors (folded at load time)
+    cache.t2_emb_in = ggml_new_tensor_1d(cache.gctx, GGML_TYPE_F32, dim);
+    ggml_set_name(cache.t2_emb_in, "dit_t2");
+    ggml_set_input(cache.t2_emb_in);
+
+    auto cond_w = s2a_find(s, "decoder.estimator.wavenet.cond_layer.conv.weight");
+    auto cond_b = s2a_find(s, "decoder.estimator.wavenet.cond_layer.conv.bias");
+
+    ggml_tensor* x_wn = x_conv1; // (dim, T)
+    ggml_tensor* wn_output = nullptr;
+
+    if (cond_w) {
+        const int n_wn_layers = ctx->s2a.hp.wavenet_num_layers;
+        const int hidden = dim;
+        // cond_layer: Conv1d(dim, 2*dim*n_layers, 1) — kernel=1 so use mul_mat
+        // cond_w is 3D after fold: (1, dim, 2*dim*n_layers); reshape to 2D
+        ggml_tensor* cw2d = ggml_reshape_2d(cache.gctx, cond_w, cond_w->ne[0] * cond_w->ne[1], cond_w->ne[2]);
+        ggml_tensor* g_all = ggml_mul_mat(cache.gctx, cw2d, cache.t2_emb_in); // (2*dim*n_layers,)
+        if (cond_b)
+            g_all = ggml_add(cache.gctx, g_all, cond_b);
+
+        wn_output = ggml_dup(cache.gctx, ggml_scale(cache.gctx, x_wn, 0.0f)); // zeros (dim, T)
+
+        char nbuf[256];
+        for (int il = 0; il < n_wn_layers; il++) {
+            // in_layers[il]: Conv1d(dim, 2*dim, k=5, pad=2) — fused weight
+            snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.in_layers.%d.conv.weight", il);
+            auto il_w = s2a_find(s, nbuf);
+            snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.in_layers.%d.conv.bias", il);
+            auto il_b = s2a_find(s, nbuf);
+
+            ggml_tensor* x_in_l = il_w ? ggml_conv_1d(cache.gctx, il_w, x_wn, 1, 2, 1) : x_wn;
+            if (il_b) {
+                ggml_tensor* b2d = ggml_reshape_2d(cache.gctx, il_b, 1, il_b->ne[0]);
+                x_in_l = ggml_add(cache.gctx, x_in_l, b2d);
+            }
+
+            // Slice g_all for this layer: g_l = g_all[il*2*hidden .. (il+1)*2*hidden]
+            ggml_tensor* g_l = ggml_view_1d(cache.gctx, g_all, 2 * hidden, (size_t)il * 2 * hidden * sizeof(float));
+
+            // Split x_in_l (2*hidden, T) + g_l (2*hidden,) into tanh/sigmoid halves
+            // x_a = x_in_l[:hidden] + g_l[:hidden], x_b = x_in_l[hidden:] + g_l[hidden:]
+            ggml_tensor* g_a = ggml_view_1d(cache.gctx, g_l, hidden, 0);
+            ggml_tensor* g_b = ggml_view_1d(cache.gctx, g_l, hidden, hidden * sizeof(float));
+
+            int esz = (int)ggml_element_size(x_in_l);
+            ggml_tensor* xa = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, hidden, T, 2 * hidden * esz, 0));
+            ggml_tensor* xb =
+                ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, hidden, T, 2 * hidden * esz, hidden * esz));
+            xa = ggml_add(cache.gctx, xa, g_a);
+            xb = ggml_add(cache.gctx, xb, g_b);
+
+            // Gated activation: tanh(xa) * sigmoid(xb)
+            ggml_tensor* acts = ggml_mul(cache.gctx, ggml_tanh(cache.gctx, xa), ggml_sigmoid(cache.gctx, xb));
+
+            // res_skip_layers[il]: Conv1d(hidden, rs_ch, 1) — fused weight
+            snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.res_skip_layers.%d.conv.weight", il);
+            auto rs_w = s2a_find(s, nbuf);
+            snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.res_skip_layers.%d.conv.bias", il);
+            auto rs_b = s2a_find(s, nbuf);
+
+            ggml_tensor* rs_out = rs_w ? ggml_conv_1d(cache.gctx, rs_w, acts, 1, 0, 1) : acts;
+            if (rs_b) {
+                ggml_tensor* b2d = ggml_reshape_2d(cache.gctx, rs_b, 1, rs_b->ne[0]);
+                rs_out = ggml_add(cache.gctx, rs_out, b2d);
+            }
+
+            int rs_ch = rs_w ? (int)rs_w->ne[2] : hidden;
+            if (il < n_wn_layers - 1 && rs_ch >= 2 * hidden) {
+                // res = rs_out[:hidden], skip = rs_out[hidden:]
+                esz = (int)ggml_element_size(rs_out);
+                ggml_tensor* res = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, rs_out, hidden, T, rs_ch * esz, 0));
+                ggml_tensor* skip =
+                    ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, rs_out, hidden, T, rs_ch * esz, hidden * esz));
+                x_wn = ggml_add(cache.gctx, x_wn, res);
+                wn_output = ggml_add(cache.gctx, wn_output, skip);
+            } else {
+                // Last layer: output += rs_out
+                wn_output = ggml_add(cache.gctx, wn_output, rs_out);
+            }
+        }
+    }
+
+    // Combine: wn_output (from WaveNet) + res_projection(x_res)
+    auto res_w = s2a_find(s, "decoder.estimator.res_projection.weight");
+    auto res_b = s2a_find(s, "decoder.estimator.res_projection.bias");
+    ggml_tensor* res_proj = res_w ? ggml_mul_mat(cache.gctx, res_w, x_res) : x_res;
+    if (res_b)
+        res_proj = ggml_add(cache.gctx, res_proj, res_b);
+
+    x = wn_output ? ggml_add(cache.gctx, wn_output, res_proj) : res_proj;
+
+    // FinalLayer: LayerNorm(no affine) → (1+scale)*x + shift → Linear
+    auto fl_w = s2a_find(s, "decoder.estimator.final_layer.linear.weight");
+    auto fl_b = s2a_find(s, "decoder.estimator.final_layer.linear.bias");
+    auto fm_w = s2a_find(s, "decoder.estimator.final_layer.adaLN_modulation.1.weight");
+    auto fm_b = s2a_find(s, "decoder.estimator.final_layer.adaLN_modulation.1.bias");
+    if (fl_w && fm_w) {
+        ggml_tensor* silu_t = ggml_silu(cache.gctx, cache.t_emb_in);
+        ggml_tensor* fmod = ggml_mul_mat(cache.gctx, fm_w, silu_t);
+        if (fm_b)
+            fmod = ggml_add(cache.gctx, fmod, fm_b);
+
+        int wn_dim = (int)fl_w->ne[0];
+        ggml_tensor* fsh = ggml_view_1d(cache.gctx, fmod, wn_dim, 0);
+        ggml_tensor* fsc = ggml_view_1d(cache.gctx, fmod, wn_dim, wn_dim * sizeof(float));
+
+        ggml_tensor* xn = ggml_norm(cache.gctx, x, 1e-6f);
+        ggml_tensor* xs = ggml_mul(cache.gctx, xn, fsc);
+        xn = ggml_add(cache.gctx, xn, xs);
+        xn = ggml_add(cache.gctx, xn, fsh);
+
+        x = ggml_mul_mat(cache.gctx, fl_w, xn);
+        if (fl_b)
+            x = ggml_add(cache.gctx, x, fl_b);
+    }
+
+    // conv2: Conv1d(wn_dim, mel_dim, 1) = Linear projection
+    auto c2_w = s2a_find(s, "decoder.estimator.conv2.weight");
+    auto c2_b = s2a_find(s, "decoder.estimator.conv2.bias");
+    if (c2_w) {
+        ggml_tensor* c2_2d = ggml_reshape_2d(cache.gctx, c2_w, c2_w->ne[0] * c2_w->ne[1], c2_w->ne[2]);
+        x = ggml_mul_mat(cache.gctx, c2_2d, x);
+        if (c2_b)
+            x = ggml_add(cache.gctx, x, c2_b);
+    }
+
+    ggml_set_name(x, "velocity");
     ggml_set_output(x);
     cache.output = x;
 
@@ -1383,10 +1611,10 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     return true;
 }
 
-// Run one DiT forward pass. hidden: (T*dim) row-major, t_emb: (dim), x_mel: (T*mel_dim).
-// Returns velocity as (T*mel_dim) row-major, or empty on failure.
-static std::vector<float> s2a_dit_run(confucius4_tts_context* ctx, const float* hidden, const float* t_emb,
-                                      const float* x_mel, int T, int mel_dim) {
+// Run one DiT forward pass. hidden: (T*dim), t1/t2: (dim), x_mel: (T*mel_dim).
+// Returns velocity as (T*out_dim) row-major, or empty on failure.
+static std::vector<float> s2a_dit_run(confucius4_tts_context* ctx, const float* hidden, const float* t1_emb,
+                                      const float* t2_emb, const float* x_mel, int T, int mel_dim) {
     auto& cache = ctx->dit_cache;
     if (!s2a_dit_cache_build(ctx, T, mel_dim))
         return {};
@@ -1397,7 +1625,9 @@ static std::vector<float> s2a_dit_run(confucius4_tts_context* ctx, const float* 
     const int dim = ctx->s2a.hp.estimator_hidden_dim;
 
     ggml_backend_tensor_set(cache.hidden_in, hidden, 0, (size_t)T * dim * sizeof(float));
-    ggml_backend_tensor_set(cache.t_emb_in, t_emb, 0, (size_t)dim * sizeof(float));
+    ggml_backend_tensor_set(cache.t_emb_in, t1_emb, 0, (size_t)dim * sizeof(float));
+    if (cache.t2_emb_in)
+        ggml_backend_tensor_set(cache.t2_emb_in, t2_emb, 0, (size_t)dim * sizeof(float));
     ggml_backend_tensor_set(cache.x_mel_in, x_mel, 0, (size_t)T * mel_dim * sizeof(float));
 
     // Position indices must be re-set each call (gallocr may alias input buffers)
@@ -1415,262 +1645,6 @@ static std::vector<float> s2a_dit_run(confucius4_tts_context* ctx, const float* 
     return vel;
 }
 
-// Fold weight_norm: weight = weight_g * weight_v / ||weight_v||.
-// Adapted from bark_tts.cpp fold_weight_norm. Returns F32 fused weight.
-static std::vector<float> s2a_fold_weight_norm(ggml_tensor* w_g, ggml_tensor* w_v) {
-    if (!w_g || !w_v)
-        return {};
-    const int64_t ne0 = w_v->ne[0]; // kernel (or 1)
-    const int64_t ne1 = w_v->ne[1]; // in_ch
-    const int64_t ne2 = w_v->ne[2]; // out_ch
-    const int64_t vec_len = ne0 * ne1;
-    const size_t total = (size_t)(ne0 * ne1 * ne2);
-
-    auto v = s2a_read_f32(w_v);
-    auto g = s2a_read_f32(w_g);
-    if (v.empty() || g.empty())
-        return {};
-
-    std::vector<float> result(total);
-    for (int64_t co = 0; co < ne2; co++) {
-        float norm_sq = 0.0f;
-        size_t off = (size_t)(co * vec_len);
-        for (int64_t i = 0; i < vec_len; i++)
-            norm_sq += v[off + (size_t)i] * v[off + (size_t)i];
-        float scale = g[(size_t)co] / (std::sqrt(norm_sq) + 1e-12f);
-        for (int64_t i = 0; i < vec_len; i++)
-            result[off + (size_t)i] = v[off + (size_t)i] * scale;
-    }
-    return result;
-}
-
-// CPU Conv1d: y[oc, t] = sum_{ic, k} w[oc, ic, k] * x[ic, t-pad+k] + bias[oc]
-// x: (in_ch, T) row-major, w: (out_ch, in_ch, kernel) row-major, y: (out_ch, T)
-static void s2a_conv1d_cpu(const float* x, const float* w, const float* bias, float* y, int T, int in_ch, int out_ch,
-                           int kernel, int pad) {
-    for (int t = 0; t < T; t++) {
-        for (int oc = 0; oc < out_ch; oc++) {
-            float sum = bias ? bias[oc] : 0.0f;
-            for (int k = 0; k < kernel; k++) {
-                int ti = t - pad + k;
-                if (ti < 0 || ti >= T)
-                    continue;
-                for (int ic = 0; ic < in_ch; ic++)
-                    sum += w[(size_t)oc * in_ch * kernel + (size_t)ic * kernel + k] * x[(size_t)ic * T + ti];
-            }
-            y[(size_t)oc * T + t] = sum;
-        }
-    }
-}
-
-// CPU WaveNet forward: gated dilated residual network with weight_norm convolutions.
-// x: (hidden=512, T) channel-first. g_cond: (hidden,) timestep conditioning.
-// Returns (hidden, T) output.
-static std::vector<float> s2a_wavenet_cpu(confucius4_tts_context* ctx, const float* x_in, int T, const float* g_cond) {
-    const auto& s = ctx->s2a;
-    const int hidden = s.hp.estimator_hidden_dim; // 512
-    const int n_layers = s.hp.wavenet_num_layers; // 8
-    const int vb = ctx->params.verbosity;
-
-    // Cond layer: Conv1d(hidden, 2*hidden*n_layers, 1) with weight_norm
-    // g_cond is (hidden,), treat as (hidden, 1) → output (2*hidden*n_layers, 1)
-    auto cl_wg = s2a_find(s, "decoder.estimator.wavenet.cond_layer.conv.weight_g");
-    auto cl_wv = s2a_find(s, "decoder.estimator.wavenet.cond_layer.conv.weight_v");
-    auto cl_b_t = s2a_find(s, "decoder.estimator.wavenet.cond_layer.conv.bias");
-    auto cl_w = s2a_fold_weight_norm(cl_wg, cl_wv);
-    auto cl_b = s2a_read_f32(cl_b_t);
-    if (cl_w.empty()) {
-        if (vb >= 1)
-            fprintf(stderr, "confucius4: WaveNet cond_layer weight_norm fold failed\n");
-        return {};
-    }
-
-    const int cond_out = 2 * hidden * n_layers;
-    // cond_layer is Conv1d with kernel=1, so it's just a matmul: (cond_out, hidden) @ (hidden, 1)
-    std::vector<float> g_all(cond_out, 0.0f);
-    for (int o = 0; o < cond_out; o++) {
-        float sum = cl_b.empty() ? 0.0f : cl_b[o];
-        for (int i = 0; i < hidden; i++)
-            sum += cl_w[(size_t)o * hidden + i] * g_cond[i];
-        g_all[o] = sum;
-    }
-
-    // Working state: x (modified in-place per layer), output (accumulated)
-    std::vector<float> x((size_t)hidden * T);
-    std::memcpy(x.data(), x_in, (size_t)hidden * T * sizeof(float));
-    std::vector<float> output((size_t)hidden * T, 0.0f);
-
-    char nbuf[256];
-    for (int il = 0; il < n_layers; il++) {
-        // Fold in_layers[il] weight_norm: Conv1d(hidden, 2*hidden, k=5, pad=2)
-        snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.in_layers.%d.conv.weight_g", il);
-        auto il_wg = s2a_find(s, nbuf);
-        snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.in_layers.%d.conv.weight_v", il);
-        auto il_wv = s2a_find(s, nbuf);
-        snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.in_layers.%d.conv.bias", il);
-        auto il_b = s2a_read_f32(s2a_find(s, nbuf));
-        auto il_w = s2a_fold_weight_norm(il_wg, il_wv);
-        if (il_w.empty())
-            return {};
-
-        // Conv1d: x(hidden, T) → x_in_l(2*hidden, T) with kernel=5, pad=2
-        std::vector<float> x_in_l((size_t)(2 * hidden) * T, 0.0f);
-        s2a_conv1d_cpu(x.data(), il_w.data(), il_b.data(), x_in_l.data(), T, hidden, 2 * hidden, 5, 2);
-
-        // Gated activation: tanh(x_in_l[:hidden] + g_l[:hidden]) * sigmoid(x_in_l[hidden:] + g_l[hidden:])
-        int g_off = il * 2 * hidden;
-        std::vector<float> acts((size_t)hidden * T);
-        for (int t = 0; t < T; t++) {
-            for (int c = 0; c < hidden; c++) {
-                float a = x_in_l[(size_t)c * T + t] + g_all[g_off + c];
-                float b = x_in_l[(size_t)(hidden + c) * T + t] + g_all[g_off + hidden + c];
-                acts[(size_t)c * T + t] = tanhf(a) / (1.0f + expf(-b));
-            }
-        }
-
-        // Fold res_skip_layers[il] weight_norm: Conv1d(hidden, res_skip_ch, 1)
-        snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.res_skip_layers.%d.conv.weight_g", il);
-        auto rs_wg = s2a_find(s, nbuf);
-        snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.res_skip_layers.%d.conv.weight_v", il);
-        auto rs_wv = s2a_find(s, nbuf);
-        snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.res_skip_layers.%d.conv.bias", il);
-        auto rs_b = s2a_read_f32(s2a_find(s, nbuf));
-        auto rs_w = s2a_fold_weight_norm(rs_wg, rs_wv);
-        if (rs_w.empty())
-            return {};
-
-        int rs_out_ch = rs_wv ? (int)rs_wv->ne[2] : 2 * hidden;
-
-        // Conv1d kernel=1: acts(hidden, T) → res_skip(rs_out_ch, T)
-        std::vector<float> res_skip((size_t)rs_out_ch * T, 0.0f);
-        s2a_conv1d_cpu(acts.data(), rs_w.data(), rs_b.data(), res_skip.data(), T, hidden, rs_out_ch, 1, 0);
-
-        if (il < n_layers - 1) {
-            // res_acts = res_skip[:hidden], skip_acts = res_skip[hidden:]
-            for (int t = 0; t < T; t++) {
-                for (int c = 0; c < hidden; c++) {
-                    x[(size_t)c * T + t] += res_skip[(size_t)c * T + t];                 // residual
-                    output[(size_t)c * T + t] += res_skip[(size_t)(hidden + c) * T + t]; // skip
-                }
-            }
-        } else {
-            // Last layer: output += res_skip (which is (hidden, T))
-            for (int t = 0; t < T; t++)
-                for (int c = 0; c < hidden; c++)
-                    output[(size_t)c * T + t] += res_skip[(size_t)c * T + t];
-        }
-    }
-
-    if (vb >= 2)
-        fprintf(stderr, "confucius4: WaveNet %d layers done\n", n_layers);
-    return output;
-}
-
-// CPU output path: conv1 → WaveNet → + res_projection → final_layer → conv2
-// x_res: (T*dim) row-major from DiT graph. Returns velocity (T*mel_dim) row-major.
-static std::vector<float> s2a_output_path_cpu(confucius4_tts_context* ctx, const float* x_res_rm, int T, int dim,
-                                              int mel_dim, const float* t1_emb, float timestep) {
-    const auto& s = ctx->s2a;
-
-    // conv1: Linear(dim→dim) — stored as regular weight (not weight_norm)
-    auto c1_w = s2a_read_f32(s2a_find(s, "decoder.estimator.conv1.weight"));
-    auto c1_b = s2a_read_f32(s2a_find(s, "decoder.estimator.conv1.bias"));
-
-    // res_projection: Linear(dim→dim)
-    auto rp_w = s2a_read_f32(s2a_find(s, "decoder.estimator.res_projection.weight"));
-    auto rp_b = s2a_read_f32(s2a_find(s, "decoder.estimator.res_projection.bias"));
-
-    // x_res is row-major (T, dim). conv1 needs channel-first (dim, T).
-    // Since ggml row-major (T,dim) IS channel-first in terms of data layout, no transpose needed.
-    std::vector<float> conv1_out((size_t)dim * T);
-    s2a_linear(x_res_rm, c1_w.data(), c1_b.data(), conv1_out.data(), T, dim, dim);
-
-    // Transpose conv1_out from row-major (T, dim) to channel-first (dim, T) for WaveNet
-    std::vector<float> conv1_cf((size_t)dim * T);
-    for (int t = 0; t < T; t++)
-        for (int d = 0; d < dim; d++)
-            conv1_cf[(size_t)d * T + t] = conv1_out[(size_t)t * dim + d];
-
-    // Compute t2 timestep embedding for WaveNet conditioning (same timestep, different MLP)
-    auto t2_emb = s2a_timestep_embed_cpu(s, timestep, "decoder.estimator.t_embedder2", dim);
-
-    // WaveNet: (dim, T) → (dim, T)
-    std::vector<float> wn_out;
-    if (!t2_emb.empty()) {
-        wn_out = s2a_wavenet_cpu(ctx, conv1_cf.data(), T, t2_emb.data());
-    }
-
-    // res_projection: x_res (T, dim) → (T, dim)
-    std::vector<float> res_out((size_t)T * dim);
-    s2a_linear(x_res_rm, rp_w.data(), rp_b.data(), res_out.data(), T, dim, dim);
-
-    // Combine: wn_out (dim, T) channel-first + res_out (T, dim) row-major → (T, dim) row-major
-    std::vector<float> combined((size_t)T * dim);
-    if (!wn_out.empty()) {
-        for (int t = 0; t < T; t++)
-            for (int d = 0; d < dim; d++)
-                combined[(size_t)t * dim + d] = wn_out[(size_t)d * T + t] + res_out[(size_t)t * dim + d];
-    } else {
-        combined = std::move(res_out); // fallback: no WaveNet
-    }
-
-    // FinalLayer: LayerNorm(no affine) → (1+scale)*x + shift → Linear
-    auto fl_w = s2a_read_f32(s2a_find(s, "decoder.estimator.final_layer.linear.weight"));
-    auto fl_b = s2a_read_f32(s2a_find(s, "decoder.estimator.final_layer.linear.bias"));
-    auto fm_w = s2a_read_f32(s2a_find(s, "decoder.estimator.final_layer.adaLN_modulation.1.weight"));
-    auto fm_b = s2a_read_f32(s2a_find(s, "decoder.estimator.final_layer.adaLN_modulation.1.bias"));
-
-    if (!fl_w.empty() && !fm_w.empty()) {
-        // SiLU(t1) → modulation
-        std::vector<float> silu_t(dim);
-        for (int d = 0; d < dim; d++)
-            silu_t[d] = t1_emb[d] / (1.0f + expf(-t1_emb[d]));
-        std::vector<float> fmod(2 * dim);
-        s2a_linear(silu_t.data(), fm_w.data(), fm_b.data(), fmod.data(), 1, dim, 2 * dim);
-
-        // LayerNorm(no affine) + (1+scale)*x + shift
-        for (int t = 0; t < T; t++) {
-            float* row = combined.data() + (size_t)t * dim;
-            // Compute mean and variance for LayerNorm
-            float mean = 0.0f;
-            for (int d = 0; d < dim; d++)
-                mean += row[d];
-            mean /= dim;
-            float var = 0.0f;
-            for (int d = 0; d < dim; d++)
-                var += (row[d] - mean) * (row[d] - mean);
-            var = 1.0f / sqrtf(var / dim + 1e-6f);
-            for (int d = 0; d < dim; d++) {
-                float normed = (row[d] - mean) * var;
-                float shift = fmod[d];
-                float scale = fmod[dim + d];
-                row[d] = normed * (1.0f + scale) + shift;
-            }
-        }
-
-        // Final linear
-        std::vector<float> fl_out((size_t)T * dim);
-        s2a_linear(combined.data(), fl_w.data(), fl_b.data(), fl_out.data(), T, dim, dim);
-        combined = std::move(fl_out);
-    }
-
-    // conv2: Linear(dim→mel_dim) — Conv1d(dim, mel_dim, 1)
-    auto c2_w_t = s2a_find(s, "decoder.estimator.conv2.weight");
-    auto c2_b_t = s2a_find(s, "decoder.estimator.conv2.bias");
-    auto c2_w = s2a_read_f32(c2_w_t);
-    auto c2_b = s2a_read_f32(c2_b_t);
-
-    std::vector<float> velocity((size_t)T * mel_dim);
-    if (!c2_w.empty()) {
-        // Conv1d(dim, mel_dim, 1) is just Linear(dim→mel_dim) with weight (mel_dim, dim)
-        // c2_w from GGUF: Conv1d weight is (out_ch=mel_dim, in_ch=dim, k=1),
-        // stored as ne=[1, dim, mel_dim]. Flatten to (dim, mel_dim) for s2a_linear.
-        s2a_linear(combined.data(), c2_w.data(), c2_b.data(), velocity.data(), T, dim, mel_dim);
-    }
-
-    return velocity;
-}
-
 // Full DiT estimator forward: timestep embed + input embed (CPU) → DiT graph → output path (CPU).
 // x_flat: (T*mel_dim) row-major (noisy data), cond: (T*cond_dim) row-major (semantic cond),
 // cond_ref: (T*mel_dim) row-major (reference mel, zeros if none).
@@ -1680,29 +1654,25 @@ static std::vector<float> s2a_dit_forward(confucius4_tts_context* ctx, const flo
     const auto& s = ctx->s2a;
     const int dim = s.hp.estimator_hidden_dim;
 
-    // Timestep embedding (t1 for transformer + final_layer)
-    auto t_emb = s2a_timestep_embed_cpu(s, timestep, "decoder.estimator.t_embedder", dim);
-    if (t_emb.empty()) {
+    // t1 (transformer + final_layer) and t2 (WaveNet) timestep embeddings
+    auto t1 = s2a_timestep_embed_cpu(s, timestep, "decoder.estimator.t_embedder", dim);
+    auto t2 = s2a_timestep_embed_cpu(s, timestep, "decoder.estimator.t_embedder2", dim);
+    if (t1.empty()) {
         fprintf(stderr, "confucius4: timestep embedding failed\n");
         return {};
     }
+    if (t2.empty())
+        t2 = t1; // fallback: share t1 if t2 MLP not found
 
-    // Input embedding: cat(x, cond_ref, mu_proj(cond), spks) → proj
+    // Input embedding: cat(x, cond_ref, mu_proj(cond), spks) → proj (CPU)
     auto hidden = s2a_input_embed_cpu(ctx, x_flat, cond_ref, cond, T, mel_dim);
     if (hidden.empty()) {
         fprintf(stderr, "confucius4: input embedding failed\n");
         return {};
     }
 
-    // Run DiT graph → x_res (T*dim) row-major
-    auto x_res = s2a_dit_run(ctx, hidden.data(), t_emb.data(), x_flat, T, mel_dim);
-    if (x_res.empty()) {
-        fprintf(stderr, "confucius4: DiT graph failed\n");
-        return {};
-    }
-
-    // CPU output path: conv1 → WaveNet → res_proj → final_layer → conv2 → velocity
-    return s2a_output_path_cpu(ctx, x_res.data(), T, dim, mel_dim, t_emb.data(), timestep);
+    // Full ggml graph: DiT blocks + WaveNet + final_layer + conv2 → velocity
+    return s2a_dit_run(ctx, hidden.data(), t1.data(), t2.data(), x_flat, T, mel_dim);
 }
 
 // ---------------------------------------------------------------------------
@@ -1855,12 +1825,11 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
     (void)lang;
     const int vb = ctx->params.verbosity;
 
-    // Step 1: Tokenize text. For now, use a hardcoded test sequence.
-    // TODO: wire SentencePiece tokenizer from companion file.
+    // Step 1: Tokenize text
     std::vector<int32_t> text_ids;
     const char* env_ids = std::getenv("CRISPASR_CONFUCIUS4_TEXT_IDS");
-    if (env_ids) {
-        // Parse comma-separated token IDs from env var (testing path)
+    if (env_ids && *env_ids) {
+        // Env var override: comma-separated pre-tokenized IDs (testing path)
         std::string s(env_ids);
         size_t pos = 0;
         while (pos < s.size()) {
@@ -1872,9 +1841,20 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
         }
         if (vb >= 1)
             fprintf(stderr, "confucius4: using %zu text IDs from CRISPASR_CONFUCIUS4_TEXT_IDS\n", text_ids.size());
+    } else if (ctx->has_bpe_tokenizer) {
+        // BPE tokenizer from GGUF vocab (tokenizer.ggml.tokens + merges)
+        // Format: "You are a helpful assistant. {lang_token}:{text}"
+        const char* lang_token = "Please read the following English text";
+        if (lang && *lang) {
+            // TODO: map lang code to LANGUAGE_TOKEN_MAP string
+        }
+        std::string formatted = std::string("You are a helpful assistant. ") + lang_token + ":" + text;
+        text_ids = core_bpe::tokenize_simple(ctx->bpe_token_to_id, ctx->bpe_merge_rank, formatted);
+        if (vb >= 1)
+            fprintf(stderr, "confucius4: BPE tokenized '%s' → %zu tokens\n", text, text_ids.size());
     } else {
-        fprintf(stderr, "confucius4: no tokenizer available yet. Set CRISPASR_CONFUCIUS4_TEXT_IDS=id1,id2,... "
-                        "to test with pre-tokenized input.\n");
+        fprintf(stderr, "confucius4: no tokenizer. Set CRISPASR_CONFUCIUS4_TEXT_IDS=id1,id2,... "
+                        "or bake vocab into the GGUF.\n");
         *out_n_samples = 0;
         return nullptr;
     }
@@ -1948,6 +1928,10 @@ void confucius4_tts_free(confucius4_tts_context* ctx) {
 
     kv_free(ctx->kv);
     // Free S2A
+    if (ctx->s2a.buf_wn)
+        ggml_backend_buffer_free(ctx->s2a.buf_wn);
+    if (ctx->s2a.ctx_wn)
+        ggml_free(ctx->s2a.ctx_wn);
     if (ctx->s2a.buf_w)
         ggml_backend_buffer_free(ctx->s2a.buf_w);
     if (ctx->s2a.ctx_w)
