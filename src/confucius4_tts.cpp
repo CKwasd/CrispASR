@@ -1452,12 +1452,15 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     // Full output path in ggml graph (WaveNet weight_norm folded at load time).
     ggml_tensor* x_res = x; // save for res_projection
 
-    // conv1: Linear(dim→dim)
+    // conv1: Linear(dim→dim) — operates in (dim, T) space
     auto c1_w = s2a_find(s, "decoder.estimator.conv1.weight");
     auto c1_b = s2a_find(s, "decoder.estimator.conv1.bias");
     ggml_tensor* x_conv1 = c1_w ? ggml_mul_mat(cache.gctx, c1_w, x_res) : x_res;
     if (c1_b)
         x_conv1 = ggml_add(cache.gctx, x_conv1, c1_b);
+
+    // Transpose to time-first (T, dim) for ggml_conv_1d in WaveNet
+    x_conv1 = ggml_cont(cache.gctx, ggml_transpose(cache.gctx, x_conv1));
 
     // WaveNet: gated dilated residual network with timestep conditioning (t2)
     // Uses fused weight_norm tensors (folded at load time)
@@ -1468,7 +1471,7 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     auto cond_w = s2a_find(s, "decoder.estimator.wavenet.cond_layer.conv.weight");
     auto cond_b = s2a_find(s, "decoder.estimator.wavenet.cond_layer.conv.bias");
 
-    ggml_tensor* x_wn = x_conv1; // (dim, T)
+    ggml_tensor* x_wn = x_conv1; // (T, dim) time-first for ggml_conv_1d
     ggml_tensor* wn_output = nullptr;
 
     if (cond_w) {
@@ -1481,7 +1484,7 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
         if (cond_b)
             g_all = ggml_add(cache.gctx, g_all, cond_b);
 
-        wn_output = ggml_dup(cache.gctx, ggml_scale(cache.gctx, x_wn, 0.0f)); // zeros (dim, T)
+        wn_output = ggml_dup(cache.gctx, ggml_scale(cache.gctx, x_wn, 0.0f)); // zeros (T, dim)
 
         char nbuf[256];
         for (int il = 0; il < n_wn_layers; il++) {
@@ -1500,15 +1503,17 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
             // Slice g_all for this layer: g_l = g_all[il*2*hidden .. (il+1)*2*hidden]
             ggml_tensor* g_l = ggml_view_1d(cache.gctx, g_all, 2 * hidden, (size_t)il * 2 * hidden * sizeof(float));
 
-            // Split x_in_l (2*hidden, T) + g_l (2*hidden,) into tanh/sigmoid halves
-            // x_a = x_in_l[:hidden] + g_l[:hidden], x_b = x_in_l[hidden:] + g_l[hidden:]
+            // x_in_l is (T, 2*hidden) time-first from conv1d. Split into two (T, hidden).
+            // g_l is (2*hidden,) — broadcast over T.
             ggml_tensor* g_a = ggml_view_1d(cache.gctx, g_l, hidden, 0);
             ggml_tensor* g_b = ggml_view_1d(cache.gctx, g_l, hidden, hidden * sizeof(float));
 
+            // ne[0]=T, ne[1]=2*hidden. Split along ne[1]:
+            int64_t stride1 = x_in_l->nb[1];
             int esz = (int)ggml_element_size(x_in_l);
-            ggml_tensor* xa = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, hidden, T, 2 * hidden * esz, 0));
+            ggml_tensor* xa = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T, hidden, stride1, 0));
             ggml_tensor* xb =
-                ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, hidden, T, 2 * hidden * esz, hidden * esz));
+                ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T, hidden, stride1, (size_t)hidden * esz));
             xa = ggml_add(cache.gctx, xa, g_a);
             xb = ggml_add(cache.gctx, xb, g_b);
 
@@ -1529,11 +1534,11 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
 
             int rs_ch = rs_w ? (int)rs_w->ne[2] : hidden;
             if (il < n_wn_layers - 1 && rs_ch >= 2 * hidden) {
-                // res = rs_out[:hidden], skip = rs_out[hidden:]
-                esz = (int)ggml_element_size(rs_out);
-                ggml_tensor* res = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, rs_out, hidden, T, rs_ch * esz, 0));
+                // rs_out is (T, rs_ch) time-first. Split: res=(T,hidden), skip=(T,hidden)
+                int64_t rs_stride = rs_out->nb[1];
+                ggml_tensor* res = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, rs_out, T, hidden, rs_stride, 0));
                 ggml_tensor* skip =
-                    ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, rs_out, hidden, T, rs_ch * esz, hidden * esz));
+                    ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, rs_out, T, hidden, rs_stride, (size_t)hidden * esz));
                 x_wn = ggml_add(cache.gctx, x_wn, res);
                 wn_output = ggml_add(cache.gctx, wn_output, skip);
             } else {
@@ -1543,7 +1548,11 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
         }
     }
 
-    // Combine: wn_output (from WaveNet) + res_projection(x_res)
+    // Combine: wn_output (T, dim) time-first + res_projection(x_res) (dim, T) channel-first
+    // Transpose wn_output back to (dim, T) to match the rest of the graph
+    if (wn_output)
+        wn_output = ggml_cont(cache.gctx, ggml_transpose(cache.gctx, wn_output));
+
     auto res_w = s2a_find(s, "decoder.estimator.res_projection.weight");
     auto res_b = s2a_find(s, "decoder.estimator.res_projection.bias");
     ggml_tensor* res_proj = res_w ? ggml_mul_mat(cache.gctx, res_w, x_res) : x_res;
