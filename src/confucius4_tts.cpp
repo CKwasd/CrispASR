@@ -1349,64 +1349,17 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     // skip_linear: cat(x_res, x_mel) → Linear(dim + mel_dim → dim)
     auto sl_w = s2a_find(s, "decoder.estimator.skip_linear.weight");
     auto sl_b = s2a_find(s, "decoder.estimator.skip_linear.bias");
-    ggml_tensor* x_res = x; // save for res_projection
     if (sl_w) {
         ggml_tensor* cat = ggml_concat(cache.gctx, x, cache.x_mel_in, 0);
         x = ggml_mul_mat(cache.gctx, sl_w, cat);
         if (sl_b)
             x = ggml_add(cache.gctx, x, sl_b);
-        x_res = x;
     }
 
-    // Output path: conv1 → (skip WaveNet) → res_projection → final_layer → conv2
-    // The WaveNet is gated behind CRISPASR_CONFUCIUS4_WAVENET=1 (not yet implemented).
-    // Without WaveNet: output = res_projection(x_res) → final_layer → conv2
-    auto res_w = s2a_find(s, "decoder.estimator.res_projection.weight");
-    auto res_b = s2a_find(s, "decoder.estimator.res_projection.bias");
-    if (res_w) {
-        x = ggml_mul_mat(cache.gctx, res_w, x_res);
-        if (res_b)
-            x = ggml_add(cache.gctx, x, res_b);
-    }
-
-    // FinalLayer: LayerNorm(no affine) → (1+scale)*x + shift → Linear
-    auto fl_w = s2a_find(s, "decoder.estimator.final_layer.linear.weight");
-    auto fl_b = s2a_find(s, "decoder.estimator.final_layer.linear.bias");
-    auto fm_w = s2a_find(s, "decoder.estimator.final_layer.adaLN_modulation.1.weight");
-    auto fm_b = s2a_find(s, "decoder.estimator.final_layer.adaLN_modulation.1.bias");
-    if (fl_w && fm_w) {
-        ggml_tensor* silu_t = ggml_silu(cache.gctx, cache.t_emb_in);
-        ggml_tensor* fmod = ggml_mul_mat(cache.gctx, fm_w, silu_t);
-        if (fm_b)
-            fmod = ggml_add(cache.gctx, fmod, fm_b);
-
-        int wn_dim = (int)fl_w->ne[0]; // wavenet_hidden_dim (might be dim)
-        ggml_tensor* fsh = ggml_view_1d(cache.gctx, fmod, wn_dim, 0);
-        ggml_tensor* fsc = ggml_view_1d(cache.gctx, fmod, wn_dim, wn_dim * sizeof(float));
-
-        ggml_tensor* xn = ggml_norm(cache.gctx, x, 1e-6f); // LayerNorm, no affine
-        // x = x_norm * (1 + scale) + shift = x_norm + x_norm*scale + shift
-        ggml_tensor* xs = ggml_mul(cache.gctx, xn, fsc);
-        xn = ggml_add(cache.gctx, xn, xs);
-        xn = ggml_add(cache.gctx, xn, fsh);
-
-        x = ggml_mul_mat(cache.gctx, fl_w, xn);
-        if (fl_b)
-            x = ggml_add(cache.gctx, x, fl_b);
-    }
-
-    // conv2: Conv1d(wn_dim, mel_dim, 1) = Linear projection to output dim
-    auto c2_w = s2a_find(s, "decoder.estimator.conv2.weight");
-    auto c2_b = s2a_find(s, "decoder.estimator.conv2.bias");
-    if (c2_w) {
-        // Conv1d weight is 3D (ne=[1, in, out]); reshape to 2D for mul_mat
-        ggml_tensor* c2_2d = ggml_reshape_2d(cache.gctx, c2_w, c2_w->ne[0] * c2_w->ne[1], c2_w->ne[2]);
-        x = ggml_mul_mat(cache.gctx, c2_2d, x);
-        if (c2_b)
-            x = ggml_add(cache.gctx, x, c2_b);
-    }
-
-    ggml_set_name(x, "velocity");
+    // Graph outputs x_res (dim=512, T) after skip_linear.
+    // The output path (conv1 → WaveNet → res_proj → final_layer → conv2)
+    // runs on CPU so we can include weight_norm WaveNet convolutions.
+    ggml_set_name(x, "x_res");
     ggml_set_output(x);
     cache.output = x;
 
@@ -1462,7 +1415,263 @@ static std::vector<float> s2a_dit_run(confucius4_tts_context* ctx, const float* 
     return vel;
 }
 
-// Full DiT estimator forward: timestep embed + input embed (CPU) → DiT graph → velocity.
+// Fold weight_norm: weight = weight_g * weight_v / ||weight_v||.
+// Adapted from bark_tts.cpp fold_weight_norm. Returns F32 fused weight.
+static std::vector<float> s2a_fold_weight_norm(ggml_tensor* w_g, ggml_tensor* w_v) {
+    if (!w_g || !w_v)
+        return {};
+    const int64_t ne0 = w_v->ne[0]; // kernel (or 1)
+    const int64_t ne1 = w_v->ne[1]; // in_ch
+    const int64_t ne2 = w_v->ne[2]; // out_ch
+    const int64_t vec_len = ne0 * ne1;
+    const size_t total = (size_t)(ne0 * ne1 * ne2);
+
+    auto v = s2a_read_f32(w_v);
+    auto g = s2a_read_f32(w_g);
+    if (v.empty() || g.empty())
+        return {};
+
+    std::vector<float> result(total);
+    for (int64_t co = 0; co < ne2; co++) {
+        float norm_sq = 0.0f;
+        size_t off = (size_t)(co * vec_len);
+        for (int64_t i = 0; i < vec_len; i++)
+            norm_sq += v[off + (size_t)i] * v[off + (size_t)i];
+        float scale = g[(size_t)co] / (std::sqrt(norm_sq) + 1e-12f);
+        for (int64_t i = 0; i < vec_len; i++)
+            result[off + (size_t)i] = v[off + (size_t)i] * scale;
+    }
+    return result;
+}
+
+// CPU Conv1d: y[oc, t] = sum_{ic, k} w[oc, ic, k] * x[ic, t-pad+k] + bias[oc]
+// x: (in_ch, T) row-major, w: (out_ch, in_ch, kernel) row-major, y: (out_ch, T)
+static void s2a_conv1d_cpu(const float* x, const float* w, const float* bias, float* y, int T, int in_ch, int out_ch,
+                           int kernel, int pad) {
+    for (int t = 0; t < T; t++) {
+        for (int oc = 0; oc < out_ch; oc++) {
+            float sum = bias ? bias[oc] : 0.0f;
+            for (int k = 0; k < kernel; k++) {
+                int ti = t - pad + k;
+                if (ti < 0 || ti >= T)
+                    continue;
+                for (int ic = 0; ic < in_ch; ic++)
+                    sum += w[(size_t)oc * in_ch * kernel + (size_t)ic * kernel + k] * x[(size_t)ic * T + ti];
+            }
+            y[(size_t)oc * T + t] = sum;
+        }
+    }
+}
+
+// CPU WaveNet forward: gated dilated residual network with weight_norm convolutions.
+// x: (hidden=512, T) channel-first. g_cond: (hidden,) timestep conditioning.
+// Returns (hidden, T) output.
+static std::vector<float> s2a_wavenet_cpu(confucius4_tts_context* ctx, const float* x_in, int T, const float* g_cond) {
+    const auto& s = ctx->s2a;
+    const int hidden = s.hp.estimator_hidden_dim; // 512
+    const int n_layers = s.hp.wavenet_num_layers; // 8
+    const int vb = ctx->params.verbosity;
+
+    // Cond layer: Conv1d(hidden, 2*hidden*n_layers, 1) with weight_norm
+    // g_cond is (hidden,), treat as (hidden, 1) → output (2*hidden*n_layers, 1)
+    auto cl_wg = s2a_find(s, "decoder.estimator.wavenet.cond_layer.conv.weight_g");
+    auto cl_wv = s2a_find(s, "decoder.estimator.wavenet.cond_layer.conv.weight_v");
+    auto cl_b_t = s2a_find(s, "decoder.estimator.wavenet.cond_layer.conv.bias");
+    auto cl_w = s2a_fold_weight_norm(cl_wg, cl_wv);
+    auto cl_b = s2a_read_f32(cl_b_t);
+    if (cl_w.empty()) {
+        if (vb >= 1)
+            fprintf(stderr, "confucius4: WaveNet cond_layer weight_norm fold failed\n");
+        return {};
+    }
+
+    const int cond_out = 2 * hidden * n_layers;
+    // cond_layer is Conv1d with kernel=1, so it's just a matmul: (cond_out, hidden) @ (hidden, 1)
+    std::vector<float> g_all(cond_out, 0.0f);
+    for (int o = 0; o < cond_out; o++) {
+        float sum = cl_b.empty() ? 0.0f : cl_b[o];
+        for (int i = 0; i < hidden; i++)
+            sum += cl_w[(size_t)o * hidden + i] * g_cond[i];
+        g_all[o] = sum;
+    }
+
+    // Working state: x (modified in-place per layer), output (accumulated)
+    std::vector<float> x((size_t)hidden * T);
+    std::memcpy(x.data(), x_in, (size_t)hidden * T * sizeof(float));
+    std::vector<float> output((size_t)hidden * T, 0.0f);
+
+    char nbuf[256];
+    for (int il = 0; il < n_layers; il++) {
+        // Fold in_layers[il] weight_norm: Conv1d(hidden, 2*hidden, k=5, pad=2)
+        snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.in_layers.%d.conv.weight_g", il);
+        auto il_wg = s2a_find(s, nbuf);
+        snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.in_layers.%d.conv.weight_v", il);
+        auto il_wv = s2a_find(s, nbuf);
+        snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.in_layers.%d.conv.bias", il);
+        auto il_b = s2a_read_f32(s2a_find(s, nbuf));
+        auto il_w = s2a_fold_weight_norm(il_wg, il_wv);
+        if (il_w.empty())
+            return {};
+
+        // Conv1d: x(hidden, T) → x_in_l(2*hidden, T) with kernel=5, pad=2
+        std::vector<float> x_in_l((size_t)(2 * hidden) * T, 0.0f);
+        s2a_conv1d_cpu(x.data(), il_w.data(), il_b.data(), x_in_l.data(), T, hidden, 2 * hidden, 5, 2);
+
+        // Gated activation: tanh(x_in_l[:hidden] + g_l[:hidden]) * sigmoid(x_in_l[hidden:] + g_l[hidden:])
+        int g_off = il * 2 * hidden;
+        std::vector<float> acts((size_t)hidden * T);
+        for (int t = 0; t < T; t++) {
+            for (int c = 0; c < hidden; c++) {
+                float a = x_in_l[(size_t)c * T + t] + g_all[g_off + c];
+                float b = x_in_l[(size_t)(hidden + c) * T + t] + g_all[g_off + hidden + c];
+                acts[(size_t)c * T + t] = tanhf(a) / (1.0f + expf(-b));
+            }
+        }
+
+        // Fold res_skip_layers[il] weight_norm: Conv1d(hidden, res_skip_ch, 1)
+        snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.res_skip_layers.%d.conv.weight_g", il);
+        auto rs_wg = s2a_find(s, nbuf);
+        snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.res_skip_layers.%d.conv.weight_v", il);
+        auto rs_wv = s2a_find(s, nbuf);
+        snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.res_skip_layers.%d.conv.bias", il);
+        auto rs_b = s2a_read_f32(s2a_find(s, nbuf));
+        auto rs_w = s2a_fold_weight_norm(rs_wg, rs_wv);
+        if (rs_w.empty())
+            return {};
+
+        int rs_out_ch = rs_wv ? (int)rs_wv->ne[2] : 2 * hidden;
+
+        // Conv1d kernel=1: acts(hidden, T) → res_skip(rs_out_ch, T)
+        std::vector<float> res_skip((size_t)rs_out_ch * T, 0.0f);
+        s2a_conv1d_cpu(acts.data(), rs_w.data(), rs_b.data(), res_skip.data(), T, hidden, rs_out_ch, 1, 0);
+
+        if (il < n_layers - 1) {
+            // res_acts = res_skip[:hidden], skip_acts = res_skip[hidden:]
+            for (int t = 0; t < T; t++) {
+                for (int c = 0; c < hidden; c++) {
+                    x[(size_t)c * T + t] += res_skip[(size_t)c * T + t];                 // residual
+                    output[(size_t)c * T + t] += res_skip[(size_t)(hidden + c) * T + t]; // skip
+                }
+            }
+        } else {
+            // Last layer: output += res_skip (which is (hidden, T))
+            for (int t = 0; t < T; t++)
+                for (int c = 0; c < hidden; c++)
+                    output[(size_t)c * T + t] += res_skip[(size_t)c * T + t];
+        }
+    }
+
+    if (vb >= 2)
+        fprintf(stderr, "confucius4: WaveNet %d layers done\n", n_layers);
+    return output;
+}
+
+// CPU output path: conv1 → WaveNet → + res_projection → final_layer → conv2
+// x_res: (T*dim) row-major from DiT graph. Returns velocity (T*mel_dim) row-major.
+static std::vector<float> s2a_output_path_cpu(confucius4_tts_context* ctx, const float* x_res_rm, int T, int dim,
+                                              int mel_dim, const float* t1_emb, float timestep) {
+    const auto& s = ctx->s2a;
+
+    // conv1: Linear(dim→dim) — stored as regular weight (not weight_norm)
+    auto c1_w = s2a_read_f32(s2a_find(s, "decoder.estimator.conv1.weight"));
+    auto c1_b = s2a_read_f32(s2a_find(s, "decoder.estimator.conv1.bias"));
+
+    // res_projection: Linear(dim→dim)
+    auto rp_w = s2a_read_f32(s2a_find(s, "decoder.estimator.res_projection.weight"));
+    auto rp_b = s2a_read_f32(s2a_find(s, "decoder.estimator.res_projection.bias"));
+
+    // x_res is row-major (T, dim). conv1 needs channel-first (dim, T).
+    // Since ggml row-major (T,dim) IS channel-first in terms of data layout, no transpose needed.
+    std::vector<float> conv1_out((size_t)dim * T);
+    s2a_linear(x_res_rm, c1_w.data(), c1_b.data(), conv1_out.data(), T, dim, dim);
+
+    // Transpose conv1_out from row-major (T, dim) to channel-first (dim, T) for WaveNet
+    std::vector<float> conv1_cf((size_t)dim * T);
+    for (int t = 0; t < T; t++)
+        for (int d = 0; d < dim; d++)
+            conv1_cf[(size_t)d * T + t] = conv1_out[(size_t)t * dim + d];
+
+    // Compute t2 timestep embedding for WaveNet conditioning (same timestep, different MLP)
+    auto t2_emb = s2a_timestep_embed_cpu(s, timestep, "decoder.estimator.t_embedder2", dim);
+
+    // WaveNet: (dim, T) → (dim, T)
+    std::vector<float> wn_out;
+    if (!t2_emb.empty()) {
+        wn_out = s2a_wavenet_cpu(ctx, conv1_cf.data(), T, t2_emb.data());
+    }
+
+    // res_projection: x_res (T, dim) → (T, dim)
+    std::vector<float> res_out((size_t)T * dim);
+    s2a_linear(x_res_rm, rp_w.data(), rp_b.data(), res_out.data(), T, dim, dim);
+
+    // Combine: wn_out (dim, T) channel-first + res_out (T, dim) row-major → (T, dim) row-major
+    std::vector<float> combined((size_t)T * dim);
+    if (!wn_out.empty()) {
+        for (int t = 0; t < T; t++)
+            for (int d = 0; d < dim; d++)
+                combined[(size_t)t * dim + d] = wn_out[(size_t)d * T + t] + res_out[(size_t)t * dim + d];
+    } else {
+        combined = std::move(res_out); // fallback: no WaveNet
+    }
+
+    // FinalLayer: LayerNorm(no affine) → (1+scale)*x + shift → Linear
+    auto fl_w = s2a_read_f32(s2a_find(s, "decoder.estimator.final_layer.linear.weight"));
+    auto fl_b = s2a_read_f32(s2a_find(s, "decoder.estimator.final_layer.linear.bias"));
+    auto fm_w = s2a_read_f32(s2a_find(s, "decoder.estimator.final_layer.adaLN_modulation.1.weight"));
+    auto fm_b = s2a_read_f32(s2a_find(s, "decoder.estimator.final_layer.adaLN_modulation.1.bias"));
+
+    if (!fl_w.empty() && !fm_w.empty()) {
+        // SiLU(t1) → modulation
+        std::vector<float> silu_t(dim);
+        for (int d = 0; d < dim; d++)
+            silu_t[d] = t1_emb[d] / (1.0f + expf(-t1_emb[d]));
+        std::vector<float> fmod(2 * dim);
+        s2a_linear(silu_t.data(), fm_w.data(), fm_b.data(), fmod.data(), 1, dim, 2 * dim);
+
+        // LayerNorm(no affine) + (1+scale)*x + shift
+        for (int t = 0; t < T; t++) {
+            float* row = combined.data() + (size_t)t * dim;
+            // Compute mean and variance for LayerNorm
+            float mean = 0.0f;
+            for (int d = 0; d < dim; d++)
+                mean += row[d];
+            mean /= dim;
+            float var = 0.0f;
+            for (int d = 0; d < dim; d++)
+                var += (row[d] - mean) * (row[d] - mean);
+            var = 1.0f / sqrtf(var / dim + 1e-6f);
+            for (int d = 0; d < dim; d++) {
+                float normed = (row[d] - mean) * var;
+                float shift = fmod[d];
+                float scale = fmod[dim + d];
+                row[d] = normed * (1.0f + scale) + shift;
+            }
+        }
+
+        // Final linear
+        std::vector<float> fl_out((size_t)T * dim);
+        s2a_linear(combined.data(), fl_w.data(), fl_b.data(), fl_out.data(), T, dim, dim);
+        combined = std::move(fl_out);
+    }
+
+    // conv2: Linear(dim→mel_dim) — Conv1d(dim, mel_dim, 1)
+    auto c2_w_t = s2a_find(s, "decoder.estimator.conv2.weight");
+    auto c2_b_t = s2a_find(s, "decoder.estimator.conv2.bias");
+    auto c2_w = s2a_read_f32(c2_w_t);
+    auto c2_b = s2a_read_f32(c2_b_t);
+
+    std::vector<float> velocity((size_t)T * mel_dim);
+    if (!c2_w.empty()) {
+        // Conv1d(dim, mel_dim, 1) is just Linear(dim→mel_dim) with weight (mel_dim, dim)
+        // c2_w from GGUF: Conv1d weight is (out_ch=mel_dim, in_ch=dim, k=1),
+        // stored as ne=[1, dim, mel_dim]. Flatten to (dim, mel_dim) for s2a_linear.
+        s2a_linear(combined.data(), c2_w.data(), c2_b.data(), velocity.data(), T, dim, mel_dim);
+    }
+
+    return velocity;
+}
+
+// Full DiT estimator forward: timestep embed + input embed (CPU) → DiT graph → output path (CPU).
 // x_flat: (T*mel_dim) row-major (noisy data), cond: (T*cond_dim) row-major (semantic cond),
 // cond_ref: (T*mel_dim) row-major (reference mel, zeros if none).
 // Returns velocity (T*mel_dim) row-major.
@@ -1471,7 +1680,7 @@ static std::vector<float> s2a_dit_forward(confucius4_tts_context* ctx, const flo
     const auto& s = ctx->s2a;
     const int dim = s.hp.estimator_hidden_dim;
 
-    // Timestep embedding
+    // Timestep embedding (t1 for transformer + final_layer)
     auto t_emb = s2a_timestep_embed_cpu(s, timestep, "decoder.estimator.t_embedder", dim);
     if (t_emb.empty()) {
         fprintf(stderr, "confucius4: timestep embedding failed\n");
@@ -1485,8 +1694,15 @@ static std::vector<float> s2a_dit_forward(confucius4_tts_context* ctx, const flo
         return {};
     }
 
-    // Run DiT graph
-    return s2a_dit_run(ctx, hidden.data(), t_emb.data(), x_flat, T, mel_dim);
+    // Run DiT graph → x_res (T*dim) row-major
+    auto x_res = s2a_dit_run(ctx, hidden.data(), t_emb.data(), x_flat, T, mel_dim);
+    if (x_res.empty()) {
+        fprintf(stderr, "confucius4: DiT graph failed\n");
+        return {};
+    }
+
+    // CPU output path: conv1 → WaveNet → res_proj → final_layer → conv2 → velocity
+    return s2a_output_path_cpu(ctx, x_res.data(), T, dim, mel_dim, t_emb.data(), timestep);
 }
 
 // ---------------------------------------------------------------------------
