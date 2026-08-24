@@ -162,6 +162,47 @@ def main():
                                        mu, spks)
             cmp("dit x_in (input_embed)", load(d, "dit_x_in", shp), x_in_ref[0].numpy())
 
+        # --- stage 2c: inside the ggml graph, at step 1 ---------------------
+        # Everything entering the graph is exact at F16, so the divergence is in
+        # the graph.  Hook the reference modules at the same points the runtime
+        # taps and report them in execution order: the first one that drops is
+        # the bug.
+        graph_taps = [k for k in ("dbg_blk00", "dbg_blk06", "dbg_blk12", "dbg_xres",
+                                  "dbg_skip", "dbg_wn", "dbg_fin") if k in shp]
+        if graph_taps:
+            caught = {}
+
+            def grab(name):
+                def hook(_m, _inp, out):
+                    caught[name] = (out[0] if isinstance(out, tuple) else out).detach()
+                return hook
+
+            depth = len(est.transformer_blocks)
+            handles = [
+                est.transformer_blocks[0].register_forward_hook(grab("dbg_blk00")),
+                est.transformer_blocks[depth // 2].register_forward_hook(grab("dbg_blk06")),
+                est.transformer_blocks[depth - 1].register_forward_hook(grab("dbg_blk12")),
+                est.transformer_norm.register_forward_hook(grab("dbg_xres")),
+                est.skip_linear.register_forward_hook(grab("dbg_skip")),
+                est.wavenet.register_forward_hook(grab("dbg_wn")),
+                est.final_layer.register_forward_hook(grab("dbg_fin")),
+            ]
+            z0 = torch.from_numpy(load(d, "z_init", shp).T.copy()).unsqueeze(0)
+            est(z0, mask, mu, torch.tensor([0.0]), spks, torch.zeros_like(z0))
+            for h in handles:
+                h.remove()
+
+            print("  inside the graph, step 1 (execution order):")
+            for k in graph_taps:
+                if k not in caught:
+                    continue
+                r = caught[k][0].numpy()
+                # the runtime taps are (C, T); the reference blocks emit (T, C)
+                # except the wavenet, which is (C, T)
+                if k != "dbg_wn":
+                    r = r.T
+                cmp(f"  {k}", load(d, k, shp), r)
+
         # --- stage 3: per-step, TEACHER-FORCED velocity ---------------------
         # Recompute each step's velocity from the C++'s OWN state at that step,
         # so no error accumulates between steps.  A first step that already

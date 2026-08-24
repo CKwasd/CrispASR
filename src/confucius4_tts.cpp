@@ -1340,6 +1340,18 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     const int half = depth / 2;
     const int vb = ctx->params.verbosity;
 
+    // Debug taps: when CRISPASR_CONFUCIUS4_DUMP_S2A is set, mark selected
+    // intermediates as graph outputs so gallocr cannot elide them, and read
+    // them back after compute to bisect the estimator against the reference.
+    const bool dbg_taps = s2a_dump_dir() != nullptr;
+    auto tap = [&](ggml_tensor* t, const char* name) {
+        if (dbg_taps && t) {
+            ggml_set_name(t, name);
+            ggml_set_output(t);
+        }
+        return t;
+    };
+
     // Determine FFN intermediate size from w1 weight shape
     auto w1_0 = s2a_find(s, "decoder.estimator.transformer_blocks.0.feed_forward.w1.weight");
     const int inter_dim = w1_0 ? (int)w1_0->ne[1] : dim * 4;
@@ -1476,6 +1488,12 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
             x = ggml_add(cache.gctx, x, ff);
         }
 
+        if (i == 0 || i == half || i == depth - 1) {
+            char tn_dbg[32];
+            snprintf(tn_dbg, sizeof(tn_dbg), "dbg_blk%02d", i);
+            tap(x, tn_dbg);
+        }
+
         // Emit skip
         if (i < half)
             skip_stack.push_back(x);
@@ -1500,6 +1518,8 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
         x = ggml_add(cache.gctx, x, tb);
     }
 
+    tap(x, "dbg_xres");
+
     // skip_linear: cat(x_res, x_mel) → Linear(dim + mel_dim → dim)
     auto sl_w = s2a_find(s, "decoder.estimator.skip_linear.weight");
     auto sl_b = s2a_find(s, "decoder.estimator.skip_linear.bias");
@@ -1509,6 +1529,8 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
         if (sl_b)
             x = ggml_add(cache.gctx, x, sl_b);
     }
+
+    tap(x, "dbg_skip");
 
     // Full output path in ggml graph (WaveNet weight_norm folded at load time).
     ggml_tensor* x_res = x; // save for res_projection
@@ -1616,6 +1638,7 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     // Transpose wn_output back to (dim, T) to match the rest of the graph
     if (wn_output)
         wn_output = ggml_cont(cache.gctx, ggml_transpose(cache.gctx, wn_output));
+    tap(wn_output, "dbg_wn");
 
     auto res_w = s2a_find(s, "decoder.estimator.res_projection.weight");
     auto res_b = s2a_find(s, "decoder.estimator.res_projection.bias");
@@ -1649,6 +1672,8 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
         if (fl_b)
             x = ggml_add(cache.gctx, x, fl_b);
     }
+
+    tap(x, "dbg_fin");
 
     // conv2: Conv1d(wn_dim, mel_dim, 1) = Linear projection
     auto c2_w = s2a_find(s, "decoder.estimator.conv2.weight");
@@ -1711,6 +1736,28 @@ static std::vector<float> s2a_dit_run(confucius4_tts_context* ctx, const float* 
 
     if (ggml_backend_graph_compute(ctx->backend, cache.gf) != GGML_STATUS_SUCCESS)
         return {};
+
+    // Read back the debug taps once, on the first call, so the parity harness
+    // can localize where inside the graph the estimator starts to diverge.
+    if (s2a_dump_dir()) {
+        static bool tapped_once = false;
+        if (!tapped_once) {
+            tapped_once = true;
+            for (const char* nm :
+                 {"dbg_blk00", "dbg_blk06", "dbg_blk12", "dbg_xres", "dbg_skip", "dbg_wn", "dbg_fin"}) {
+                ggml_tensor* t = ggml_graph_get_tensor(cache.gf, nm);
+                if (!t)
+                    continue;
+                std::vector<float> buf(ggml_nelements(t));
+                ggml_backend_tensor_get(t, buf.data(), 0, buf.size() * sizeof(float));
+                char shp[64];
+                // taps are (C, T) channel-first except dbg_wn, which the graph
+                // has already transposed back to (C, T) as well
+                snprintf(shp, sizeof(shp), "%d,%d", (int)t->ne[1], (int)t->ne[0]);
+                s2a_dump_raw(nm, buf.data(), buf.size() * sizeof(float), shp);
+            }
+        }
+    }
 
     int out_dim = (int)cache.output->ne[0];
     std::vector<float> vel((size_t)T * out_dim);
