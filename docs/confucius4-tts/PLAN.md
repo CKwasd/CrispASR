@@ -72,49 +72,69 @@ WaveNet res/skip halves and dilation=1/pad=2, InputEmbedding concat order
 alignment (the port collects one extra trailing row, which the conditioning
 correctly ignores).
 
-### Kaggle run 1 (kernel `chr1s4/crispasr-confucius4-cfg-verify` v1, 8 min)
+### S2A port: FULL PARITY (Kaggle run 7, kernel `crispasr-confucius4-cfg-verify`)
 
-The whole pipeline now runs on a Kaggle CPU box in ~45 s of compute:
+The S2A stage is now numerically exact against the PyTorch blueprint, driven on
+identical semantic codes, lm_latent and initial noise (F16):
 
 ```
-TTS rc=0
-confucius4: EOS at step 131            <-- was: ran to the 1520 cap, never EOS
-confucius4: generated 131 semantic codes
-confucius4: S2A flow-matching: T_sem=131 -> T_mel=225, mel_dim=80, 25 ODE steps, cfg=0.70
-confucius4: S2A conditioning: embed+project+regulator OK (2304->1024->512 dims)
-confucius4: S2A time schedule: linear
-confucius4: DiT graph: depth=13 dim=512 heads=8 inter=1536 mel=80 T=225
-confucius4: BigVGAN: 225 mel frames -> 57600 PCM samples @ 22050 Hz (2.61s)
+cond (regulator)   cos=1.000000   |mine|=  10.4294  |ref|=  10.4291  max_abs_diff=5.1e-05
+dit t1 / t2        cos=1.000000
+dit x_in           cos=1.000000
+dbg_blk00/06/12    cos=1.000000
+dbg_xres / dbg_skip cos=1.000000
+dbg_wn             cos=1.000000   (was ratio 2.0723)
+dbg_fin            cos=1.000000
+v step 1..25       cos=1.000000   (was 0.978)
+mel (final)        cos=1.000000   |mine|= 834.8463 |ref|= 834.8934  max_abs_diff=0.0237
+cpp mel mean=-5.808 floor=2.7%  ==  ref mel mean=-5.808 floor=2.7%
 ```
 
-**EOS at step 131 is the headline.** The decode terminating on its own (131
-codes ~= 2.6 s, right for the test sentence) confirms the greedy-decode and
-wrong-prompt bugs were real and are fixed. Every fix marker reads as expected.
+Seven bugs, all found by reading the blueprint against the port and bisecting
+with the harness. In discovery order: the timestep embedding (missing
+scale=1000, cos/sin swapped), the skipped InterpolateRegulator + truncated
+encoder_proj, missing CFG, the CLI forcing greedy T2S, the cosine-instead-of-
+linear ODE schedule, the invented English prompt in the old test kernel, and
+the WaveNet channel split offsetting by element size instead of row stride.
 
-**But the ASR roundtrip still fails: `(electronic music)`, 0/8 word overlap.**
-The audio is not speech yet, so the port is NOT done.
+**Method note worth keeping:** the WaveNet bug was only findable because the
+harness prints `|mine|` next to `|ref|`. Every graph tap read cos ~ 0 with
+IDENTICAL norms, which is the signature of a transposed comparison (a harness
+bug), not a divergence -- and `dbg_wn`'s 2.07x ratio was the single number that
+survived that reasoning. On cosine alone the conclusion would have been "the
+whole transformer stack is broken".
 
-Two harness problems that run 1 exposed, both fixed for run 2:
-- `s2a_parity.py` crashed before printing any cosine -- it fed the whole dumped
-  `lm_latent` (T_sem + 1 rows) to `encoder_proj`; slice to T_sem.
-- The run could not separate "the port is still wrong" from "zero speaker
-  conditioning cannot produce speech". Run 2 vocodes BOTH the C++ mel and the
-  reference mel with the real BigVGAN and ASRs each.
+### The remaining blocker is conditioning, not the port
 
-### Next
+The acceptance test still fails, and no S2A work can fix it:
 
-- Read run 2's per-stage cosines and the cpp-vs-REF ASR comparison. If the
-  REFERENCE mel is also unintelligible on identical inputs, the S2A port is not
-  the blocker and speaker conditioning is the whole remaining story.
-- Speaker conditioning is still entirely absent: `spks`, the reference mel and
-  the T2S `condition_emb` are all zero, and this model is zero-shot -- the
-  reference implementation always has a prompt wav. Note `speaker_encoder(0)`
-  is NOT zero (the ECAPA-TDNN has biases), so even the "no speaker" path is not
-  faithfully reproduced by a literal zero vector.
-- Still open from the handover: re-run the converter for the baked BPE vocab,
-  and the BigVGAN perf work.
-- Note: `max_semantic_tokens` is treated as a *new-token* count, while the
-  reference's `max_length=1520` is the **total** sequence length.
+```
+[cpp-cli-f16]        "I'm not going to do it."             0/8
+[REF-mel/torch-voc]  "I'm going to be a little bit more."  0/8
+```
+
+The PyTorch reference produces the same kind of babble on the same inputs,
+because `spks`, the reference mel and the T2S `condition_emb` are all zero and
+this model is **zero-shot** -- `ConfuciusTTS.generate` always takes a
+`prompt_wav`. So the handover's ordering (CFG first, speaker conditioning
+fourth) is inverted: conditioning is the gate on the roundtrip.
+
+### Next: speaker conditioning
+
+What is missing, in the reference's terms:
+1. **T2S `condition_emb`** = `speaker_encoder(w2v_bert_layer17)` -> (1, 1280),
+   prepended to the GPT-2 prefix. Currently a literal zero -- note
+   `speaker_encoder(0)` is NOT zero, the ECAPA-TDNN has biases.
+2. **S2A `spks`** = CAMPPlus 192-d. Already wired through
+   `confucius4_tts_set_speaker()`; just never supplied.
+3. **S2A prompt path**: `prompt_feat` (reference mel) -> `prompt_cond` expanded
+   to T_ref and PREPENDED to the conditioning, `prompt_x` in solve_euler, `x`
+   zeroed over the prompt span every step, and the prompt frames stripped from
+   the output. None of this is implemented.
+
+Cheapest route to a passing roundtrip, avoiding the 600M-param w2v-BERT port
+entirely: inject all three pre-computed from a Python run, prove the pipeline
+end to end, and only then decide whether to port the encoders.
 
 ## Architecture (read from Python, 2026-08-22)
 
