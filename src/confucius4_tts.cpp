@@ -447,9 +447,11 @@ static ggml_tensor* gpt2_forward(confucius4_tts_context* ctx, ggml_context* ctx0
         x = ggml_add(ctx0, x, ff);
     }
 
-    // Final LayerNorm
+    // Final LayerNorm → hidden state (LM latent for S2A conditioning)
     x = ggml_norm(ctx0, x, 1e-5f);
     x = ggml_add(ctx0, ggml_mul(ctx0, x, m.final_norm_w), m.final_norm_b);
+    ggml_set_name(x, "lm_hidden");
+    ggml_set_output(x);
 
     // Semantic head: Linear(model_dim, semantic_vocab_size)
     ggml_tensor* logits = ggml_mul_mat(ctx0, m.semantic_head_w, x);
@@ -954,7 +956,10 @@ static std::vector<float> embed_semantic_token(confucius4_tts_context* ctx, int3
 
 // Run a single GPT-2 forward step via ggml_backend_sched.
 // Input: (D, T) float embeddings. Output: last-token logits (semantic_vocab_size,).
-static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float* input_emb, int T, int n_past) {
+// Run one GPT-2 step. Returns logits for the last token.
+// If `out_hidden` is non-null, appends the hidden state (D floats) for the last token.
+static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float* input_emb, int T, int n_past,
+                                        std::vector<float>* out_hidden = nullptr) {
     const auto& hp = ctx->t2s.hp;
     const int D = hp.model_dim;
 
@@ -1000,6 +1005,15 @@ static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float
         ggml_backend_graph_compute(ctx->backend, gf);
         size_t offset = (T > 1) ? (size_t)(T - 1) * V * sizeof(float) : 0;
         ggml_backend_tensor_get(logits, out_logits.data(), offset, V * sizeof(float));
+        if (out_hidden) {
+            ggml_tensor* h = ggml_graph_get_tensor(gf, "lm_hidden");
+            if (h) {
+                size_t h_off = (T > 1) ? (size_t)(T - 1) * D * sizeof(float) : 0;
+                size_t old = out_hidden->size();
+                out_hidden->resize(old + D);
+                ggml_backend_tensor_get(h, out_hidden->data() + old, h_off, D * sizeof(float));
+            }
+        }
         ggml_gallocr_free(galloc);
     } else {
         ggml_backend_sched_t sched = ggml_backend_sched_new(&ctx->backend, nullptr, 1, n_tensors, false, false);
@@ -1013,6 +1027,15 @@ static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float
         ggml_backend_sched_graph_compute(sched, gf);
         size_t offset = (T > 1) ? (size_t)(T - 1) * V * sizeof(float) : 0;
         ggml_backend_tensor_get(logits, out_logits.data(), offset, V * sizeof(float));
+        if (out_hidden) {
+            ggml_tensor* h = ggml_graph_get_tensor(gf, "lm_hidden");
+            if (h) {
+                size_t h_off = (T > 1) ? (size_t)(T - 1) * D * sizeof(float) : 0;
+                size_t old = out_hidden->size();
+                out_hidden->resize(old + D);
+                ggml_backend_tensor_get(h, out_hidden->data() + old, h_off, D * sizeof(float));
+            }
+        }
         ggml_backend_sched_free(sched);
     }
 
@@ -1020,7 +1043,10 @@ static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float
     return out_logits;
 }
 
-static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::vector<int32_t>& text_token_ids) {
+// Decode text tokens to semantic codes. If `out_lm_latent` is non-null,
+// collects the GPT-2 hidden state (model_dim floats) for each generated semantic token.
+static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::vector<int32_t>& text_token_ids,
+                                       std::vector<float>* out_lm_latent = nullptr) {
     const auto& hp = ctx->t2s.hp;
     const int T_text = (int)text_token_ids.size();
     const int prefix_len = 1 + T_text + 1; // condition(1) + text(T) + BOS(1)
@@ -1052,7 +1078,7 @@ static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::v
     }
 
     // ── Step 2: Prefill — run GPT-2 on the full prefix ──
-    std::vector<float> logits = run_gpt2_step(ctx, prefix_emb.data(), prefix_len, 0);
+    std::vector<float> logits = run_gpt2_step(ctx, prefix_emb.data(), prefix_len, 0, out_lm_latent);
     if (logits.empty()) {
         fprintf(stderr, "confucius4: prefill failed\n");
         kv_free(ctx->kv);
@@ -1089,8 +1115,8 @@ static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::v
             break;
         }
 
-        // Run one GPT-2 step
-        logits = run_gpt2_step(ctx, tok_emb.data(), 1, n_past);
+        // Run one GPT-2 step (also collects hidden state for LM latent)
+        logits = run_gpt2_step(ctx, tok_emb.data(), 1, n_past, out_lm_latent);
         if (logits.empty()) {
             fprintf(stderr, "confucius4: decode step %d failed\n", step);
             break;
@@ -1715,7 +1741,8 @@ static std::vector<float> s2a_dit_forward(confucius4_tts_context* ctx, const flo
 // Run the S2A conditioning pipeline: semantic codes → cond vector for DiT.
 // Returns (lr_out_channels, T_mel) conditioning, or empty on failure.
 static std::vector<float> s2a_build_conditioning(confucius4_tts_context* ctx,
-                                                 const std::vector<int32_t>& semantic_codes, int T_mel) {
+                                                 const std::vector<int32_t>& semantic_codes, int T_mel,
+                                                 const std::vector<float>& lm_latent = {}) {
     const auto& s = ctx->s2a;
     const auto& hp = s.hp;
     const int T_sem = (int)semantic_codes.size();
@@ -1751,15 +1778,19 @@ static std::vector<float> s2a_build_conditioning(confucius4_tts_context* ctx,
         }
     }
 
-    // Step 2: concat with zero LM latent → (T_sem, lr_in=2304)
-    // LM latent should come from T2S hidden states, but we don't pass them yet.
+    // Step 2: concat LM latent + semantic embedding → (T_sem, lr_in=2304)
+    // lm_latent is (T_sem * lm_dim) row-major from T2S hidden states.
+    // If empty, use zeros (no T2S hidden states available).
+    const bool have_lm = !lm_latent.empty() && (int)lm_latent.size() >= T_sem * lm_dim;
     std::vector<float> concat_in((size_t)T_sem * lr_in, 0.0f);
     for (int t = 0; t < T_sem; t++) {
-        // First lm_dim slots: zeros (no LM latent)
-        // Next sem_emb_dim slots: semantic embedding
+        if (have_lm)
+            std::memcpy(concat_in.data() + t * lr_in, lm_latent.data() + t * lm_dim, lm_dim * sizeof(float));
         std::memcpy(concat_in.data() + t * lr_in + lm_dim, sem_emb.data() + t * sem_emb_dim,
                     sem_emb_dim * sizeof(float));
     }
+    if (vb >= 1)
+        fprintf(stderr, "confucius4: S2A conditioning: LM latent %s\n", have_lm ? "OK" : "zeros (not available)");
 
     // Step 3: project → (T_sem, lr_out=512)
     auto enc_w = s2a_read_f32(s.encoder_proj_w); // (lr_out, lr_in)
@@ -1788,7 +1819,8 @@ static std::vector<float> s2a_build_conditioning(confucius4_tts_context* ctx,
 
 // Run the full S2A flow-matching ODE to produce mel.
 // Returns (mel_dim, T_mel) mel spectrogram as float32, or empty on failure.
-static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const std::vector<int32_t>& semantic_codes) {
+static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const std::vector<int32_t>& semantic_codes,
+                                            const std::vector<float>& lm_latent = {}) {
     const auto& s = ctx->s2a;
     const auto& hp = s.hp;
     const int T_sem = (int)semantic_codes.size();
@@ -1802,7 +1834,7 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
                 mel_dim, n_steps);
 
     // Build semantic conditioning → (T_mel, cond_dim=512) row-major
-    std::vector<float> cond = s2a_build_conditioning(ctx, semantic_codes, T_mel);
+    std::vector<float> cond = s2a_build_conditioning(ctx, semantic_codes, T_mel, lm_latent);
     if (cond.empty())
         return {};
 
@@ -1892,8 +1924,9 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
         return nullptr;
     }
 
-    // Step 2: T2S decode → semantic codes
-    std::vector<int32_t> semantic_codes = t2s_decode(ctx, text_ids);
+    // Step 2: T2S decode → semantic codes + LM latent (hidden states for S2A)
+    std::vector<float> lm_latent;
+    std::vector<int32_t> semantic_codes = t2s_decode(ctx, text_ids, &lm_latent);
     if (semantic_codes.empty()) {
         if (vb >= 1)
             fprintf(stderr, "confucius4: T2S produced no semantic codes\n");
@@ -1921,7 +1954,10 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
     }
 
     // Run S2A flow-matching → mel
-    std::vector<float> mel = s2a_flow_matching(ctx, semantic_codes);
+    if (vb >= 1 && !lm_latent.empty())
+        fprintf(stderr, "confucius4: LM latent: %zu floats (%zu tokens × %d dim)\n", lm_latent.size(),
+                lm_latent.size() / ctx->t2s.hp.model_dim, ctx->t2s.hp.model_dim);
+    std::vector<float> mel = s2a_flow_matching(ctx, semantic_codes, lm_latent);
     if (mel.empty()) {
         fprintf(stderr, "confucius4: S2A flow-matching failed\n");
         *out_n_samples = 0;

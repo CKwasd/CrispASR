@@ -202,13 +202,31 @@ writer.add_uint32("confucius4.t2s.start_semantic_token", 8192)
 writer.add_uint32("confucius4.t2s.stop_semantic_token", 8193)
 writer.add_uint32("confucius4.sample_rate", 22050)
 
-# Add tokenizer model
+# Add tokenizer model (raw SentencePiece bytes)
 tok_model_path = os.path.join(src, "tokenizer.model")
 if os.path.exists(tok_model_path):
     with open(tok_model_path, "rb") as f:
         tok_data_raw = f.read()
     writer.add_array("tokenizer.model", list(tok_data_raw))
     print(f"  baked tokenizer.model ({len(tok_data_raw)} bytes)")
+
+# Bake BPE vocab + merges from tokenizer.json (core/bpe.h compatible)
+tok_json_path = os.path.join(src, "tokenizer.json")
+if os.path.exists(tok_json_path):
+    import json as _json
+    with open(tok_json_path) as f:
+        tok_j = _json.load(f)
+    model = tok_j.get("model", {})
+    vocab_dict = model.get("vocab", {})
+    merges_list = model.get("merges", [])
+    # Build ordered token list by ID
+    tokens = [""] * len(vocab_dict)
+    for token, idx in vocab_dict.items():
+        tokens[idx] = token
+    writer.add_array("tokenizer.ggml.tokens", tokens)
+    if merges_list:
+        writer.add_array("tokenizer.ggml.merges", merges_list)
+    print(f"  baked BPE vocab: {len(tokens)} tokens, {len(merges_list)} merges")
 
 # Add wav2vec2bert stats
 writer.add_array("confucius4.w2v_bert.mean", stats["mean"].float().numpy().tolist())
