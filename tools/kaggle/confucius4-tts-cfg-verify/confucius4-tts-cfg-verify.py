@@ -26,6 +26,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
+
 BRANCH = "feat/confucius4-cfg"
 WORK = Path("/kaggle/working")
 REPO = WORK / "CrispASR"
@@ -241,11 +243,14 @@ ref_e2e_wav = TEMP / "confucius4_ref_e2e.wav"
 # transformers pinned to the reference release: beam-sample internals moved
 # across HF versions, and this arm defines the ground-truth decode behavior.
 kh.sh_with_progress("pip install -q regex inflect pykakasi 'transformers==4.52.4'")
+ref_dcond_wav = TEMP / "confucius4_ref_dumpercond.wav"
+runtime_codes_wav = TEMP / "confucius4_runtimecodes_refs2a.wav"
 _driver = TEMP / "ref_e2e_driver.py"
 _driver.write_text(f"""
-import sys, torch, torchaudio
+import sys, os
+import numpy as np
+import torch, torchaudio
 sys.path.insert(0, {str(REF)!r})
-import os
 os.chdir({str(REF)!r})   # config uses relative ./checkpoints paths
 from confuciustts.cli.inference import ConfuciusTTS
 m = ConfuciusTTS(config_path="config/inference_config.yaml", device="cpu")
@@ -254,6 +259,50 @@ if audio.dim() == 1:
     audio = audio.unsqueeze(0)
 torchaudio.save({str(ref_e2e_wav)!r}, audio.cpu(), m.sample_rate)
 print("saved", {str(ref_e2e_wav)!r})
+
+# ---- conditioning cross-check: dumper .bins vs the reference's own values ----
+def cmp(tag, mine, ref):
+    mine = np.asarray(mine, np.float64).ravel(); ref = np.asarray(ref, np.float64).ravel()
+    if mine.shape != ref.shape:
+        print(f"COND-XCHK {{tag:16s}} SHAPE mine={{mine.shape}} ref={{ref.shape}}"); return
+    cos = float(mine @ ref / (np.linalg.norm(mine) * np.linalg.norm(ref) + 1e-12))
+    print(f"COND-XCHK {{tag:16s}} cos={{cos:.6f}} |mine|={{np.linalg.norm(mine):.3f}} |ref|={{np.linalg.norm(ref):.3f}}")
+
+cd = {str(TEMP / 'cond_full')!r}
+wav16, wavt = m._load_prompt({str(prompt_wav)!r})
+sem = m._extract_semantic(wav16)[0].numpy()
+sty = m._extract_style(wav16)[0].numpy()
+rmel = m._ref_mel(wavt)[0].numpy()
+cmp("w2v_features", np.fromfile(cd + "/w2v_features.bin", np.float32).reshape(-1, 1024), sem)
+cmp("style_embedding", np.fromfile(cd + "/style_embedding.bin", np.float32), sty)
+cmp("prompt_mel", np.fromfile(cd + "/prompt_mel.bin", np.float32).reshape(-1, 80), rmel)
+
+# ---- reference generate under the DUMPER's conditioning -> ref S2A -> voc ----
+def synth_from_codes(codes, latent, tag, out_path):
+    T = codes.shape[1]
+    mel = m.s2a_model.inference(
+        semantic_token=codes, lm_latent=latent,
+        prompt_feat=torch.from_numpy(rmel).unsqueeze(0), embedding=torch.from_numpy(sty).unsqueeze(0),
+        target_feat_len=torch.tensor([int(T * 1.72)]), n_timesteps=25, inference_cfg_rate=0.7)
+    wav = m.bigvgan(mel.float()).squeeze(1)
+    torchaudio.save(out_path, wav.cpu(), m.sample_rate)
+    print(f"{{tag}}: {{T}} codes -> {{wav.shape[-1] / m.sample_rate:.2f}}s saved")
+
+feats = torch.from_numpy(np.fromfile(cd + "/w2v_features.bin", np.float32).reshape(1, -1, 1024))
+tid = torch.from_numpy(np.fromfile(cd.replace("cond_full", "dump_cond_full") + "/text_ids_i32.bin",
+                                   np.int32).astype(np.int64)).unsqueeze(0)
+out = m.t2s_model.generate(text_inputs=tid, condition_vector=feats, max_length=1520, num_beams=3,
+                           do_sample=True, top_p=0.8, top_k=30, temperature=0.8,
+                           repetition_penalty=10.0, early_stopping=True, return_latent=True)
+print("ref codes under dumper conditioning:", out["semantic_codes"].shape[1])
+synth_from_codes(out["semantic_codes"], out["latent"], "REF-dumpercond", {str(ref_dcond_wav)!r})
+
+# ---- runtime's own conditioned codes + latents through ref S2A + voc ----
+dd = cd.replace("cond_full", "dump_cond_full")
+rc = np.fromfile(dd + "/semantic_codes_i32.bin", np.int32).astype(np.int64)
+rl = np.fromfile(dd + "/lm_latent.bin", np.float32).reshape(-1, 1280)[: len(rc)]
+synth_from_codes(torch.from_numpy(rc).unsqueeze(0), torch.from_numpy(rl).unsqueeze(0),
+                 "RUNTIME-codes/ref-S2A", {str(runtime_codes_wav)!r})
 """)
 try:
     eres = subprocess.run([sys.executable, str(_driver)], capture_output=True,
@@ -343,8 +392,15 @@ def asr_score(tag, path):
                        capture_output=True, text=True, timeout=600)
     clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", a.stdout)
     hit = {w for w in ORIG if w in clean.lower()}
+    try:  # duration + rms so a silent / NaN wav is visible next to its score
+        import soundfile as _sf
+        _d, _sr = _sf.read(str(path))
+        _rms = float(np.sqrt(np.mean(np.square(_d)))) if len(_d) else 0.0
+        _stat = f"{len(_d) / _sr:.2f}s rms={_rms:.4f} nan={int(np.isnan(_d).any())}"
+    except Exception as _e:  # noqa: BLE001
+        _stat = f"stat-err {_e}"
     print(f"  [{tag}] rc={a.returncode}  overlap {len(hit)}/{len(ORIG)} = "
-          f"{100 * len(hit) / max(len(ORIG), 1):.0f}%")
+          f"{100 * len(hit) / max(len(ORIG), 1):.0f}%  ({_stat})")
     print(f"  [{tag}] transcript: {clean.strip()[:400]}")
     return len(hit)
 
@@ -356,6 +412,8 @@ for _arm, _r in cond_runs.items():
 asr_score("cpp-mel/torch-voc", str(TEMP / "vocoded" / "cpp_mel.wav"))
 asr_score("REF-mel/torch-voc", str(TEMP / "vocoded" / "ref_mel.wav"))
 asr_score("REF-E2E-control", str(ref_e2e_wav) if ref_e2e_wav.exists() else None)
+asr_score("REF-dumpercond", str(ref_dcond_wav) if ref_dcond_wav.exists() else None)
+asr_score("RUNTIME-codes/ref-S2A", str(runtime_codes_wav) if runtime_codes_wav.exists() else None)
 print("  NOTE: if REF-mel is also ~0%, the port is not the blocker -- the model is")
 print("        zero-shot and always has a speaker prompt, which is still all zeros.")
 
