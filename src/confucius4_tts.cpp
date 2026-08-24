@@ -1514,8 +1514,11 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
             ggml_tensor* xa = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T, hidden, stride1, 0));
             ggml_tensor* xb =
                 ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T, hidden, stride1, (size_t)hidden * esz));
-            xa = ggml_add(cache.gctx, xa, g_a);
-            xb = ggml_add(cache.gctx, xb, g_b);
+            // Reshape g_a/g_b from (hidden,) to (1, hidden) for time-first broadcast
+            ggml_tensor* ga2 = ggml_reshape_2d(cache.gctx, g_a, 1, hidden);
+            ggml_tensor* gb2 = ggml_reshape_2d(cache.gctx, g_b, 1, hidden);
+            xa = ggml_add(cache.gctx, xa, ga2);
+            xb = ggml_add(cache.gctx, xb, gb2);
 
             // Gated activation: tanh(xa) * sigmoid(xb)
             ggml_tensor* acts = ggml_mul(cache.gctx, ggml_tanh(cache.gctx, xa), ggml_sigmoid(cache.gctx, xb));
