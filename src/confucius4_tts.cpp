@@ -245,6 +245,9 @@ confucius4_tts_params confucius4_tts_default_params(void) {
 // Forward declarations for helpers used during loading
 static std::vector<float> s2a_read_f32(ggml_tensor* t);
 static ggml_tensor* s2a_find(const confucius4_s2a_model& s, const std::string& name);
+// S2A stage-dump helpers (defined further down, next to the flow-matching code)
+static const char* s2a_dump_dir();
+static void s2a_dump_raw(const char* name, const void* data, size_t nbytes, const char* shape);
 
 // ---------------------------------------------------------------------------
 // Load T2S model from GGUF
