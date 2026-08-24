@@ -58,6 +58,14 @@ int confucius4_tts_set_s2a_path(struct confucius4_tts_context* ctx, const char* 
 // Returns 0 on success.
 int confucius4_tts_set_vocoder_path(struct confucius4_tts_context* ctx, const char* path_vocoder);
 
+// Native voice conditioning from a reference WAV (`--voice ref.wav`): computes
+// the CAMPPlus style embedding and the 22.05 kHz prompt mel in-process (needs
+// the campplus.* bake in the S2A GGUF). The T2S condition_emb still requires
+// externally-computed w2v-BERT features (CRISPASR_CONFUCIUS4_COND_DIR or
+// confucius4_tts_set_speaker) until w2v-BERT is ported natively.
+// Returns 0 on success.
+int confucius4_tts_set_voice_path(struct confucius4_tts_context* ctx, const char* wav_path);
+
 // Set reference speaker conditioning from pre-computed Wav2Vec2-BERT features.
 // `semantic_features` is (n_frames, 1024) float32 — layer-17 hidden states,
 // z-normalised with the baked mean/var. `style_embedding` is (192,) float32

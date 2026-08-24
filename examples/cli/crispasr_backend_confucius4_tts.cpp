@@ -65,6 +65,19 @@ public:
         try_vocoder(p.tts_codec_model);
         try_vocoder(p.model);
 
+        // Voice cloning (--voice ref.wav): native CAMPPlus style + prompt mel
+        // (needs the campplus.* bake in the S2A GGUF). The T2S condition_emb
+        // additionally needs w2v-BERT features via CRISPASR_CONFUCIUS4_COND_DIR
+        // until that model is ported natively.
+        if (!p.tts_voice.empty()) {
+            if (confucius4_tts_set_voice_path(ctx_, p.tts_voice.c_str()) != 0) {
+                fprintf(stderr, "crispasr[confucius4-tts]: WARNING: failed to apply voice prompt '%s'\n",
+                        p.tts_voice.c_str());
+            } else if (!p.no_prints) {
+                fprintf(stderr, "crispasr[confucius4-tts]: voice = '%s'\n", p.tts_voice.c_str());
+            }
+        }
+
         return true;
     }
 

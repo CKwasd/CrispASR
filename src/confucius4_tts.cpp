@@ -13,6 +13,9 @@
 #include "core/attention.h"
 #include "core/ecapa_tdnn.h"
 #include "core/spm_bpe.h"
+#include "core/audio_resample.h"
+#include "core/wav_reader.h"
+#include "chatterbox_campplus.h"
 #include "core/ggml_cpu_backend.h"
 #include "core/gpu_backend_pref.h"
 #include "core/gguf_loader.h"
@@ -225,6 +228,11 @@ struct confucius4_tts_context {
     std::vector<float> prompt_mel;
     int prompt_n_frames = 0;
 
+    // CAMPPlus style encoder (baked into the S2A GGUF under campplus.*)
+    cb_campplus_model campplus_model{};
+    chatterbox_campplus::cb_campplus_runtime campplus_rt{};
+    bool has_campplus = false;
+
     // BPE tokenizer (loaded from GGUF tokenizer.ggml.tokens + merges)
     std::vector<std::string> bpe_id_to_token;
     std::unordered_map<std::string, int32_t> bpe_token_to_id;
@@ -263,6 +271,7 @@ confucius4_tts_params confucius4_tts_default_params(void) {
 static std::vector<float> s2a_read_f32(ggml_tensor* t);
 static ggml_tensor* s2a_find(const confucius4_s2a_model& s, const std::string& name);
 static bool bind_speaker_encoder(confucius4_tts_context* ctx, const core_gguf::tensor_map& tensors);
+static bool confucius4_bind_campplus(confucius4_tts_context* ctx);
 static bool compute_condition_embedding(confucius4_tts_context* ctx);
 // S2A stage-dump helpers (defined further down, next to the flow-matching code)
 static const char* s2a_dump_dir();
@@ -673,7 +682,128 @@ int confucius4_tts_set_s2a_path(confucius4_tts_context* ctx, const char* path_s2
     s.loaded = true;
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "confucius4: S2A loaded %zu tensors OK\n", s.tensors.size());
+    confucius4_bind_campplus(ctx); // optional: older GGUFs lack the campplus bake
     return 0;
+}
+
+
+// Bind the CAMPPlus style encoder baked into the S2A GGUF under `campplus.*`
+// (same backbone as chatterbox/dots; funasr campplus_cn_common, 192-d).
+// Mirrors dots_bind_campplus with the S2A tensor-map lookup.
+static bool confucius4_bind_campplus(confucius4_tts_context* ctx) {
+    auto& s = ctx->s2a;
+    auto& m = ctx->campplus_model;
+    char k[192];
+    const char* P = "campplus";
+    auto T = [&](const char* name) -> ggml_tensor* { return s2a_find(s, name); };
+
+    auto bind_unit = [&](cb_campplus_unit& u, const std::string& base) {
+        u.lin_w = T((base + ".linear.weight").c_str());
+        u.lin_b = T((base + ".linear.bias").c_str());
+        u.bn_w = T((base + ".nonlinear.batchnorm.weight").c_str());
+        u.bn_b = T((base + ".nonlinear.batchnorm.bias").c_str());
+        u.bn_m = T((base + ".nonlinear.batchnorm.running_mean").c_str());
+        u.bn_v = T((base + ".nonlinear.batchnorm.running_var").c_str());
+    };
+    auto bind_resblock = [&](cb_campplus_resblock& b, const std::string& base) {
+        b.conv1_w = T((base + ".conv1.weight").c_str());
+        b.conv1_b = T((base + ".conv1.bias").c_str());
+        b.bn1_w = T((base + ".bn1.weight").c_str());
+        b.bn1_b = T((base + ".bn1.bias").c_str());
+        b.bn1_m = T((base + ".bn1.running_mean").c_str());
+        b.bn1_v = T((base + ".bn1.running_var").c_str());
+        b.conv2_w = T((base + ".conv2.weight").c_str());
+        b.conv2_b = T((base + ".conv2.bias").c_str());
+        b.bn2_w = T((base + ".bn2.weight").c_str());
+        b.bn2_b = T((base + ".bn2.bias").c_str());
+        b.bn2_m = T((base + ".bn2.running_mean").c_str());
+        b.bn2_v = T((base + ".bn2.running_var").c_str());
+        b.sc_w = T((base + ".shortcut.0.weight").c_str());
+        b.sc_b = T((base + ".shortcut.0.bias").c_str());
+        b.sc_bn_w = T((base + ".shortcut.1.weight").c_str());
+        b.sc_bn_b = T((base + ".shortcut.1.bias").c_str());
+        b.sc_bn_m = T((base + ".shortcut.1.running_mean").c_str());
+        b.sc_bn_v = T((base + ".shortcut.1.running_var").c_str());
+    };
+    auto bind_dense_layer = [&](cb_campplus_dense_layer& l, const std::string& base) {
+        l.nonl1_bn_w = T((base + ".nonlinear1.batchnorm.weight").c_str());
+        l.nonl1_bn_b = T((base + ".nonlinear1.batchnorm.bias").c_str());
+        l.nonl1_bn_m = T((base + ".nonlinear1.batchnorm.running_mean").c_str());
+        l.nonl1_bn_v = T((base + ".nonlinear1.batchnorm.running_var").c_str());
+        l.l1_w = T((base + ".linear1.weight").c_str());
+        l.l1_b = T((base + ".linear1.bias").c_str());
+        l.nonl2_bn_w = T((base + ".nonlinear2.batchnorm.weight").c_str());
+        l.nonl2_bn_b = T((base + ".nonlinear2.batchnorm.bias").c_str());
+        l.nonl2_bn_m = T((base + ".nonlinear2.batchnorm.running_mean").c_str());
+        l.nonl2_bn_v = T((base + ".nonlinear2.batchnorm.running_var").c_str());
+        l.cam_ll_w = T((base + ".cam_layer.linear_local.weight").c_str());
+        l.cam_l1_w = T((base + ".cam_layer.linear1.weight").c_str());
+        l.cam_l1_b = T((base + ".cam_layer.linear1.bias").c_str());
+        l.cam_l2_w = T((base + ".cam_layer.linear2.weight").c_str());
+        l.cam_l2_b = T((base + ".cam_layer.linear2.bias").c_str());
+    };
+
+    // FCM head.
+    auto& head = m.head;
+    snprintf(k, sizeof(k), "%s.head.conv1.weight", P), head.conv1_w = T(k);
+    if (!head.conv1_w)
+        return false; // GGUF predates the campplus bake
+    snprintf(k, sizeof(k), "%s.head.bn1.weight", P), head.bn1_w = T(k);
+    snprintf(k, sizeof(k), "%s.head.bn1.bias", P), head.bn1_b = T(k);
+    snprintf(k, sizeof(k), "%s.head.bn1.running_mean", P), head.bn1_m = T(k);
+    snprintf(k, sizeof(k), "%s.head.bn1.running_var", P), head.bn1_v = T(k);
+    snprintf(k, sizeof(k), "%s.head.conv2.weight", P), head.conv2_w = T(k);
+    snprintf(k, sizeof(k), "%s.head.bn2.weight", P), head.bn2_w = T(k);
+    snprintf(k, sizeof(k), "%s.head.bn2.bias", P), head.bn2_b = T(k);
+    snprintf(k, sizeof(k), "%s.head.bn2.running_mean", P), head.bn2_m = T(k);
+    snprintf(k, sizeof(k), "%s.head.bn2.running_var", P), head.bn2_v = T(k);
+    head.layer1.assign(2, cb_campplus_resblock{});
+    head.layer2.assign(2, cb_campplus_resblock{});
+    for (int i = 0; i < 2; i++) {
+        snprintf(k, sizeof(k), "%s.head.layer1.%d", P, i), bind_resblock(head.layer1[i], k);
+        snprintf(k, sizeof(k), "%s.head.layer2.%d", P, i), bind_resblock(head.layer2[i], k);
+    }
+    head.layer1[0].stride = 2;
+    head.layer2[0].stride = 2;
+
+    // xvector chain.
+    snprintf(k, sizeof(k), "%s.xvector.tdnn", P), bind_unit(m.tdnn, k);
+    snprintf(k, sizeof(k), "%s.xvector.transit1", P), bind_unit(m.transit1, k);
+    snprintf(k, sizeof(k), "%s.xvector.transit2", P), bind_unit(m.transit2, k);
+    snprintf(k, sizeof(k), "%s.xvector.transit3", P), bind_unit(m.transit3, k);
+    m.out_nl.lin_w = nullptr;
+    m.out_nl.lin_b = nullptr;
+    snprintf(k, sizeof(k), "%s.xvector.out_nonlinear.batchnorm.weight", P), m.out_nl.bn_w = T(k);
+    snprintf(k, sizeof(k), "%s.xvector.out_nonlinear.batchnorm.bias", P), m.out_nl.bn_b = T(k);
+    snprintf(k, sizeof(k), "%s.xvector.out_nonlinear.batchnorm.running_mean", P), m.out_nl.bn_m = T(k);
+    snprintf(k, sizeof(k), "%s.xvector.out_nonlinear.batchnorm.running_var", P), m.out_nl.bn_v = T(k);
+    snprintf(k, sizeof(k), "%s.xvector.dense.linear.weight", P), m.dense.lin_w = T(k);
+    snprintf(k, sizeof(k), "%s.xvector.dense.nonlinear.batchnorm.running_mean", P), m.dense.bn_m = T(k);
+    snprintf(k, sizeof(k), "%s.xvector.dense.nonlinear.batchnorm.running_var", P), m.dense.bn_v = T(k);
+
+    // Dense blocks: 12 / 24 / 16 layers, dilation 1 / 2 / 2, tdnnd1..N (1-indexed).
+    const int nlayers[3] = {12, 24, 16};
+    const int dils[3] = {1, 2, 2};
+    cb_campplus_dense_block* blocks[3] = {&m.block1, &m.block2, &m.block3};
+    for (int bi = 0; bi < 3; bi++) {
+        auto& blk = *blocks[bi];
+        blk.num_layers = nlayers[bi];
+        blk.dilation = dils[bi];
+        blk.layers.assign(nlayers[bi], cb_campplus_dense_layer{});
+        for (int li = 0; li < nlayers[bi]; li++) {
+            snprintf(k, sizeof(k), "%s.xvector.block%d.tdnnd%d", P, bi + 1, li + 1);
+            bind_dense_layer(blk.layers[li], k);
+        }
+    }
+
+    if (!m.tdnn.lin_w || !m.dense.lin_w || m.block1.layers.empty() || !m.block1.layers[0].l1_w) {
+        fprintf(stderr, "confucius4: CAMPPlus bind failed (missing core tensors)\n");
+        return false;
+    }
+    ctx->has_campplus = true;
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "confucius4: CAMPPlus style encoder bound from S2A GGUF\n");
+    return true;
 }
 
 int confucius4_tts_set_vocoder_path(confucius4_tts_context* ctx, const char* path_vocoder) {
@@ -892,6 +1022,60 @@ static void load_conditioning_from_env(confucius4_tts_context* ctx) {
     confucius4_tts_set_conditioning(ctx, cond_emb.empty() ? nullptr : cond_emb.data(), (int)cond_emb.size(),
                                     style.empty() ? nullptr : style.data(), (int)style.size(),
                                     pmel.empty() ? nullptr : pmel.data(), n_prompt, mel_dim);
+}
+
+// Native voice conditioning from a reference WAV: CAMPPlus style embedding
+// (16 kHz kaldi fbank + CMN, unbiased stats pool — the exact reference
+// recipe) and the 22.05 kHz HiFi-GAN-style prompt mel. The T2S
+// condition_emb needs w2v-BERT layer-17 features, which are not yet native —
+// it stays absent unless CRISPASR_CONFUCIUS4_COND_DIR supplies them, and the
+// zero-shot voice then comes from the S2A conditioning alone.
+int confucius4_tts_set_voice_path(confucius4_tts_context* ctx, const char* wav_path) {
+    if (!ctx || !wav_path)
+        return -1;
+    if (!ctx->has_campplus) {
+        fprintf(stderr, "confucius4: --voice needs the CAMPPlus bake in the S2A GGUF (re-converted model)\n");
+        return -1;
+    }
+    std::vector<float> pcm;
+    int sr = 0;
+    if (!crispasr::core::read_wav_mono_pcm16(wav_path, pcm, sr) || pcm.empty()) {
+        fprintf(stderr, "confucius4: failed to read reference WAV %s\n", wav_path);
+        return -1;
+    }
+
+    std::vector<float> pcm16 =
+        sr == 16000 ? pcm : core_audio::resample_polyphase(pcm.data(), (int)pcm.size(), sr, 16000);
+    auto style = chatterbox_campplus::embed_speaker(ctx->campplus_model, ctx->campplus_rt, pcm16.data(),
+                                                    (int)pcm16.size(), /*stats_var_floor=*/0.0f);
+    const int want_spk = ctx->s2a.hp.spk_embed_dim > 0 ? ctx->s2a.hp.spk_embed_dim : 192;
+    if ((int)style.size() != want_spk) {
+        fprintf(stderr, "confucius4: CAMPPlus produced %zu dims, expected %d\n", style.size(), want_spk);
+        return -1;
+    }
+    ctx->speaker_style_embedding = std::move(style);
+    ctx->has_speaker = true;
+
+    const int tgt_sr = ctx->t2s.hp.sample_rate > 0 ? ctx->t2s.hp.sample_rate : 22050;
+    std::vector<float> pcm_tgt =
+        sr == tgt_sr ? pcm : core_audio::resample_polyphase(pcm.data(), (int)pcm.size(), sr, tgt_sr);
+    const int mel_dim = ctx->s2a.hp.estimator_mel_dim > 0 ? ctx->s2a.hp.estimator_mel_dim : 80;
+    int T_mel = 0;
+    auto pmel = chatterbox_campplus::compute_prompt_feat(pcm_tgt.data(), (int)pcm_tgt.size(), tgt_sr,
+                                                         /*n_fft=*/1024, /*hop=*/256, /*win=*/1024, mel_dim,
+                                                         /*fmin=*/0.0f, /*fmax=*/tgt_sr / 2.0f,
+                                                         /*max_samples=*/0, T_mel);
+    if (pmel.empty() || T_mel <= 0) {
+        fprintf(stderr, "confucius4: prompt mel computation failed\n");
+        return -1;
+    }
+    ctx->prompt_mel = std::move(pmel);
+    ctx->prompt_n_frames = T_mel;
+
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "confucius4: voice set: style=%d-d, prompt_mel=%d frames @%d Hz%s\n", want_spk, T_mel, tgt_sr,
+                ctx->has_condition_emb ? "" : " (no T2S condition_emb — w2v-BERT not native yet)");
+    return 0;
 }
 
 int confucius4_tts_set_speaker(confucius4_tts_context* ctx, const float* semantic_features, int n_frames,

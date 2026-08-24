@@ -220,4 +220,11 @@ std::vector<float> embed_speaker(const cb_campplus_model& m, cb_campplus_runtime
 // 240000 samples before computing the mel).
 std::vector<float> compute_prompt_feat_24k(const float* pcm_24k, int n_samples, int max_samples, int& T_mel_out);
 
+// Generic form of the same HiFi-GAN-style magnitude mel (sqrt(power+1e-9),
+// librosa Slaney basis, log(clamp(mel, 1e-5)), center=False with manual
+// reflect pad of (n_fft-hop)/2). Confucius4-TTS uses it at
+// 22050/1024/256/1024, fmax = sr/2. Returns row-major (T_mel, n_mels).
+std::vector<float> compute_prompt_feat(const float* pcm, int n_samples, int sample_rate, int n_fft, int hop, int win,
+                                       int n_mels, float fmin, float fmax, int max_samples, int& T_mel_out);
+
 } // namespace chatterbox_campplus
