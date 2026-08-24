@@ -941,6 +941,29 @@ static void kv_free(confucius4_kv_cache& kv) {
     kv = {};
 }
 
+// Copy the first n_cols cached positions from src into dst (identical shapes
+// [hd, max_seq, heads, layers]). Beam search reorders hypotheses each step;
+// the surviving beams inherit their parent's cache prefix.
+static void kv_copy_prefix(confucius4_kv_cache& dst, const confucius4_kv_cache& src, int n_cols) {
+    if (n_cols <= 0)
+        return;
+    for (int which = 0; which < 2; which++) {
+        ggml_tensor* s = which ? src.v : src.k;
+        ggml_tensor* d = which ? dst.v : dst.k;
+        const size_t nb2 = s->nb[2], nb3 = s->nb[3];
+        const size_t chunk = (size_t)n_cols * s->nb[1];
+        const int heads = (int)s->ne[2], layers = (int)s->ne[3];
+        std::vector<uint8_t> buf(chunk);
+        for (int l = 0; l < layers; l++) {
+            for (int h = 0; h < heads; h++) {
+                const size_t off = (size_t)l * nb3 + (size_t)h * nb2;
+                ggml_backend_tensor_get(s, buf.data(), off, chunk);
+                ggml_backend_tensor_set(d, buf.data(), off, chunk);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Top-p sampling
 // ---------------------------------------------------------------------------
@@ -1216,8 +1239,11 @@ static std::vector<float> embed_semantic_token(confucius4_tts_context* ctx, int3
 // Input: (D, T) float embeddings. Output: last-token logits (semantic_vocab_size,).
 // Run one GPT-2 step. Returns logits for the last token.
 // If `out_hidden` is non-null, appends the hidden state (D floats) for the last token.
+// If `kvc` is non-null, that KV cache is used instead of ctx->kv (beam decode).
+// If `out_hidden_all` is non-null, it receives ALL T hidden rows (T*D floats).
 static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float* input_emb, int T, int n_past,
-                                        std::vector<float>* out_hidden = nullptr) {
+                                        std::vector<float>* out_hidden = nullptr, confucius4_kv_cache* kvc = nullptr,
+                                        std::vector<float>* out_hidden_all = nullptr) {
     const auto& hp = ctx->t2s.hp;
     const int D = hp.model_dim;
 
@@ -1251,7 +1277,8 @@ static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float
     }
 
     // Forward pass
-    ggml_tensor* logits = gpt2_forward(ctx, ctx0, gf, x, ctx->kv.k, ctx->kv.v, n_past, causal_mask);
+    confucius4_kv_cache& kv_use = kvc ? *kvc : ctx->kv;
+    ggml_tensor* logits = gpt2_forward(ctx, ctx0, gf, x, kv_use.k, kv_use.v, n_past, causal_mask);
     ggml_set_name(logits, "logits");
     ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
@@ -1292,6 +1319,13 @@ static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float
                 ggml_backend_tensor_get(h, out_hidden->data() + old, h_off, D * sizeof(float));
             }
         }
+        if (out_hidden_all) {
+            ggml_tensor* h = ggml_graph_get_tensor(gf, "lm_hidden");
+            if (h) {
+                out_hidden_all->resize((size_t)T * D);
+                ggml_backend_tensor_get(h, out_hidden_all->data(), 0, (size_t)T * D * sizeof(float));
+            }
+        }
         ggml_gallocr_free(galloc);
     } else {
         ggml_backend_sched_t sched = ggml_backend_sched_new(&ctx->backend, nullptr, 1, n_tensors, false, false);
@@ -1321,6 +1355,13 @@ static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float
                 ggml_backend_tensor_get(h, out_hidden->data() + old, h_off, D * sizeof(float));
             }
         }
+        if (out_hidden_all) {
+            ggml_tensor* h = ggml_graph_get_tensor(gf, "lm_hidden");
+            if (h) {
+                out_hidden_all->resize((size_t)T * D);
+                ggml_backend_tensor_get(h, out_hidden_all->data(), 0, (size_t)T * D * sizeof(float));
+            }
+        }
         ggml_backend_sched_free(sched);
     }
 
@@ -1328,15 +1369,376 @@ static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float
     return out_logits;
 }
 
+// ---------------------------------------------------------------------------
+// T2S beam-sample decode -- mirrors transformers 4.52.4 `_beam_search` with
+// do_sample=True, the exact path the reference hits with num_beams=3:
+//   log_softmax(logits) -> processors+warpers ON LOG-PROBS in order
+//   [repetition_penalty, temperature, top_k, top_p] -> + running beam score ->
+//   joint softmax over (n_beams * vocab) -> multinomial 2*n_beams WITHOUT
+//   replacement -> first n_beams candidates may finish on EOS (score
+//   length-penalized by generated length, length_penalty=1.0) -> running
+//   beams = top n_beams continuations by score; early_stopping=True stops
+//   once n_beams hypotheses have finished.
+// ---------------------------------------------------------------------------
+
+static std::vector<int32_t> t2s_decode_beam(confucius4_tts_context* ctx, const std::vector<int32_t>& text_token_ids,
+                                            int n_beams, std::vector<float>* out_lm_latent) {
+    const auto& hp = ctx->t2s.hp;
+    const int T_text = (int)text_token_ids.size();
+    const int prefix_len = 1 + T_text + 1; // condition(1) + text(T) + BOS(1)
+    // Reference max_length=1520 is the TOTAL sequence length passed to HF
+    // generate() (prefix + BOS + generated), not a new-token count.
+    const int max_new = ctx->params.max_semantic_tokens > 0 ? ctx->params.max_semantic_tokens
+                                                            : std::max(1, hp.max_semantic_seq_lens - prefix_len);
+    const int max_seq = prefix_len + max_new + 1;
+    const int vb = ctx->params.verbosity;
+    const int V = hp.semantic_vocab_size;
+    const int eos = hp.stop_semantic_token;
+    const int n_cand = 2 * n_beams;
+
+    float rep_pen = ctx->params.repetition_penalty;
+    if (const char* e = std::getenv("CRISPASR_CONFUCIUS4_REP_PEN"))
+        rep_pen = (float)atof(e);
+    const float temp = ctx->params.temperature > 0.0f ? ctx->params.temperature : 1.0f;
+    const float top_p = ctx->params.top_p;
+    const int top_k = ctx->params.top_k;
+
+    if (vb >= 1)
+        fprintf(stderr, "confucius4: T2S beam decode: text_len=%d, prefix_len=%d, beams=%d, max_new=%d\n", T_text,
+                prefix_len, n_beams, max_new);
+
+    // Two banks of per-beam KV caches (beam reorder copies parent -> child).
+    std::vector<confucius4_kv_cache> bank[2];
+    bank[0].resize(n_beams);
+    bank[1].resize(n_beams);
+    for (int i = 0; i < n_beams; i++) {
+        if (!kv_init(bank[0][i], hp, max_seq, ctx->backend) || !kv_init(bank[1][i], hp, max_seq, ctx->backend)) {
+            fprintf(stderr, "confucius4: beam KV cache allocation failed\n");
+            for (auto& b : bank[0])
+                kv_free(b);
+            for (auto& b : bank[1])
+                kv_free(b);
+            return {};
+        }
+    }
+    int cur_bank = 0;
+
+    std::mt19937 rng(ctx->params.seed ? ctx->params.seed : 42);
+
+    // Prefill beam 0, then clone the prefix into every beam of the bank.
+    std::vector<float> prefix_emb = build_prefix_embedding(ctx, text_token_ids);
+    if (prefix_emb.empty()) {
+        for (int w = 0; w < 2; w++)
+            for (auto& b : bank[w])
+                kv_free(b);
+        return {};
+    }
+    std::vector<std::vector<float>> beam_logits(n_beams);
+    beam_logits[0] = run_gpt2_step(ctx, prefix_emb.data(), prefix_len, 0, nullptr, &bank[0][0]);
+    if (beam_logits[0].empty()) {
+        for (int w = 0; w < 2; w++)
+            for (auto& b : bank[w])
+                kv_free(b);
+        return {};
+    }
+    for (int i = 1; i < n_beams; i++) {
+        kv_copy_prefix(bank[0][i], bank[0][0], prefix_len);
+        beam_logits[i] = beam_logits[0];
+    }
+
+    if (s2a_dump_dir()) {
+        char shp[64];
+        snprintf(shp, sizeof(shp), "%d", (int)text_token_ids.size());
+        s2a_dump_raw("text_ids_i32", text_token_ids.data(), text_token_ids.size() * sizeof(int32_t), shp);
+        snprintf(shp, sizeof(shp), "%d", (int)beam_logits[0].size());
+        s2a_dump_raw("prefill_logits", beam_logits[0].data(), beam_logits[0].size() * sizeof(float), shp);
+        snprintf(shp, sizeof(shp), "%d,%d", prefix_len, hp.model_dim);
+        s2a_dump_raw("prefix_emb", prefix_emb.data(), prefix_emb.size() * sizeof(float), shp);
+    }
+
+    struct Beam {
+        std::vector<int32_t> codes;
+        double score = 0.0;
+        std::vector<uint8_t> seen; // per-unique-token repetition set (BOS pre-seeded)
+    };
+    std::vector<Beam> beams(n_beams);
+    for (int i = 0; i < n_beams; i++) {
+        beams[i].score = i == 0 ? 0.0 : -1e9;
+        beams[i].seen.assign(V, 0);
+        beams[i].seen[hp.start_semantic_token] = 1;
+    }
+
+    struct Finished {
+        std::vector<int32_t> codes;
+        double score = -1e18;
+    };
+    std::vector<Finished> finished; // kept sorted desc, size <= n_beams
+
+    std::vector<double> acc((size_t)n_beams * V);
+    std::vector<double> warped(V);
+    int n_past = prefix_len;
+
+    for (int step = 0; step < max_new; step++) {
+        const bool full = (int)finished.size() >= n_beams; // early_stopping guard
+        for (int b = 0; b < n_beams; b++) {
+            // log_softmax in double
+            const auto& lg = beam_logits[b];
+            double mx = -1e30;
+            for (int v = 0; v < V; v++)
+                mx = std::max(mx, (double)lg[v]);
+            double se = 0.0;
+            for (int v = 0; v < V; v++)
+                se += std::exp((double)lg[v] - mx);
+            const double lse = mx + std::log(se);
+            for (int v = 0; v < V; v++)
+                warped[v] = (double)lg[v] - lse;
+            // repetition penalty ON LOG-PROBS (HF applies the processor list
+            // to log_softmax output in _beam_search; log-probs are <= 0, so
+            // penalized tokens multiply)
+            if (rep_pen != 1.0f) {
+                for (int v = 0; v < V; v++)
+                    if (beams[b].seen[v])
+                        warped[v] = warped[v] < 0 ? warped[v] * rep_pen : warped[v] / rep_pen;
+            }
+            // temperature
+            for (int v = 0; v < V; v++)
+                warped[v] /= temp;
+            // top-k: keep the k largest, others -inf
+            if (top_k > 0 && top_k < V) {
+                std::vector<double> tmp(warped.begin(), warped.end());
+                std::nth_element(tmp.begin(), tmp.begin() + (top_k - 1), tmp.end(), std::greater<double>());
+                const double thresh = tmp[top_k - 1];
+                for (int v = 0; v < V; v++)
+                    if (warped[v] < thresh)
+                        warped[v] = -INFINITY;
+            }
+            // top-p on softmax of the current scores (keep the smallest
+            // descending prefix with mass >= top_p, crossing token included)
+            if (top_p > 0.0f && top_p < 1.0f) {
+                std::vector<std::pair<double, int>> order;
+                order.reserve(top_k > 0 ? top_k : V);
+                for (int v = 0; v < V; v++)
+                    if (warped[v] != -INFINITY)
+                        order.push_back({warped[v], v});
+                std::sort(order.begin(), order.end(), std::greater<std::pair<double, int>>());
+                double m2 = order.empty() ? 0.0 : order[0].first, s2 = 0.0;
+                for (auto& pr : order)
+                    s2 += std::exp(pr.first - m2);
+                double cum = 0.0;
+                size_t keep = order.size();
+                for (size_t oi = 0; oi < order.size(); oi++) {
+                    cum += std::exp(order[oi].first - m2) / s2;
+                    if (cum >= (double)top_p) {
+                        keep = oi + 1;
+                        break;
+                    }
+                }
+                for (size_t oi = keep; oi < order.size(); oi++)
+                    warped[order[oi].second] = -INFINITY;
+            }
+            for (int v = 0; v < V; v++)
+                acc[(size_t)b * V + v] = warped[v] + beams[b].score;
+        }
+
+        // joint softmax over n_beams*V, multinomial n_cand WITHOUT replacement
+        double mx = -1e30;
+        for (auto d : acc)
+            if (d > mx)
+                mx = d;
+        std::vector<double> probs(acc.size());
+        double se = 0.0;
+        for (size_t i = 0; i < acc.size(); i++) {
+            probs[i] = acc[i] == -INFINITY || acc[i] < mx - 700.0 ? 0.0 : std::exp(acc[i] - mx);
+            se += probs[i];
+        }
+        std::vector<size_t> cand_idx;
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
+        for (int j = 0; j < n_cand && se > 0.0; j++) {
+            double r = uni(rng) * se, cum = 0.0;
+            size_t pick = 0;
+            bool found = false;
+            for (size_t i = 0; i < probs.size(); i++) {
+                cum += probs[i];
+                if (cum >= r && probs[i] > 0.0) {
+                    pick = i;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) { // numeric tail: last nonzero
+                for (size_t i = probs.size(); i-- > 0;)
+                    if (probs[i] > 0.0) {
+                        pick = i;
+                        found = true;
+                        break;
+                    }
+            }
+            if (!found)
+                break;
+            cand_idx.push_back(pick);
+            se -= probs[pick];
+            probs[pick] = 0.0;
+        }
+        if (cand_idx.empty())
+            break;
+
+        // finished-hypothesis update: only the first n_beams sampled
+        // candidates are eligible (HF top_num_beam_mask)
+        struct Cand {
+            int parent, token;
+            double score, cont_score;
+        };
+        std::vector<Cand> cands;
+        for (size_t j = 0; j < cand_idx.size(); j++) {
+            Cand c;
+            c.parent = (int)(cand_idx[j] / V);
+            c.token = (int)(cand_idx[j] % V);
+            c.score = acc[cand_idx[j]];
+            c.cont_score = c.token == eos ? c.score - 1e9 : c.score;
+            cands.push_back(c);
+            if (c.token == eos && (int)j < n_beams && !full) {
+                const double L = (double)beams[c.parent].codes.size() + 1.0; // generated incl. EOS
+                Finished f;
+                f.codes = beams[c.parent].codes;
+                f.score = c.score / L;
+                finished.push_back(std::move(f));
+                std::sort(finished.begin(), finished.end(),
+                          [](const Finished& a, const Finished& b) { return a.score > b.score; });
+                if ((int)finished.size() > n_beams)
+                    finished.resize(n_beams);
+            }
+        }
+        if ((int)finished.size() >= n_beams) {
+            if (vb >= 1)
+                fprintf(stderr, "confucius4: beam decode: %d finished at step %d\n", n_beams, step);
+            break;
+        }
+
+        // running beams for the next iteration: top n_beams by cont_score
+        std::vector<int> sel(cands.size());
+        for (size_t j = 0; j < sel.size(); j++)
+            sel[j] = (int)j;
+        std::stable_sort(sel.begin(), sel.end(),
+                         [&](int a, int b) { return cands[a].cont_score > cands[b].cont_score; });
+        sel.resize(std::min((size_t)n_beams, sel.size()));
+
+        const int next_bank = 1 - cur_bank;
+        std::vector<Beam> next_beams(n_beams);
+        for (int i = 0; i < (int)sel.size(); i++) {
+            const Cand& c = cands[sel[i]];
+            next_beams[i] = beams[c.parent];
+            next_beams[i].codes.push_back(c.token);
+            next_beams[i].seen[c.token] = 1;
+            next_beams[i].score = c.cont_score;
+            kv_copy_prefix(bank[next_bank][i], bank[cur_bank][c.parent], n_past);
+        }
+        for (int i = (int)sel.size(); i < n_beams; i++) {
+            next_beams[i] = beams[0];
+            next_beams[i].score = -1e18;
+            kv_copy_prefix(bank[next_bank][i], bank[cur_bank][0], n_past);
+        }
+        beams = std::move(next_beams);
+        cur_bank = next_bank;
+
+        // feed each beam its new token
+        bool fail = false;
+        for (int i = 0; i < n_beams; i++) {
+            const int sem_pos = std::min((int)beams[i].codes.size(), hp.max_semantic_seq_lens - 1);
+            std::vector<float> emb =
+                embed_semantic_token(ctx, beams[i].codes.empty() ? eos : beams[i].codes.back(), sem_pos);
+            if (emb.empty()) {
+                fail = true;
+                break;
+            }
+            beam_logits[i] = run_gpt2_step(ctx, emb.data(), 1, n_past, nullptr, &bank[cur_bank][i]);
+            if (beam_logits[i].empty()) {
+                fail = true;
+                break;
+            }
+        }
+        n_past++;
+        if (fail)
+            break;
+        if (vb >= 2 && step < 6)
+            fprintf(stderr, "confucius4: beam step %d: tokens [%d %d %d]\n", step,
+                    beams[0].codes.empty() ? -1 : beams[0].codes.back(),
+                    n_beams > 1 && !beams[1].codes.empty() ? beams[1].codes.back() : -1,
+                    n_beams > 2 && !beams[2].codes.empty() ? beams[2].codes.back() : -1);
+    }
+
+    // pick the winner: best finished, else best running (length-penalized)
+    std::vector<int32_t> codes;
+    if (!finished.empty()) {
+        codes = finished[0].codes;
+    } else {
+        int best = 0;
+        double best_s = -1e30;
+        for (int i = 0; i < n_beams; i++) {
+            const double L = std::max<double>(1.0, (double)beams[i].codes.size());
+            if (beams[i].score / L > best_s) {
+                best_s = beams[i].score / L;
+                best = i;
+            }
+        }
+        codes = beams[best].codes;
+    }
+
+    for (int w = 0; w < 2; w++)
+        for (auto& b : bank[w])
+            kv_free(b);
+
+    if (vb >= 1)
+        fprintf(stderr, "confucius4: beam decode: %zu semantic codes (%zu finished hyps)\n", codes.size(),
+                finished.size());
+
+    // Teacher-forced latent pass over the winning sequence -- mirrors the
+    // reference return_latent path, which re-runs the transformer on
+    // [cond | text | BOS | codes] and slices the hidden states.
+    if (out_lm_latent && !codes.empty()) {
+        const int T_all = prefix_len + (int)codes.size();
+        std::vector<float> embeds((size_t)T_all * hp.model_dim);
+        std::memcpy(embeds.data(), prefix_emb.data(), prefix_emb.size() * sizeof(float));
+        for (size_t i = 0; i < codes.size(); i++) {
+            const int sem_pos = std::min((int)i + 1, hp.max_semantic_seq_lens - 1);
+            std::vector<float> emb = embed_semantic_token(ctx, codes[i], sem_pos);
+            if (emb.empty())
+                return codes;
+            std::memcpy(embeds.data() + (prefix_len + i) * hp.model_dim, emb.data(), emb.size() * sizeof(float));
+        }
+        confucius4_kv_cache lat_kv{};
+        if (!kv_init(lat_kv, hp, T_all + 1, ctx->backend))
+            return codes;
+        std::vector<float> hidden_all;
+        run_gpt2_step(ctx, embeds.data(), T_all, 0, nullptr, &lat_kv, &hidden_all);
+        kv_free(lat_kv);
+        if ((int)hidden_all.size() == T_all * hp.model_dim) {
+            // hidden at position (prefix_len-1+i) -- BOS for i=0 -- predicts code i
+            out_lm_latent->assign(hidden_all.begin() + (size_t)(prefix_len - 1) * hp.model_dim,
+                                  hidden_all.begin() + (size_t)(prefix_len - 1 + codes.size()) * hp.model_dim);
+        }
+    }
+
+    return codes;
+}
+
 // Decode text tokens to semantic codes. If `out_lm_latent` is non-null,
 // collects the GPT-2 hidden state (model_dim floats) for each generated semantic token.
 static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::vector<int32_t>& text_token_ids,
                                        std::vector<float>* out_lm_latent = nullptr) {
+    // Reference decode is beam-sample with num_beams=3 (inference.py). The
+    // pure-sampling path below stays for A/B via CRISPASR_CONFUCIUS4_BEAMS=1.
+    {
+        int n_beams = 3;
+        if (const char* e = std::getenv("CRISPASR_CONFUCIUS4_BEAMS"))
+            n_beams = std::atoi(e);
+        if (n_beams > 1)
+            return t2s_decode_beam(ctx, text_token_ids, n_beams, out_lm_latent);
+    }
     const auto& hp = ctx->t2s.hp;
     const int T_text = (int)text_token_ids.size();
     const int prefix_len = 1 + T_text + 1; // condition(1) + text(T) + BOS(1)
-    const int max_new =
-        ctx->params.max_semantic_tokens > 0 ? ctx->params.max_semantic_tokens : hp.max_semantic_seq_lens;
+    const int max_new = ctx->params.max_semantic_tokens > 0 ? ctx->params.max_semantic_tokens
+                                                            : std::max(1, hp.max_semantic_seq_lens - prefix_len);
     const int max_seq = prefix_len + max_new;
     const int vb = ctx->params.verbosity;
 
