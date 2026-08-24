@@ -56,7 +56,7 @@ kh.init_progress()
 
 # ── Phase 1: deps + HF token ────────────────────────────────────────────────
 kh.step("install deps")
-kh.sh_with_progress("pip install -q huggingface_hub hf_transfer tokenizers pyyaml librosa")
+kh.sh_with_progress("pip install -q huggingface_hub hf_transfer tokenizers pyyaml librosa scipy")
 
 kh.step("resolve HF token")
 hf_token = kh.resolve_hf_token()
@@ -159,7 +159,8 @@ else:
     pres = subprocess.run(
         [sys.executable, str(parity), "--dump-dir", str(DUMP),
          "--ref-repo", str(REF), "--s2a-ckpt", s2a_ckpt,
-         "--steps", str(ODE_STEPS), "--cfg", "0.7"],
+         "--steps", str(ODE_STEPS), "--cfg", "0.7",
+         "--vocode-out", str(TEMP / "vocoded")],
         capture_output=True, text=True, timeout=7200,
     )
     print(f"  parity rc={pres.returncode}")
@@ -172,30 +173,41 @@ else:
 
 # ── Phase 8: ASR roundtrip (the acceptance gate) ────────────────────────────
 kh.step("ASR roundtrip")
-if wav_ok:
-    import urllib.request
+import urllib.request
 
-    whisper_model = str(TEMP / "models" / "ggml-base.en.bin")
-    os.makedirs(os.path.dirname(whisper_model), exist_ok=True)
-    if not os.path.exists(whisper_model):
-        urllib.request.urlretrieve(
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
-            whisper_model,
-        )
-    asr = subprocess.run([crispasr_bin, "-m", whisper_model, "-f", str(tts_wav), "--no-prints"],
-                         capture_output=True, text=True, timeout=600)
-    # Feed the FULL ansi-stripped stdout to a word-OVERLAP check: the CLI
-    # interleaves device/model-load noise and appends an AI-disclosure line.
-    clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", asr.stdout)
-    print(f"  ASR rc={asr.returncode}")
-    print(f"  ASR stdout: {clean.strip()[:600]}")
-    orig = set(w.strip(".,!?").lower() for w in TEST_TEXT.split())
-    heard = clean.lower()
-    hit = {w for w in orig if w in heard}
-    print(f"  word overlap: {len(hit)}/{len(orig)} = {100 * len(hit) / max(len(orig), 1):.0f}%  "
-          f"missing={sorted(orig - hit)}")
-else:
-    print("  SKIP: no WAV")
+whisper_model = str(TEMP / "models" / "ggml-base.en.bin")
+os.makedirs(os.path.dirname(whisper_model), exist_ok=True)
+if not os.path.exists(whisper_model):
+    urllib.request.urlretrieve(
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+        whisper_model,
+    )
+
+ORIG = set(w.strip(".,!?").lower() for w in TEST_TEXT.split())
+
+
+def asr_score(tag, path):
+    """Transcribe and word-overlap score one wav.  The decisive comparison is
+    cpp vs ref: if the REFERENCE audio is also unintelligible then the S2A port
+    is not the blocker, the missing speaker conditioning is."""
+    if not (path and os.path.exists(path) and os.path.getsize(path) > 100):
+        print(f"  [{tag}] SKIP: no wav")
+        return
+    a = subprocess.run([crispasr_bin, "-m", whisper_model, "-f", str(path), "--no-prints"],
+                       capture_output=True, text=True, timeout=600)
+    clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", a.stdout)
+    hit = {w for w in ORIG if w in clean.lower()}
+    print(f"  [{tag}] rc={a.returncode}  overlap {len(hit)}/{len(ORIG)} = "
+          f"{100 * len(hit) / max(len(ORIG), 1):.0f}%")
+    print(f"  [{tag}] transcript: {clean.strip()[:400]}")
+    return len(hit)
+
+
+asr_score("cpp-cli", str(tts_wav) if wav_ok else None)
+asr_score("cpp-mel/torch-voc", str(TEMP / "vocoded" / "cpp_mel.wav"))
+asr_score("REF-mel/torch-voc", str(TEMP / "vocoded" / "ref_mel.wav"))
+print("  NOTE: if REF-mel is also ~0%, the port is not the blocker -- the model is")
+print("        zero-shot and always has a speaker prompt, which is still all zeros.")
 
 # ── Phase 9: summary ────────────────────────────────────────────────────────
 kh.step("summary")

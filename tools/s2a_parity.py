@@ -55,6 +55,9 @@ def main():
     ap.add_argument("--s2a-ckpt", required=True)
     ap.add_argument("--ref-repo", required=True,
                     help="clone of github.com/netease-youdao/Confucius4-TTS")
+    ap.add_argument("--vocode-out", default=None,
+                    help="if set, vocode BOTH mels with the real BigVGAN into this dir "
+                         "(ref_mel.wav / cpp_mel.wav) so each can be ASR'd separately")
     ap.add_argument("--cfg", type=float, default=0.7)
     ap.add_argument("--steps", type=int, default=25)
     a = ap.parse_args()
@@ -91,7 +94,11 @@ def main():
     model.eval()
 
     sem = torch.from_numpy(codes.astype(np.int64)).unsqueeze(0)
-    lat = torch.from_numpy(lm_latent).unsqueeze(0)
+    # The runtime collects one hidden state per decode step, which is T_sem + 1
+    # rows (the last one would predict the token after the final code).  The
+    # reference keeps exactly T_sem, and the C++ conditioning already slices to
+    # T_sem -- so slice here too rather than feeding the extra row.
+    lat = torch.from_numpy(lm_latent[:T_sem]).unsqueeze(0)
 
     with torch.no_grad():
         # --- stage 1: conditioning (encoder_proj + InterpolateRegulator) ---
@@ -137,6 +144,34 @@ def main():
         cmp("mel (final)", mel_cpp, mel_ref)
         np.save(os.path.join(d, "mel_ref.npy"), mel_ref)
         print("wrote", os.path.join(d, "mel_ref.npy"))
+
+        # Per-frame statistics: a mel that is globally plausible but locally flat
+        # (or saturated at the log_eps floor) shows up here and not in a cosine.
+        for tag, m in (("cpp", mel_cpp), ("ref", mel_ref)):
+            m = np.asarray(m, dtype=np.float64)
+            print(f"  {tag} mel: min={m.min():8.3f} max={m.max():8.3f} mean={m.mean():8.3f} "
+                  f"std={m.std():7.3f}  per-frame std (mean)={m.std(axis=1).mean():7.3f}  "
+                  f"frames at log_eps floor={(m <= np.log(1e-5) + 1e-3).mean() * 100:.1f}%")
+
+    if a.vocode_out:
+        # Vocode BOTH mels with the reference BigVGAN.  If the REFERENCE audio is
+        # also unintelligible then the S2A port is not the blocker -- the missing
+        # speaker conditioning is (the model is zero-shot and always has a prompt).
+        os.makedirs(a.vocode_out, exist_ok=True)
+        sys.path.insert(0, a.ref_repo)
+        from external.bigvgan.bigvgan import BigVGAN
+        import scipy.io.wavfile as wavfile
+
+        voc = BigVGAN.from_pretrained("nvidia/bigvgan_v2_22khz_80band_256x", use_cuda_kernel=False)
+        voc.remove_weight_norm()
+        voc.eval()
+        with torch.no_grad():
+            for tag, m in (("ref", mel_ref), ("cpp", mel_cpp)):
+                t = torch.from_numpy(np.ascontiguousarray(np.asarray(m, dtype=np.float32).T)).unsqueeze(0)
+                wav = voc(t).squeeze().cpu().numpy()
+                out = os.path.join(a.vocode_out, f"{tag}_mel.wav")
+                wavfile.write(out, 22050, (np.clip(wav, -1, 1) * 32767).astype(np.int16))
+                print(f"  vocoded {tag}: {out}  ({len(wav) / 22050:.2f}s, peak={np.abs(wav).max():.3f})")
 
 
 if __name__ == "__main__":
