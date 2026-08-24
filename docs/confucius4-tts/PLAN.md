@@ -72,12 +72,47 @@ WaveNet res/skip halves and dilation=1/pad=2, InputEmbedding concat order
 alignment (the port collects one extra trailing row, which the conditioning
 correctly ignores).
 
+### Kaggle run 1 (kernel `chr1s4/crispasr-confucius4-cfg-verify` v1, 8 min)
+
+The whole pipeline now runs on a Kaggle CPU box in ~45 s of compute:
+
+```
+TTS rc=0
+confucius4: EOS at step 131            <-- was: ran to the 1520 cap, never EOS
+confucius4: generated 131 semantic codes
+confucius4: S2A flow-matching: T_sem=131 -> T_mel=225, mel_dim=80, 25 ODE steps, cfg=0.70
+confucius4: S2A conditioning: embed+project+regulator OK (2304->1024->512 dims)
+confucius4: S2A time schedule: linear
+confucius4: DiT graph: depth=13 dim=512 heads=8 inter=1536 mel=80 T=225
+confucius4: BigVGAN: 225 mel frames -> 57600 PCM samples @ 22050 Hz (2.61s)
+```
+
+**EOS at step 131 is the headline.** The decode terminating on its own (131
+codes ~= 2.6 s, right for the test sentence) confirms the greedy-decode and
+wrong-prompt bugs were real and are fixed. Every fix marker reads as expected.
+
+**But the ASR roundtrip still fails: `(electronic music)`, 0/8 word overlap.**
+The audio is not speech yet, so the port is NOT done.
+
+Two harness problems that run 1 exposed, both fixed for run 2:
+- `s2a_parity.py` crashed before printing any cosine -- it fed the whole dumped
+  `lm_latent` (T_sem + 1 rows) to `encoder_proj`; slice to T_sem.
+- The run could not separate "the port is still wrong" from "zero speaker
+  conditioning cannot produce speech". Run 2 vocodes BOTH the C++ mel and the
+  reference mel with the real BigVGAN and ASRs each.
+
 ### Next
 
-- Finish the build, run end-to-end, dump the S2A stages and diff against the
-  Python reference; then the TTS→ASR roundtrip (HARD RULE #3).
-- Still open from the handover: speaker conditioning (w2v-BERT + CAMPPlus),
-  re-running the converter for the baked BPE vocab, and the BigVGAN perf work.
+- Read run 2's per-stage cosines and the cpp-vs-REF ASR comparison. If the
+  REFERENCE mel is also unintelligible on identical inputs, the S2A port is not
+  the blocker and speaker conditioning is the whole remaining story.
+- Speaker conditioning is still entirely absent: `spks`, the reference mel and
+  the T2S `condition_emb` are all zero, and this model is zero-shot -- the
+  reference implementation always has a prompt wav. Note `speaker_encoder(0)`
+  is NOT zero (the ECAPA-TDNN has biases), so even the "no speaker" path is not
+  faithfully reproduced by a literal zero vector.
+- Still open from the handover: re-run the converter for the baked BPE vocab,
+  and the BigVGAN perf work.
 - Note: `max_semantic_tokens` is treated as a *new-token* count, while the
   reference's `max_length=1520` is the **total** sequence length.
 
