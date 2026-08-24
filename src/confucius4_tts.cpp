@@ -11,6 +11,7 @@
 #include "indextts_voc.h"
 
 #include "core/attention.h"
+#include "core/ecapa_tdnn.h"
 #include "core/bpe.h"
 #include "core/ggml_cpu_backend.h"
 #include "core/gpu_backend_pref.h"
@@ -98,9 +99,10 @@ struct confucius4_t2s_model {
     struct ggml_tensor* semantic_head_w = nullptr; // [d, semantic_vocab]
     struct ggml_tensor* semantic_head_b = nullptr;
 
-    // Speaker encoder (ECAPA-TDNN) — loaded but not yet wired for GPU compute
-    // (the speaker encoder runs on Wav2Vec2-BERT output, which is external)
-    // For now, conditioning comes pre-computed via confucius4_tts_set_speaker().
+    // Speaker encoder (Qwen3TTSSpeakerEncoder / ECAPA-TDNN): 76 tensors that
+    // already ship in the T2S GGUF but were never bound.  The graph itself is
+    // shared with qwen3-tts via core/ecapa_tdnn.h.
+    core_ecapa::model spk_enc;
 };
 
 // ---------------------------------------------------------------------------
@@ -257,6 +259,9 @@ confucius4_tts_params confucius4_tts_default_params(void) {
 // Forward declarations for helpers used during loading
 static std::vector<float> s2a_read_f32(ggml_tensor* t);
 static ggml_tensor* s2a_find(const confucius4_s2a_model& s, const std::string& name);
+static bool bind_speaker_encoder(confucius4_tts_context* ctx,
+                                 const core_gguf::tensor_map& tensors);
+static bool compute_condition_embedding(confucius4_tts_context* ctx);
 // S2A stage-dump helpers (defined further down, next to the flow-matching code)
 static const char* s2a_dump_dir();
 static void s2a_dump_raw(const char* name, const void* data, size_t nbytes, const char* shape);
@@ -394,6 +399,8 @@ static bool load_t2s(confucius4_tts_context* ctx, const char* path) {
 
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "confucius4: T2S loaded %zu tensors OK\n", wl.tensors.size());
+
+    bind_speaker_encoder(ctx, wl.tensors);
 
     return true;
 }
@@ -662,6 +669,105 @@ int confucius4_tts_set_vocoder_path(confucius4_tts_context* ctx, const char* pat
     return 0;
 }
 
+// Bind the ECAPA speaker encoder from the T2S GGUF.  Names follow the upstream
+// module layout: blocks.0 is the initial TDNN, blocks.1..3 the SE-Res2Net
+// stack, then mfa / asp / fc.  Returns false if any tensor is missing, in which
+// case condition_emb stays unavailable and the prefix slot stays zero.
+static bool bind_speaker_encoder(confucius4_tts_context* ctx,
+                                 const core_gguf::tensor_map& tensors) {
+    auto& t2s = ctx->t2s;
+    auto find = [&](const std::string& n) -> ggml_tensor* {
+        auto it = tensors.find(n);
+        return it != tensors.end() ? it->second : nullptr;
+    };
+    auto bind_conv = [&](core_ecapa::tdnn_w& t, const std::string& base) {
+        t.w = find(base + ".weight");
+        t.b = find(base + ".bias");
+        return t.w != nullptr;
+    };
+
+    auto& m = t2s.spk_enc;
+    bool ok = bind_conv(m.blk0, "speaker_encoder.blocks.0.conv");
+    for (int bi = 1; bi <= 3; bi++) {
+        auto& blk = m.blk[bi - 1];
+        char base[128];
+        snprintf(base, sizeof(base), "speaker_encoder.blocks.%d", bi);
+        ok &= bind_conv(blk.tdnn1, std::string(base) + ".tdnn1.conv");
+        ok &= bind_conv(blk.tdnn2, std::string(base) + ".tdnn2.conv");
+        for (int r = 0; r < 7; r++) {
+            char rb[192];
+            snprintf(rb, sizeof(rb), "%s.res2net_block.blocks.%d.conv", base, r);
+            ok &= bind_conv(blk.res2net.blocks[r], rb);
+        }
+        blk.se.c1w = find(std::string(base) + ".se_block.conv1.weight");
+        blk.se.c1b = find(std::string(base) + ".se_block.conv1.bias");
+        blk.se.c2w = find(std::string(base) + ".se_block.conv2.weight");
+        blk.se.c2b = find(std::string(base) + ".se_block.conv2.bias");
+        ok &= blk.se.c1w && blk.se.c2w;
+    }
+    ok &= bind_conv(m.mfa, "speaker_encoder.mfa.conv");
+    ok &= bind_conv(m.asp.tdnn, "speaker_encoder.asp.tdnn.conv");
+    m.asp.conv_w = find("speaker_encoder.asp.conv.weight");
+    m.asp.conv_b = find("speaker_encoder.asp.conv.bias");
+    m.fc_w = find("speaker_encoder.fc.weight");
+    m.fc_b = find("speaker_encoder.fc.bias");
+    ok &= m.asp.conv_w && m.fc_w;
+
+    m.loaded = ok;
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "confucius4: speaker encoder (ECAPA): %s\n", ok ? "bound" : "MISSING TENSORS");
+    return ok;
+}
+
+// Run the ECAPA speaker encoder over the (n_frames, feat_dim) Wav2Vec2-BERT
+// features to produce the (model_dim,) condition embedding the GPT-2 prefix
+// wants.  This is what the reference's speaker_encoder(condition_vector) does.
+static bool compute_condition_embedding(confucius4_tts_context* ctx) {
+    auto& m = ctx->t2s.spk_enc;
+    if (!m.loaded || ctx->speaker_semantic_features.empty() || ctx->speaker_n_frames <= 0)
+        return false;
+
+    const int T = ctx->speaker_n_frames;
+    const int in_dim = (int)(ctx->speaker_semantic_features.size() / (size_t)T);
+    const int enc_dim = (int)m.fc_w->ne[2];
+
+    ggml_init_params ip = {(size_t)6 * 1024 * 1024, nullptr, true};
+    ggml_context* ctx0 = ggml_init(ip);
+    if (!ctx0)
+        return false;
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 8192, false);
+
+    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, in_dim, T);
+    ggml_set_name(x, "spk_in");
+    ggml_set_input(x);
+
+    ggml_tensor* out = core_ecapa::forward(ctx0, m, x);
+    ggml_set_name(out, "spk_emb");
+    ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+    bool ok = ga && ggml_gallocr_alloc_graph(ga, gf);
+    if (ok) {
+        // features arrive (T, in_dim) row-major, which IS ggml (in_dim, T)
+        ggml_backend_tensor_set(x, ctx->speaker_semantic_features.data(), 0,
+                                ctx->speaker_semantic_features.size() * sizeof(float));
+        ok = ggml_backend_graph_compute(ctx->backend, gf) == GGML_STATUS_SUCCESS;
+    }
+    if (ok) {
+        ctx->condition_embedding.resize(enc_dim);
+        ggml_backend_tensor_get(out, ctx->condition_embedding.data(), 0, (size_t)enc_dim * sizeof(float));
+        ctx->has_condition_emb = true;
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "confucius4: condition_emb computed from %d w2v-BERT frames (%d → %d)\n", T, in_dim,
+                    enc_dim);
+    }
+    if (ga)
+        ggml_gallocr_free(ga);
+    ggml_free(ctx0);
+    return ok;
+}
+
 int confucius4_tts_set_conditioning(confucius4_tts_context* ctx, const float* condition_embedding, int cond_dim,
                                     const float* style_embedding, int style_dim, const float* prompt_mel,
                                     int n_prompt_frames, int mel_dim) {
@@ -754,6 +860,10 @@ int confucius4_tts_set_speaker(confucius4_tts_context* ctx, const float* semanti
     ctx->speaker_n_frames = n_frames;
     ctx->speaker_style_embedding.assign(style_embedding, style_embedding + 192);
     ctx->has_speaker = true;
+
+    // Run the ECAPA encoder now: the weights are in the T2S GGUF, so the only
+    // external input needed is the w2v-BERT feature block just supplied.
+    compute_condition_embedding(ctx);
     return 0;
 }
 

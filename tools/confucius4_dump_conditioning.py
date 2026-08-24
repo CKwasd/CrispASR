@@ -7,9 +7,15 @@ Wav2Vec2-BERT (600M) and the ECAPA-TDNN speaker encoder just to prove the rest
 of the pipeline is not worth it, so this runs the reference encoders once and
 writes the three tensors the runtime needs:
 
-  condition_emb.bin    (model_dim,)            speaker_encoder(w2v_bert L17)
+  w2v_features.bin     (n_frames, 1024)        w2v-BERT layer 17, z-normalised
   style_embedding.bin  (spk_embed_dim,)        CAMPPlus
   prompt_mel.bin       (n_frames, n_mels)      reference mel
+
+The ECAPA speaker encoder is NOT run here: its weights already ship in the T2S
+GGUF and the runtime forwards them through core/ecapa_tdnn.h (the same graph
+qwen3-tts uses).  Only the w2v-BERT features are still external -- sidon.cpp
+has the conformer and the SeamlessM4T frontend, so folding that in later is a
+converter job plus a layer-17 hook rather than a new port.
 
 Point CRISPASR_CONFUCIUS4_COND_DIR at the output directory.
 
