@@ -512,8 +512,22 @@ int confucius4_tts_set_s2a_path(confucius4_tts_context* ctx, const char* path_s2
         hp.estimator_mel_dim = hp.output_size;
 
     s.loaded = true;
-    if (ctx->params.verbosity >= 1)
+    if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "confucius4: S2A loaded %zu tensors OK\n", s.tensors.size());
+        // Print first few estimator tensor names for debugging
+        int n_printed = 0;
+        for (const auto& kv : s.tensors) {
+            if (kv.first.find("estimator") != std::string::npos || kv.first.find("t_embedder") != std::string::npos ||
+                kv.first.find("time_mlp") != std::string::npos) {
+                fprintf(stderr, "confucius4:   S2A tensor: %s [%lld", kv.first.c_str(), (long long)kv.second->ne[0]);
+                for (int d = 1; d < ggml_n_dims(kv.second); d++)
+                    fprintf(stderr, ",%lld", (long long)kv.second->ne[d]);
+                fprintf(stderr, "]\n");
+                if (++n_printed >= 15)
+                    break;
+            }
+        }
+    }
     return 0;
 }
 
@@ -1094,10 +1108,13 @@ static std::vector<float> s2a_timestep_embed_cpu(const confucius4_s2a_model& s, 
     std::vector<float> sin_emb(freq_dim);
     s2a_sinusoidal_embed(t, sin_emb.data(), freq_dim);
 
-    auto mlp0_w = s2a_read_f32(s2a_find(s, prefix + ".time_mlp.0.weight"));
+    std::string n0 = prefix + ".time_mlp.0.weight";
+    auto mlp0_w = s2a_read_f32(s2a_find(s, n0));
     auto mlp0_b = s2a_read_f32(s2a_find(s, prefix + ".time_mlp.0.bias"));
-    if (mlp0_w.empty())
+    if (mlp0_w.empty()) {
+        fprintf(stderr, "confucius4: missing S2A tensor '%s'\n", n0.c_str());
         return {};
+    }
 
     std::vector<float> h(dim);
     s2a_linear(sin_emb.data(), mlp0_w.data(), mlp0_b.data(), h.data(), 1, freq_dim, dim);
