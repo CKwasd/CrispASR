@@ -29,6 +29,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -861,6 +862,21 @@ static void load_conditioning_from_env(confucius4_tts_context* ctx) {
     read_f32("condition_emb.bin", cond_emb);
     read_f32("style_embedding.bin", style);
     read_f32("prompt_mel.bin", pmel);
+
+    // Prefer computing condition_emb NATIVELY from the raw w2v-BERT features
+    // via the ggml ECAPA port (exercises + dumps the port so t2s_parity can
+    // check it). CRISPASR_CONFUCIUS4_COND_PYEMB=1 forces the pre-computed
+    // Python embedding instead.
+    std::vector<float> w2v;
+    const bool force_pyemb = std::getenv("CRISPASR_CONFUCIUS4_COND_PYEMB") != nullptr;
+    if (!force_pyemb && ctx->t2s.spk_enc.loaded && read_f32("w2v_features.bin", w2v) && w2v.size() >= 1024) {
+        ctx->speaker_semantic_features = w2v;
+        ctx->speaker_n_frames = (int)(w2v.size() / 1024);
+        if (compute_condition_embedding(ctx))
+            cond_emb.clear(); // native embedding wins; don't overwrite it below
+        else
+            fprintf(stderr, "confucius4: native ECAPA condition_emb failed; using condition_emb.bin\n");
+    }
 
     const int mel_dim = ctx->s2a.hp.estimator_mel_dim > 0 ? ctx->s2a.hp.estimator_mel_dim : 80;
     const int n_prompt = pmel.empty() ? 0 : (int)(pmel.size() / mel_dim);
@@ -2542,7 +2558,6 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
     if (!ctx || !text || !out_n_samples)
         return nullptr;
 
-    (void)lang;
     const int vb = ctx->params.verbosity;
 
     load_conditioning_from_env(ctx);
@@ -2566,9 +2581,64 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
     } else if (ctx->has_bpe_tokenizer) {
         // BPE tokenizer from GGUF vocab (tokenizer.ggml.tokens + merges)
         // Format: "You are a helpful assistant. {lang_token}:{text}"
-        const char* lang_token = "Please read the following English text";
-        if (lang && *lang) {
-            // TODO: map lang code to LANGUAGE_TOKEN_MAP string
+        // Reference LANGUAGE_TOKEN_MAP (confuciustts/utils/text_utils.py):
+        // the prompts are CHINESE for every language — the model was trained on
+        // these exact strings, an invented English prompt derails the T2S.
+        static const std::unordered_map<std::string, const char*> k_lang_token_map = {
+            {"zh", "请用中文朗读接下来的文字"},         {"ja", "请用日语朗读接下来的文字"},
+            {"ko", "请用韩语朗读接下来的文字"},         {"vi", "请用越南语朗读接下来的文字"},
+            {"th", "请用泰语朗读接下来的文字"},         {"id", "请用印尼语朗读接下来的文字"},
+            {"ms", "请用马来语朗读接下来的文字"},       {"tl", "请用菲律宾语朗读接下来的文字"},
+            {"my", "请用缅甸语朗读接下来的文字"},       {"km", "请用高棉语朗读接下来的文字"},
+            {"lo", "请用老挝语朗读接下来的文字"},       {"hi", "请用印地语朗读接下来的文字"},
+            {"bn", "请用孟加拉语朗读接下来的文字"},     {"ta", "请用泰米尔语朗读接下来的文字"},
+            {"te", "请用泰卢固语朗读接下来的文字"},     {"mr", "请用马拉地语朗读接下来的文字"},
+            {"gu", "请用古吉拉特语朗读接下来的文字"},   {"kn", "请用卡纳达语朗读接下来的文字"},
+            {"ml", "请用马拉雅拉姆语朗读接下来的文字"}, {"pa", "请用旁遮普语朗读接下来的文字"},
+            {"ur", "请用乌尔都语朗读接下来的文字"},     {"ne", "请用尼泊尔语朗读接下来的文字"},
+            {"si", "请用僧伽罗语朗读接下来的文字"},     {"en", "请用英文朗读接下来的文字"},
+            {"de", "请用德语朗读接下来的文字"},         {"nl", "请用荷兰语朗读接下来的文字"},
+            {"sv", "请用瑞典语朗读接下来的文字"},       {"da", "请用丹麦语朗读接下来的文字"},
+            {"no", "请用挪威语朗读接下来的文字"},       {"nb", "请用挪威语朗读接下来的文字"},
+            {"nn", "请用挪威语朗读接下来的文字"},       {"is", "请用冰岛语朗读接下来的文字"},
+            {"af", "请用南非荷兰语朗读接下来的文字"},   {"lb", "请用卢森堡语朗读接下来的文字"},
+            {"fy", "请用弗里斯兰语朗读接下来的文字"},   {"fr", "请用法语朗读接下来的文字"},
+            {"es", "请用西班牙语朗读接下来的文字"},     {"pt", "请用葡萄牙语朗读接下来的文字"},
+            {"it", "请用意大利语朗读接下来的文字"},     {"ro", "请用罗马尼亚语朗读接下来的文字"},
+            {"ca", "请用加泰罗尼亚语朗读接下来的文字"}, {"gl", "请用加利西亚语朗读接下来的文字"},
+            {"oc", "请用奥克语朗读接下来的文字"},       {"la", "请用拉丁语朗读接下来的文字"},
+            {"ru", "请用俄语朗读接下来的文字"},         {"uk", "请用乌克兰语朗读接下来的文字"},
+            {"pl", "请用波兰语朗读接下来的文字"},       {"cs", "请用捷克语朗读接下来的文字"},
+            {"sk", "请用斯洛伐克语朗读接下来的文字"},   {"bg", "请用保加利亚语朗读接下来的文字"},
+            {"sr", "请用塞尔维亚语朗读接下来的文字"},   {"hr", "请用克罗地亚语朗读接下来的文字"},
+            {"sl", "请用斯洛文尼亚语朗读接下来的文字"}, {"mk", "请用马其顿语朗读接下来的文字"},
+            {"bs", "请用波斯尼亚语朗读接下来的文字"},   {"be", "请用白俄罗斯语朗读接下来的文字"},
+            {"lt", "请用立陶宛语朗读接下来的文字"},     {"lv", "请用拉脱维亚语朗读接下来的文字"},
+            {"fi", "请用芬兰语朗读接下来的文字"},       {"et", "请用爱沙尼亚语朗读接下来的文字"},
+            {"hu", "请用匈牙利语朗读接下来的文字"},     {"ga", "请用爱尔兰语朗读接下来的文字"},
+            {"cy", "请用威尔士语朗读接下来的文字"},     {"gd", "请用苏格兰盖尔语朗读接下来的文字"},
+            {"br", "请用布列塔尼语朗读接下来的文字"},   {"el", "请用希腊语朗读接下来的文字"},
+            {"sq", "请用阿尔巴尼亚语朗读接下来的文字"}, {"eu", "请用巴斯克语朗读接下来的文字"},
+            {"mt", "请用马耳他语朗读接下来的文字"},     {"tr", "请用土耳其语朗读接下来的文字"},
+            {"az", "请用阿塞拜疆语朗读接下来的文字"},   {"kk", "请用哈萨克语朗读接下来的文字"},
+            {"uz", "请用乌兹别克语朗读接下来的文字"},   {"tk", "请用土库曼语朗读接下来的文字"},
+            {"ky", "请用吉尔吉斯语朗读接下来的文字"},   {"tt", "请用鞑靼语朗读接下来的文字"},
+            {"ar", "请用阿拉伯语朗读接下来的文字"},     {"he", "请用希伯来语朗读接下来的文字"},
+            {"am", "请用阿姆哈拉语朗读接下来的文字"},   {"fa", "请用波斯语朗读接下来的文字"},
+            {"ps", "请用普什图语朗读接下来的文字"},     {"ku", "请用库尔德语朗读接下来的文字"},
+            {"tg", "请用塔吉克语朗读接下来的文字"},     {"ka", "请用格鲁吉亚语朗读接下来的文字"},
+            {"hy", "请用亚美尼亚语朗读接下来的文字"},   {"sw", "请用斯瓦希里语朗读接下来的文字"},
+            {"yo", "请用约鲁巴语朗读接下来的文字"},     {"ha", "请用豪萨语朗读接下来的文字"},
+            {"ig", "请用伊博语朗读接下来的文字"},       {"zu", "请用祖鲁语朗读接下来的文字"},
+            {"xh", "请用科萨语朗读接下来的文字"},       {"mn", "请用蒙古语朗读接下来的文字"},
+            {"eo", "请用世界语朗读接下来的文字"},
+        };
+        std::string lang_token;
+        {
+            std::string lc = (lang && *lang) ? lang : "zh"; // reference CLI default
+            auto it = k_lang_token_map.find(lc);
+            // Reference fallback: f"请用{lang}朗读接下来的文字"
+            lang_token = it != k_lang_token_map.end() ? it->second : ("请用" + lc + "朗读接下来的文字");
         }
         std::string formatted = std::string("You are a helpful assistant. ") + lang_token + ":" + text;
         text_ids = core_bpe::tokenize_simple(ctx->bpe_token_to_id, ctx->bpe_merge_rank, formatted);
