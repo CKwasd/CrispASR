@@ -94,6 +94,8 @@ struct confucius4_t2s_model {
     std::vector<confucius4_t2s_layer> layers;
 
     // Final norm + semantic head
+    struct ggml_tensor* ln_f_w = nullptr; // GPT-2's own transformer.ln_f
+    struct ggml_tensor* ln_f_b = nullptr;
     struct ggml_tensor* final_norm_w = nullptr;
     struct ggml_tensor* final_norm_b = nullptr;
     struct ggml_tensor* semantic_head_w = nullptr; // [d, semantic_vocab]
@@ -380,13 +382,22 @@ static bool load_t2s(confucius4_tts_context* ctx, const char* path) {
         L.ffn_proj_b = tn("mlp.c_proj.bias");
     }
 
-    // Final norm + head
+    // Final norms + head. TWO LayerNorms stack at the top of the reference:
+    // GPT2Model's internal transformer.ln_f (its output is the lm_latent the
+    // S2A conditioning consumes), then the model's own final_norm feeding
+    // semantic_head. Skipping ln_f wrecks both the logits and the latents.
+    m.ln_f_w = find("transformer.ln_f.weight");
+    m.ln_f_b = find("transformer.ln_f.bias");
     m.final_norm_w = find("final_norm.weight");
     m.final_norm_b = find("final_norm.bias");
     m.semantic_head_w = find("semantic_head.weight");
     m.semantic_head_b = find("semantic_head.bias");
 
     // Verify critical tensors
+    if (!m.ln_f_w || !m.ln_f_b || !m.final_norm_w || !m.final_norm_b) {
+        fprintf(stderr, "confucius4: missing transformer.ln_f / final_norm tensors\n");
+        return false;
+    }
     if (!m.text_embed_w || !m.semantic_embed_w || !m.semantic_head_w) {
         fprintf(stderr, "confucius4: missing critical T2S tensors\n");
         return false;
@@ -468,14 +479,19 @@ static ggml_tensor* gpt2_forward(confucius4_tts_context* ctx, ggml_context* ctx0
         x = ggml_add(ctx0, x, ff);
     }
 
-    // Final LayerNorm → hidden state (LM latent for S2A conditioning)
+    // GPT-2's own final LayerNorm (transformer.ln_f). Its output is the
+    // reference's last_hidden_state — the LM latent the S2A conditioning uses.
     x = ggml_norm(ctx0, x, 1e-5f);
-    x = ggml_add(ctx0, ggml_mul(ctx0, x, m.final_norm_w), m.final_norm_b);
+    x = ggml_add(ctx0, ggml_mul(ctx0, x, m.ln_f_w), m.ln_f_b);
     ggml_set_name(x, "lm_hidden");
     ggml_set_output(x);
 
+    // Separate head norm: logits = semantic_head(final_norm(hidden))
+    ggml_tensor* hn = ggml_norm(ctx0, x, 1e-5f);
+    hn = ggml_add(ctx0, ggml_mul(ctx0, hn, m.final_norm_w), m.final_norm_b);
+
     // Semantic head: Linear(model_dim, semantic_vocab_size)
-    ggml_tensor* logits = ggml_mul_mat(ctx0, m.semantic_head_w, x);
+    ggml_tensor* logits = ggml_mul_mat(ctx0, m.semantic_head_w, hn);
     logits = ggml_add(ctx0, logits, m.semantic_head_b);
 
     return logits;
@@ -1319,8 +1335,27 @@ static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::v
     std::vector<int32_t> semantic_codes;
     int n_past = prefix_len;
 
+    // HF RepetitionPenaltyLogitsProcessor: every token already present in
+    // input_ids gets its logit divided by the penalty when positive, multiplied
+    // when negative — per UNIQUE token, applied BEFORE temperature/top-k/top-p.
+    // The reference generates with repetition_penalty=10.0, and its input_ids
+    // start as a BOS-filled block, so BOS is penalized from step 0.
+    float rep_pen = ctx->params.repetition_penalty;
+    if (const char* e = std::getenv("CRISPASR_CONFUCIUS4_REP_PEN"))
+        rep_pen = (float)atof(e);
+    std::vector<uint8_t> seen(hp.semantic_vocab_size, 0);
+    seen[hp.start_semantic_token] = 1;
+    auto apply_rep_penalty = [&](float* lg) {
+        if (rep_pen == 1.0f)
+            return;
+        for (int v = 0; v < hp.semantic_vocab_size; v++)
+            if (seen[v])
+                lg[v] = lg[v] > 0.0f ? lg[v] / rep_pen : lg[v] * rep_pen;
+    };
+
     for (int step = 0; step < max_new; step++) {
         // Sample from logits
+        apply_rep_penalty(logits.data());
         int token = sample_top_p(logits.data(), hp.semantic_vocab_size, ctx->params.temperature, ctx->params.top_p,
                                  ctx->params.top_k, rng);
 
@@ -1332,6 +1367,7 @@ static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::v
         }
 
         semantic_codes.push_back(token);
+        seen[token] = 1;
 
         // Embed the new token (semantic_embed + position)
         const int sem_pos = std::min(step + 1, hp.max_semantic_seq_lens - 1);
