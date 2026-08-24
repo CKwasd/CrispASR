@@ -1593,10 +1593,14 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
 
             // ne[0]=T, ne[1]=2*hidden. Split along ne[1]:
             int64_t stride1 = x_in_l->nb[1];
-            int esz = (int)ggml_element_size(x_in_l);
+            // x_in_l is time-first (T, 2*hidden): ne[0]=T, ne[1]=channel.  The
+            // split is along the CHANNEL axis, so the second half starts
+            // `hidden` ROWS in -- hidden * nb[1], not hidden * element_size.
+            // Using the element size offsets by `hidden` samples along TIME
+            // instead, which makes the sigmoid half overlap the tanh half.
             ggml_tensor* xa = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T, hidden, stride1, 0));
             ggml_tensor* xb =
-                ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T, hidden, stride1, (size_t)hidden * esz));
+                ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T, hidden, stride1, (size_t)hidden * stride1));
             // Reshape g_a/g_b from (hidden,) to (1, hidden) for time-first broadcast
             ggml_tensor* ga2 = ggml_reshape_2d(cache.gctx, g_a, 1, hidden);
             ggml_tensor* gb2 = ggml_reshape_2d(cache.gctx, g_b, 1, hidden);
@@ -1622,9 +1626,10 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
             if (il < n_wn_layers - 1 && rs_ch >= 2 * hidden) {
                 // rs_out is (T, rs_ch) time-first. Split: res=(T,hidden), skip=(T,hidden)
                 int64_t rs_stride = rs_out->nb[1];
+                // Same channel-axis split as above: offset by rows, not elements.
                 ggml_tensor* res = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, rs_out, T, hidden, rs_stride, 0));
-                ggml_tensor* skip =
-                    ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, rs_out, T, hidden, rs_stride, (size_t)hidden * esz));
+                ggml_tensor* skip = ggml_cont(
+                    cache.gctx, ggml_view_2d(cache.gctx, rs_out, T, hidden, rs_stride, (size_t)hidden * rs_stride));
                 x_wn = ggml_add(cache.gctx, x_wn, res);
                 wn_output = ggml_add(cache.gctx, wn_output, skip);
             } else {

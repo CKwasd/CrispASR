@@ -37,11 +37,18 @@ def load(d, name, shp, dtype=np.float32):
 
 
 def cmp(tag, mine, ref):
-    mine = np.asarray(mine, dtype=np.float64).ravel()
-    ref = np.asarray(ref, dtype=np.float64).ravel()
+    mine = np.asarray(mine, dtype=np.float64)
+    ref = np.asarray(ref, dtype=np.float64)
+    # Check shapes BEFORE ravel: after ravel every same-sized array matches, so
+    # the guard never fired and a transposed comparison read as cos ~ 0 with
+    # identical norms.  Norms are transpose-invariant -- that pattern means
+    # "same numbers, wrong order", i.e. a harness bug, not a divergence.
     if mine.shape != ref.shape:
-        print(f"{tag:22s} SHAPE MISMATCH mine={mine.shape} ref={ref.shape}")
+        print(f"{tag:22s} SHAPE MISMATCH mine={mine.shape} ref={ref.shape}"
+              f"  (|mine|={np.linalg.norm(mine):.4f} |ref|={np.linalg.norm(ref):.4f})")
         return
+    mine = mine.ravel()
+    ref = ref.ravel()
     nm, nr = np.linalg.norm(mine), np.linalg.norm(ref)
     cos = float(mine @ ref / (nm * nr + 1e-12))
     # magnitudes printed next to cosine: cosine is scale-blind
@@ -197,9 +204,11 @@ def main():
                 if k not in caught:
                     continue
                 r = caught[k][0].numpy()
-                # the runtime taps are (C, T); the reference blocks emit (T, C)
-                # except the wavenet, which is (C, T)
-                if k != "dbg_wn":
+                # Every runtime tap lands as (T, C) row-major: a ggml (C, T)
+                # tensor has ne[0]=C as its fast axis, so its memory IS (T, C).
+                # The reference DiT blocks emit (T, C) too -- only the WaveNet
+                # emits (C, T) and needs transposing.
+                if k == "dbg_wn":
                     r = r.T
                 cmp(f"  {k}", load(d, k, shp), r)
 
