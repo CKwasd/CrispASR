@@ -12,7 +12,7 @@
 
 #include "core/attention.h"
 #include "core/ecapa_tdnn.h"
-#include "core/bpe.h"
+#include "core/spm_bpe.h"
 #include "core/ggml_cpu_backend.h"
 #include "core/gpu_backend_pref.h"
 #include "core/gguf_loader.h"
@@ -2641,9 +2641,23 @@ float* confucius4_tts_synthesize(confucius4_tts_context* ctx, const char* text, 
             lang_token = it != k_lang_token_map.end() ? it->second : ("请用" + lc + "朗读接下来的文字");
         }
         std::string formatted = std::string("You are a helpful assistant. ") + lang_token + ":" + text;
-        text_ids = core_bpe::tokenize_simple(ctx->bpe_token_to_id, ctx->bpe_merge_rank, formatted);
+        // LlamaTokenizerFast recipe (checkpoints/tokenizer.json + config):
+        // Metaspace (replace ' '→▁, prepend ▁ with prepend_scheme="first"),
+        // SP-BPE merges with byte_fallback, then <s>...</s> because the
+        // tokenizer_config sets add_bos_token=True AND add_eos_token=True.
+        std::string processed = "\xe2\x96\x81"; // leading ▁
+        for (const char* p = formatted.c_str(); *p; p++)
+            processed += (*p == ' ') ? std::string("\xe2\x96\x81") : std::string(1, *p);
+        auto find_id = [&](const char* t, int32_t fallback) {
+            auto it = ctx->bpe_token_to_id.find(t);
+            return it != ctx->bpe_token_to_id.end() ? it->second : fallback;
+        };
+        text_ids.push_back(find_id("<s>", 1));
+        auto body = core_spm_bpe::bpe_merge(processed, ctx->bpe_token_to_id, ctx->bpe_merge_rank);
+        text_ids.insert(text_ids.end(), body.begin(), body.end());
+        text_ids.push_back(find_id("</s>", 2));
         if (vb >= 1)
-            fprintf(stderr, "confucius4: BPE tokenized '%s' → %zu tokens\n", text, text_ids.size());
+            fprintf(stderr, "confucius4: tokenized '%s' → %zu tokens (SP-BPE + bos/eos)\n", text, text_ids.size());
     } else {
         fprintf(stderr, "confucius4: no tokenizer. Set CRISPASR_CONFUCIUS4_TEXT_IDS=id1,id2,... "
                         "or bake vocab into the GGUF.\n");

@@ -104,6 +104,12 @@ tok = Tokenizer.from_file(tok_path)
 lang_token = LANGUAGE_TOKEN_MAP.get(LANG, f"请用{LANG}朗读接下来的文字")
 formatted = f"You are a helpful assistant. {lang_token}:{TEST_TEXT}"
 ids = tok.encode(formatted).ids
+# The raw tokenizers post_processor only prepends <s>, but the reference loads
+# AutoTokenizer -> LlamaTokenizerFast, whose add_eos_token=True (from
+# tokenizer_config.json) rebuilds the template to ALSO append </s> (id 2).
+# Verified: AutoTokenizer ids end [..., 28723, 2]; raw ids end [..., 28723].
+if ids and ids[-1] != 2:
+    ids = ids + [2]
 token_ids_str = ",".join(str(x) for x in ids)
 print(f"  lang_token : {lang_token!r}   <-- Chinese, per LANGUAGE_TOKEN_MAP")
 print(f"  formatted  : {formatted}")
