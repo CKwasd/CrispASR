@@ -69,6 +69,18 @@ s2a_path = hf_hub_download(
 )
 print(f"  S2A model: {s2a_path} ({os.path.getsize(s2a_path) / 1024**2:.0f} MB)")
 
+# Download BigVGAN vocoder (auto-discovered by CLI as sibling of S2A)
+try:
+    voc_path = hf_hub_download(
+        "cstr/confucius4-tts-GGUF",
+        "confucius4-tts-bigvgan-22k-f16.gguf",
+        local_dir=str(TEMP / "models"),
+        token=hf_token,
+    )
+    print(f"  BigVGAN vocoder: {voc_path} ({os.path.getsize(voc_path) / 1024**2:.0f} MB)")
+except Exception as e:
+    print(f"  BigVGAN vocoder: not available yet ({e})")
+
 # ── Phase 4: Download tokenizer ──────────────────────────────────────────────
 kh.step("download tokenizer")
 tok_path = hf_hub_download(
