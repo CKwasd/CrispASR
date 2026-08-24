@@ -40,7 +40,8 @@ struct confucius4_tts_params {
     float repetition_penalty; // T2S repetition penalty
     int max_semantic_tokens;  // max T2S generation length; 0 = default (1520)
     int ode_steps;            // S2A flow-matching ODE steps; 0 = default (25)
-    float cfg_rate;           // S2A classifier-free guidance rate; 0 = default (0.7)
+    float cfg_rate;           // S2A classifier-free guidance rate; 0 = default (0.7),
+                              // negative = disable CFG (single conditioned pass)
     uint64_t seed;            // RNG seed (0 = random)
 };
 

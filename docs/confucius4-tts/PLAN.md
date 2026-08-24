@@ -8,26 +8,78 @@
 
 ## NOW — active work
 
-**Status:** T2S decode loop WORKING (1520 semantic codes on Kaggle). S2A loader
-done, forward pending. GGUFs on HF (6 files, T2S + S2A, F16/Q8/Q4K).
+**Branch:** `feat/confucius4-cfg` (worktree `.claude/worktrees/feat-confucius4-cfg`)
+**Status:** four S2A/T2S correctness bugs found by re-reading the Python blueprint
+line-by-line; fixes written and compile-clean, end-to-end run pending (the VPS is
+heavily contended, the full build is queued).
 
-### Completed
-- Python blueprint (full inference flow traced)
-- GGUF converter + Kaggle kernel (T2S transposed Conv1D weights)
-- T2S model loader (378 tensors, Q4_K)
-- Text projector MLP (embed → fc1 → SiLU → fc2 + pos_emb, gallocr)
-- GPT-2 24L forward with KV cache (gallocr, sched gated behind env var)
-- Autoregressive decode loop (top-p/top-k, 1520 steps validated)
-- S2A model loader (274 tensors, hparams from GGUF)
-- CLI adapter, CMake, arch_backend_map
+### Bugs found and fixed on this branch
 
-### Blocking
-- S2A forward: DiT 13L (RoPE + AdaLN + U-Net skips) + WaveNet 8L + ODE solver
-- BigVGAN vocoder (external companion GGUF)
-- Speaker conditioning (ECAPA-TDNN on Wav2Vec2-BERT, currently zero)
-- SentencePiece tokenizer from companion file
+1. **Timestep embedding was wrong twice** (`s2a_sinusoidal_embed`) — the reference
+   `SinusPositionEmbedding.forward` applies `scale=1000` to `t` and concatenates
+   **cos then sin**; the port had no scale and sin-then-cos.  Measured against the
+   reference module: old cos **0.13–0.18** (essentially uncorrelated), and across
+   the 25 ODE steps the old embedding's min pairwise cosine was **0.972** — the
+   estimator was seeing an almost constant timestep signal, which by itself
+   prevents flow matching from working.  Fixed version is exact (cos 1.0000).
+   Unit check: `tools/…/tstep_unit.py` (scratch).
 
----
+2. **The length regulator was skipped entirely** (`s2a_build_conditioning`).  The
+   handover assumed `sampling_ratios=[1,1,1,1]` made it an identity, but the
+   ratios only control *how many* conv blocks exist — `InterpolateRegulator` is
+   `content_in_proj(1024→512)` → nearest-interpolate → 4×[Conv1d k=3 + GroupNorm(1)
+   + Mish] → Conv1d k=1, all of it learned and all of it present in the GGUF
+   (`length_regulator.*`, 274 tensors).  Also `encoder_proj` is Linear(2304,
+   **1024**), not 512, so the old code truncated its output to the first 512 dims
+   and fed that straight to `mu_projection`.  Now ported in full; verified against
+   torch's real module at **cos 1.0000000000** with f32 weights (max_abs_diff
+   8.6e-08) and cos 0.99898 through the Q4_K GGUF (pure quantization).
+   Legacy path kept behind `CRISPASR_CONFUCIUS4_LR_LEGACY=1`.
+
+3. **CFG implemented** (`s2a_flow_matching`) — second pass with mu, reference mel
+   and speaker embedding zeroed, blended `v = (1+cfg)·v_cond − cfg·v_uncond`,
+   matching `solve_euler`.  `cfg_rate` defaults to 0.7 and `ode_steps` to 25 (the
+   reference values); a **negative** `cfg_rate` disables CFG, so a zero-initialised
+   params struct still gets the reference default.  Env override
+   `CRISPASR_CONFUCIUS4_CFG_RATE` for A/B without recompiling.
+
+4. **The CLI forced greedy T2S decoding** — `crispasr_backend_confucius4_tts.cpp`
+   did `cp.temperature = p.temperature`, and `whisper_params.temperature` defaults
+   to **0.0**, overwriting the backend's reference default of 0.8.  The reference
+   runs `do_sample=True, temperature=0.8`.  This fits the earlier symptom of the
+   decode running to the 1520-token cap without ever emitting EOS.  Now only
+   overridden when the user actually passes a temperature.
+
+Also corrected: the S2A noise temperature was reusing `params.temperature` (the
+T2S *sampling* knob); the reference passes 1.0 to the CFM decoder.  Env override
+`CRISPASR_CONFUCIUS4_S2A_TEMP`.
+
+### Parity harness (new)
+
+`CRISPASR_CONFUCIUS4_DUMP_S2A=<dir>` dumps `semantic_codes`, `lm_latent`,
+`z_init`, `cond` and `mel` as raw f32/i32 with a `shapes.txt` manifest, so the
+real PyTorch S2A can be driven on **identical** inputs and noise and compared
+per stage (`s2a_parity.py`).  This is the acceptance gate for the ODE, alongside
+the TTS→ASR roundtrip.
+
+### Verified as already correct (read against the Python, no change needed)
+
+DiT attention (RoPE NORMAL/adjacent-pair, base 10000, scale 1/√head_dim), AdaLN
+weight/bias split order, FinalLayer's opposite shift/scale order, SwiGLU, U-Net
+skip emit/receive sets ({0..5} / {7..12}), `skip_linear(cat[x_res, x_mel])`,
+WaveNet res/skip halves and dilation=1/pad=2, InputEmbedding concat order
+(x, cond, mu_proj, spks), `T_mel = int(T_sem × 1.72)`, and the `lm_latent`
+alignment (the port collects one extra trailing row, which the conditioning
+correctly ignores).
+
+### Next
+
+- Finish the build, run end-to-end, dump the S2A stages and diff against the
+  Python reference; then the TTS→ASR roundtrip (HARD RULE #3).
+- Still open from the handover: speaker conditioning (w2v-BERT + CAMPPlus),
+  re-running the converter for the baked BPE vocab, and the BigVGAN perf work.
+- Note: `max_semantic_tokens` is treated as a *new-token* count, while the
+  reference's `max_length=1520` is the **total** sequence length.
 
 ## Architecture (read from Python, 2026-08-22)
 

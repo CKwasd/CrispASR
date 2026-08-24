@@ -23,7 +23,12 @@ public:
         cp.n_threads = p.n_threads;
         cp.verbosity = p.no_prints ? 0 : 1;
         cp.use_gpu = crispasr_backend_should_use_gpu(p);
-        cp.temperature = p.temperature;
+        // whisper_params.temperature defaults to 0.0 (greedy), which is the right
+        // default for ASR but not for this T2S stage -- the reference samples at
+        // 0.8 and a greedy decode degenerates into a repeat loop that runs to the
+        // 1520-token cap.  Only override the backend default when the user asked.
+        if (p.temperature > 0.0f)
+            cp.temperature = p.temperature;
         cp.seed = p.seed;
         if (p.tts_steps > 0)
             cp.ode_steps = p.tts_steps;

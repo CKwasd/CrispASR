@@ -236,8 +236,8 @@ confucius4_tts_params confucius4_tts_default_params(void) {
     p.top_k = 30;
     p.repetition_penalty = 10.0f;
     p.max_semantic_tokens = 0; // 0 = use hparams default (1520)
-    p.ode_steps = 0;           // 0 = default (25)
-    p.cfg_rate = 0.0f;         // 0 = default (0.7)
+    p.ode_steps = 25;          // S2A flow-matching ODE steps (reference default)
+    p.cfg_rate = 0.7f;         // S2A classifier-free guidance (reference default)
     p.seed = 0;
     return p;
 }
@@ -1231,12 +1231,22 @@ static void s2a_silu_inplace(float* x, int n) {
 }
 
 // Sinusoidal position embedding for a scalar timestep (SinusPositionEmbedding).
+// Reference: confuciustts/flow/DiT/modules.py
+//   half_dim = dim // 2
+//   emb = exp(arange(half_dim) * -(log(10000) / half_dim))
+//   emb = scale * t * emb                 with scale = 1000
+//   emb = cat((emb.cos(), emb.sin()), -1) -- cosine block FIRST
+// The scale=1000 matters: t runs over [0, 1], so without it every frequency
+// term collapses towards cos=1 / sin=0 and the ODE sees an almost constant
+// timestep signal.
 static void s2a_sinusoidal_embed(float t, float* out, int freq_dim) {
     const int half = freq_dim / 2;
+    const float scale = 1000.0f;
     for (int i = 0; i < half; i++) {
-        float freq = expf(-logf(10000.0f) * 2.0f * i / freq_dim);
-        out[i] = sinf(t * freq);
-        out[half + i] = cosf(t * freq);
+        float freq = expf(-logf(10000.0f) * (float)i / (float)half);
+        float arg = scale * t * freq;
+        out[i] = cosf(arg);
+        out[half + i] = sinf(arg);
     }
 }
 
@@ -1273,8 +1283,9 @@ static std::vector<float> s2a_timestep_embed_cpu(const confucius4_s2a_model& s, 
 //   cat(x, cond_ref, mu_proj, spks) → Linear → hidden
 // x: (T, mel_dim) row-major   cond_ref: (T, mel_dim) row-major (zeros if no ref)
 // mu: (T, cond_dim) row-major  — conditioning from s2a_build_conditioning
+// use_spk=false zeroes the speaker slice, for the unconditioned CFG pass.
 static std::vector<float> s2a_input_embed_cpu(confucius4_tts_context* ctx, const float* x, const float* cond_ref,
-                                              const float* mu, int T, int mel_dim) {
+                                              const float* mu, int T, int mel_dim, bool use_spk = true) {
     const auto& s = ctx->s2a;
     const int dim = s.hp.estimator_hidden_dim;
     const int cond_dim = dim; // mu_projection: Linear(cond_dim=dim, dim)
@@ -1296,7 +1307,7 @@ static std::vector<float> s2a_input_embed_cpu(confucius4_tts_context* ctx, const
         std::memcpy(row, x + (size_t)t * mel_dim, mel_dim * sizeof(float));
         std::memcpy(row + mel_dim, cond_ref + (size_t)t * mel_dim, mel_dim * sizeof(float));
         std::memcpy(row + mel_dim * 2, mu_proj.data() + (size_t)t * dim, dim * sizeof(float));
-        if (ctx->has_speaker && spk_dim > 0)
+        if (use_spk && ctx->has_speaker && spk_dim > 0)
             std::memcpy(row + mel_dim * 2 + dim, ctx->speaker_style_embedding.data(), spk_dim * sizeof(float));
     }
 
@@ -1709,7 +1720,8 @@ static std::vector<float> s2a_dit_run(confucius4_tts_context* ctx, const float* 
 // cond_ref: (T*mel_dim) row-major (reference mel, zeros if none).
 // Returns velocity (T*mel_dim) row-major.
 static std::vector<float> s2a_dit_forward(confucius4_tts_context* ctx, const float* x_flat, int T, int mel_dim,
-                                          const float* cond, const float* cond_ref, float timestep) {
+                                          const float* cond, const float* cond_ref, float timestep,
+                                          bool use_spk = true) {
     const auto& s = ctx->s2a;
     const int dim = s.hp.estimator_hidden_dim;
 
@@ -1724,7 +1736,7 @@ static std::vector<float> s2a_dit_forward(confucius4_tts_context* ctx, const flo
         t2 = t1; // fallback: share t1 if t2 MLP not found
 
     // Input embedding: cat(x, cond_ref, mu_proj(cond), spks) → proj (CPU)
-    auto hidden = s2a_input_embed_cpu(ctx, x_flat, cond_ref, cond, T, mel_dim);
+    auto hidden = s2a_input_embed_cpu(ctx, x_flat, cond_ref, cond, T, mel_dim, use_spk);
     if (hidden.empty()) {
         fprintf(stderr, "confucius4: input embedding failed\n");
         return {};
@@ -1732,6 +1744,112 @@ static std::vector<float> s2a_dit_forward(confucius4_tts_context* ctx, const flo
 
     // Full ggml graph: DiT blocks + WaveNet + final_layer + conv2 → velocity
     return s2a_dit_run(ctx, hidden.data(), t1.data(), t2.data(), x_flat, T, mel_dim);
+}
+
+// ---------------------------------------------------------------------------
+// S2A: InterpolateRegulator (length regulator)
+// ---------------------------------------------------------------------------
+// Python reference: confuciustts/flow/length_regulator.py
+//   content_in_proj: Linear(in_channels=1024, channels=512)
+//   F.interpolate(x.transpose(1,2), size=target_len, mode="nearest")
+//   model = 4 x [Conv1d(512,512,k=3,pad=1), GroupNorm(1,512), Mish]
+//           + Conv1d(512, out_channels=512, k=1)
+// Weights are named length_regulator.model.{0,3,6,9} (conv k=3),
+// {1,4,7,10} (GroupNorm) and 12 (conv k=1); the Mish layers carry no weights.
+
+// Mish activation: x * tanh(softplus(x)).
+static void s2a_mish_inplace(float* x, int n) {
+    for (int i = 0; i < n; i++) {
+        // softplus with the usual large-input guard so exp() cannot overflow
+        const float v = x[i];
+        const float sp = v > 20.0f ? v : logf(1.0f + expf(v));
+        x[i] = v * tanhf(sp);
+    }
+}
+
+// GroupNorm with num_groups == 1 over a (C, T) channel-first buffer: the mean
+// and variance are taken jointly over every channel AND every time step, then
+// a per-channel affine is applied.  Matches torch nn.GroupNorm(1, C).
+static void s2a_group_norm1_ct(float* x, const float* weight, const float* bias, int C, int T, float eps = 1e-5f) {
+    const size_t n = (size_t)C * T;
+    double sum = 0.0, sum_sq = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        sum += x[i];
+        sum_sq += (double)x[i] * x[i];
+    }
+    const float mean = (float)(sum / (double)n);
+    const float var = (float)(sum_sq / (double)n - (double)mean * mean);
+    const float inv = 1.0f / sqrtf(var + eps);
+    for (int c = 0; c < C; c++) {
+        const float w = weight ? weight[c] : 1.0f;
+        const float b = bias ? bias[c] : 0.0f;
+        float* row = x + (size_t)c * T;
+        for (int t = 0; t < T; t++)
+            row[t] = (row[t] - mean) * inv * w + b;
+    }
+}
+
+// Conv1d over a channel-first (C_in, T) buffer with symmetric zero padding.
+// `w` is the torch weight (C_out, C_in, K) in row-major order, so the flat
+// index of tap k of input channel ci for output channel co is
+// co*(C_in*K) + ci*K + k.  Output is (C_out, T) — stride 1, padding K/2.
+static void s2a_conv1d_ct(const float* x, const float* w, const float* bias, float* y, int C_in, int C_out, int T,
+                          int K) {
+    const int pad = K / 2;
+    for (int co = 0; co < C_out; co++) {
+        float* yr = y + (size_t)co * T;
+        const float b = bias ? bias[co] : 0.0f;
+        for (int t = 0; t < T; t++)
+            yr[t] = b;
+        for (int ci = 0; ci < C_in; ci++) {
+            const float* xr = x + (size_t)ci * T;
+            const float* wr = w + (size_t)co * C_in * K + (size_t)ci * K;
+            for (int k = 0; k < K; k++) {
+                const float wk = wr[k];
+                if (wk == 0.0f)
+                    continue;
+                // output t reads input (t + k - pad)
+                const int lo = std::max(0, pad - k);
+                const int hi = std::min(T, T + pad - k);
+                for (int t = lo; t < hi; t++)
+                    yr[t] += xr[t + k - pad] * wk;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S2A stage dump (parity harness) — gated by CRISPASR_CONFUCIUS4_DUMP_S2A=<dir>
+// ---------------------------------------------------------------------------
+// Writes raw little-endian buffers plus a shapes.txt manifest so the Python
+// reference (confuciustts/flow) can be driven on exactly the same inputs and
+// the per-stage outputs compared.  Off unless the env var is set.
+
+static const char* s2a_dump_dir() {
+    const char* d = std::getenv("CRISPASR_CONFUCIUS4_DUMP_S2A");
+    return (d && *d) ? d : nullptr;
+}
+
+static void s2a_dump_raw(const char* name, const void* data, size_t nbytes, const char* shape) {
+    const char* dir = s2a_dump_dir();
+    if (!dir)
+        return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "confucius4: cannot write dump '%s'\n", path);
+        return;
+    }
+    fwrite(data, 1, nbytes, f);
+    fclose(f);
+
+    snprintf(path, sizeof(path), "%s/shapes.txt", dir);
+    if (FILE* m = fopen(path, "a")) {
+        fprintf(m, "%s\t%s\n", name, shape);
+        fclose(m);
+    }
+    fprintf(stderr, "confucius4: dumped %s %s\n", name, shape);
 }
 
 // ---------------------------------------------------------------------------
@@ -1751,7 +1869,12 @@ static std::vector<float> s2a_build_conditioning(confucius4_tts_context* ctx,
     const int sem_emb_dim = hp.semantic_embed_dim; // 1024
     const int lm_dim = hp.lm_latent_dim;           // 1280
     const int lr_in = sem_emb_dim + lm_dim;        // 2304
-    const int lr_out = hp.input_size;              // 512
+    const int lr_out = hp.input_size;              // 512 — DiT mu dimension
+
+    // encoder_proj is Linear(2304, lr_in_channels); lr_in_channels is 1024 in the
+    // reference config, NOT input_size.  Read it off the weight so a re-converted
+    // GGUF with different dims still works.
+    const int enc_out = s.encoder_proj_w ? (int)s.encoder_proj_w->ne[1] : lr_out;
 
     if (vb >= 1)
         fprintf(stderr, "confucius4: S2A conditioning: T_sem=%d, T_mel=%d\n", T_sem, T_mel);
@@ -1792,27 +1915,107 @@ static std::vector<float> s2a_build_conditioning(confucius4_tts_context* ctx,
     if (vb >= 1)
         fprintf(stderr, "confucius4: S2A conditioning: LM latent %s\n", have_lm ? "OK" : "zeros (not available)");
 
-    // Step 3: project → (T_sem, lr_out=512)
-    auto enc_w = s2a_read_f32(s.encoder_proj_w); // (lr_out, lr_in)
-    auto enc_b = s2a_read_f32(s.encoder_proj_b); // (lr_out,)
-    std::vector<float> projected((size_t)T_sem * lr_out);
-    s2a_linear(concat_in.data(), enc_w.data(), enc_b.data(), projected.data(), T_sem, lr_in, lr_out);
+    // Step 3: project → (T_sem, enc_out=1024)
+    auto enc_w = s2a_read_f32(s.encoder_proj_w); // (enc_out, lr_in)
+    auto enc_b = s2a_read_f32(s.encoder_proj_b); // (enc_out,)
+    std::vector<float> projected((size_t)T_sem * enc_out);
+    s2a_linear(concat_in.data(), enc_w.data(), enc_b.data(), projected.data(), T_sem, lr_in, enc_out);
 
-    // Step 4: length regulate → (T_mel, lr_out) via simple linear interpolation
-    // The real length regulator uses learned conv upsampling, but interpolation
-    // gives the right shape for now.
-    std::vector<float> cond((size_t)T_mel * lr_out, 0.0f);
-    for (int t = 0; t < T_mel; t++) {
-        float src = (float)t * T_sem / T_mel;
-        int s0 = std::min((int)src, T_sem - 1);
-        int s1 = std::min(s0 + 1, T_sem - 1);
-        float frac = src - s0;
-        for (int d = 0; d < lr_out; d++)
-            cond[t * lr_out + d] = (1.0f - frac) * projected[s0 * lr_out + d] + frac * projected[s1 * lr_out + d];
+    // Step 4: length regulator.  The legacy path (linear interpolation of the
+    // encoder_proj output, no learned convolutions) is kept behind an env gate
+    // for A/B; the default now runs the real InterpolateRegulator.
+    const char* env_legacy = std::getenv("CRISPASR_CONFUCIUS4_LR_LEGACY");
+    const bool legacy_lr = env_legacy && *env_legacy && *env_legacy != '0';
+
+    if (legacy_lr) {
+        std::vector<float> cond((size_t)T_mel * lr_out, 0.0f);
+        for (int t = 0; t < T_mel; t++) {
+            float src = (float)t * T_sem / T_mel;
+            int s0 = std::min((int)src, T_sem - 1);
+            int s1 = std::min(s0 + 1, T_sem - 1);
+            float frac = src - s0;
+            for (int d = 0; d < lr_out; d++)
+                cond[t * lr_out + d] = (1.0f - frac) * projected[s0 * enc_out + d] + frac * projected[s1 * enc_out + d];
+        }
+        if (vb >= 1)
+            fprintf(stderr, "confucius4: S2A conditioning: legacy linear-interp regulator\n");
+        return cond;
     }
 
+    // 4a. content_in_proj: Linear(enc_out=1024, channels=512) → (T_sem, ch)
+    auto cip_w = s2a_read_f32(s2a_find(s, "length_regulator.content_in_proj.weight"));
+    auto cip_b = s2a_read_f32(s2a_find(s, "length_regulator.content_in_proj.bias"));
+    if (cip_w.empty()) {
+        fprintf(stderr, "confucius4: missing length_regulator.content_in_proj.weight\n");
+        return {};
+    }
+    const int ch = (int)(cip_w.size() / (size_t)enc_out); // 512
+    std::vector<float> content((size_t)T_sem * ch);
+    s2a_linear(projected.data(), cip_w.data(), cip_b.data(), content.data(), T_sem, enc_out, ch);
+
+    // 4b. F.interpolate(..., size=T_mel, mode="nearest") on the channel-first
+    //     view.  torch maps output index i to input floor(i * T_sem / T_mel).
+    //     `h` is (ch, T_mel) channel-first, which is what the convolutions want.
+    std::vector<float> h((size_t)ch * T_mel);
+    for (int t = 0; t < T_mel; t++) {
+        int src = (int)((float)t * (float)T_sem / (float)T_mel);
+        src = std::min(std::max(src, 0), T_sem - 1);
+        for (int c = 0; c < ch; c++)
+            h[(size_t)c * T_mel + t] = content[(size_t)src * ch + c];
+    }
+
+    // 4c. model = 4 x [Conv1d(ch, ch, k=3, pad=1) → GroupNorm(1, ch) → Mish],
+    //     then Conv1d(ch, lr_out, k=1).  Weight indices are fixed by the
+    //     nn.Sequential layout (Mish carries no parameters).
+    const int conv_idx[4] = {0, 3, 6, 9};
+    const int gn_idx[4] = {1, 4, 7, 10};
+    std::vector<float> tmp((size_t)ch * T_mel);
+    for (int b = 0; b < 4; b++) {
+        char nm[128];
+        snprintf(nm, sizeof(nm), "length_regulator.model.%d.weight", conv_idx[b]);
+        auto cw = s2a_read_f32(s2a_find(s, nm));
+        snprintf(nm, sizeof(nm), "length_regulator.model.%d.bias", conv_idx[b]);
+        auto cb = s2a_read_f32(s2a_find(s, nm));
+        if (cw.empty()) {
+            fprintf(stderr, "confucius4: missing length_regulator.model.%d.weight\n", conv_idx[b]);
+            return {};
+        }
+        s2a_conv1d_ct(h.data(), cw.data(), cb.empty() ? nullptr : cb.data(), tmp.data(), ch, ch, T_mel, 3);
+        h.swap(tmp);
+
+        snprintf(nm, sizeof(nm), "length_regulator.model.%d.weight", gn_idx[b]);
+        auto gw = s2a_read_f32(s2a_find(s, nm));
+        snprintf(nm, sizeof(nm), "length_regulator.model.%d.bias", gn_idx[b]);
+        auto gb = s2a_read_f32(s2a_find(s, nm));
+        s2a_group_norm1_ct(h.data(), gw.empty() ? nullptr : gw.data(), gb.empty() ? nullptr : gb.data(), ch, T_mel);
+
+        s2a_mish_inplace(h.data(), (int)h.size());
+    }
+
+    auto ow = s2a_read_f32(s2a_find(s, "length_regulator.model.12.weight"));
+    auto ob = s2a_read_f32(s2a_find(s, "length_regulator.model.12.bias"));
+    if (ow.empty()) {
+        fprintf(stderr, "confucius4: missing length_regulator.model.12.weight\n");
+        return {};
+    }
+    std::vector<float> out_ct((size_t)lr_out * T_mel);
+    s2a_conv1d_ct(h.data(), ow.data(), ob.empty() ? nullptr : ob.data(), out_ct.data(), ch, lr_out, T_mel, 1);
+
+    // Back to (T_mel, lr_out) row-major — the layout s2a_input_embed_cpu wants.
+    std::vector<float> cond((size_t)T_mel * lr_out);
+    for (int t = 0; t < T_mel; t++)
+        for (int d = 0; d < lr_out; d++)
+            cond[(size_t)t * lr_out + d] = out_ct[(size_t)d * T_mel + t];
+
     if (vb >= 1)
-        fprintf(stderr, "confucius4: S2A conditioning: embed+project+interpolate OK\n");
+        fprintf(stderr, "confucius4: S2A conditioning: embed+project+regulator OK (%d→%d→%d dims)\n", lr_in, enc_out,
+                lr_out);
+
+    if (s2a_dump_dir()) {
+        char shp[64];
+        snprintf(shp, sizeof(shp), "%d,%d", T_mel, lr_out);
+        s2a_dump_raw("cond", cond.data(), cond.size() * sizeof(float), shp);
+    }
 
     return cond;
 }
@@ -1829,9 +2032,27 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
     const int vb = ctx->params.verbosity;
     const int n_steps = ctx->params.ode_steps > 0 ? ctx->params.ode_steps : 25;
 
+    // Classifier-free guidance rate.  A zero-initialised params struct must still
+    // get the reference default (0.7), so 0 means "unset"; pass a negative rate
+    // (or CRISPASR_CONFUCIUS4_CFG_RATE=0) to turn CFG off explicitly.
+    float cfg_rate = ctx->params.cfg_rate > 0.0f ? ctx->params.cfg_rate : (ctx->params.cfg_rate < 0.0f ? 0.0f : 0.7f);
+    if (const char* env_cfg = std::getenv("CRISPASR_CONFUCIUS4_CFG_RATE"))
+        if (*env_cfg)
+            cfg_rate = strtof(env_cfg, nullptr);
+
     if (vb >= 1)
-        fprintf(stderr, "confucius4: S2A flow-matching: T_sem=%d → T_mel=%d, mel_dim=%d, %d ODE steps\n", T_sem, T_mel,
-                mel_dim, n_steps);
+        fprintf(stderr, "confucius4: S2A flow-matching: T_sem=%d → T_mel=%d, mel_dim=%d, %d ODE steps, cfg=%.2f\n",
+                T_sem, T_mel, mel_dim, n_steps, cfg_rate);
+
+    if (s2a_dump_dir()) {
+        char shp[64];
+        snprintf(shp, sizeof(shp), "%d", T_sem);
+        s2a_dump_raw("semantic_codes_i32", semantic_codes.data(), semantic_codes.size() * sizeof(int32_t), shp);
+        if (!lm_latent.empty()) {
+            snprintf(shp, sizeof(shp), "%d,%d", (int)(lm_latent.size() / hp.lm_latent_dim), hp.lm_latent_dim);
+            s2a_dump_raw("lm_latent", lm_latent.data(), lm_latent.size() * sizeof(float), shp);
+        }
+    }
 
     // Build semantic conditioning → (T_mel, cond_dim=512) row-major
     std::vector<float> cond = s2a_build_conditioning(ctx, semantic_codes, T_mel, lm_latent);
@@ -1841,13 +2062,34 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
     // Initialize noise: z ~ N(0, 1) of shape (T_mel, mel_dim) row-major
     std::mt19937 rng(ctx->params.seed ? ctx->params.seed : 42);
     std::normal_distribution<float> dist(0.0f, 1.0f);
-    const float temperature = ctx->params.temperature > 0.0f ? ctx->params.temperature : 1.0f;
+    // MaskedDiffWithXvec.inference passes temperature=1.0 to the CFM decoder.
+    // params.temperature is the T2S *sampling* temperature, a different knob.
+    float temperature = 1.0f;
+    if (const char* env_t = std::getenv("CRISPASR_CONFUCIUS4_S2A_TEMP"))
+        if (*env_t)
+            temperature = strtof(env_t, nullptr);
     std::vector<float> z((size_t)T_mel * mel_dim);
     for (auto& v : z)
         v = dist(rng) * temperature;
 
+    if (s2a_dump_dir()) {
+        char shp[64];
+        snprintf(shp, sizeof(shp), "%d,%d", T_mel, mel_dim);
+        s2a_dump_raw("z_init", z.data(), z.size() * sizeof(float), shp);
+    }
+
     // Reference mel conditioning (zeros — no speaker prompt)
     std::vector<float> cond_ref((size_t)T_mel * mel_dim, 0.0f);
+
+    // Zeroed conditioning for the unconditioned CFG pass.  cond_ref is already
+    // zero while there is no reference mel, but keep the two distinct so the
+    // unconditioned pass stays correct once a speaker prompt is wired in.
+    std::vector<float> cond_zeros;
+    std::vector<float> cond_ref_zeros;
+    if (cfg_rate > 0.0f) {
+        cond_zeros.assign(cond.size(), 0.0f);
+        cond_ref_zeros.assign(cond_ref.size(), 0.0f);
+    }
 
     // Cosine time schedule: t_span[i] = 1 - cos(i/(n_steps) * pi/2)
     std::vector<float> t_span(n_steps + 1);
@@ -1859,10 +2101,26 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
         float dt = t_span[step] - t_span[step - 1];
         float t = t_span[step - 1];
 
+        // Conditioned pass.
         auto velocity = s2a_dit_forward(ctx, z.data(), T_mel, mel_dim, cond.data(), cond_ref.data(), t);
         if (velocity.empty()) {
             fprintf(stderr, "confucius4: DiT forward failed at step %d\n", step);
             return {};
+        }
+
+        // Classifier-free guidance: a second pass with mu, the reference mel and
+        // the speaker embedding all zeroed, blended as
+        //   v = (1 + cfg) * v_cond - cfg * v_uncond
+        // (confuciustts/flow/flow_matching.py, solve_euler).
+        if (cfg_rate > 0.0f) {
+            auto v_uncond = s2a_dit_forward(ctx, z.data(), T_mel, mel_dim, cond_zeros.data(), cond_ref_zeros.data(), t,
+                                            /*use_spk=*/false);
+            if (v_uncond.empty()) {
+                fprintf(stderr, "confucius4: DiT uncond forward failed at step %d\n", step);
+                return {};
+            }
+            for (size_t i = 0; i < velocity.size(); i++)
+                velocity[i] = (1.0f + cfg_rate) * velocity[i] - cfg_rate * v_uncond[i];
         }
 
         for (size_t i = 0; i < z.size(); i++)
@@ -1879,6 +2137,12 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
 
     if (vb >= 1)
         fprintf(stderr, "confucius4: S2A flow-matching done (%d steps, mel_dim=%d)\n", n_steps, mel_dim);
+
+    if (s2a_dump_dir()) {
+        char shp[64];
+        snprintf(shp, sizeof(shp), "%d,%d", T_mel, mel_dim);
+        s2a_dump_raw("mel", z.data(), z.size() * sizeof(float), shp);
+    }
 
     return z; // (T_mel * mel_dim) row-major
 }
