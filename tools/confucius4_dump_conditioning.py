@@ -140,7 +140,7 @@ def main():
     print(f"condition_emb   : {tuple(cond_emb.shape)}")
 
     for name, arr in (("condition_emb", cond_emb), ("style_embedding", style),
-                      ("prompt_mel", prompt_mel)):
+                      ("prompt_mel", prompt_mel), ("w2v_features", feats[0])):
         p = os.path.join(a.out_dir, name + ".bin")
         np.ascontiguousarray(arr.numpy(), dtype=np.float32).tofile(p)
         print(f"wrote {p}  {np.prod(arr.shape)} floats")

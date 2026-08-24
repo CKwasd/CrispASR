@@ -259,8 +259,7 @@ confucius4_tts_params confucius4_tts_default_params(void) {
 // Forward declarations for helpers used during loading
 static std::vector<float> s2a_read_f32(ggml_tensor* t);
 static ggml_tensor* s2a_find(const confucius4_s2a_model& s, const std::string& name);
-static bool bind_speaker_encoder(confucius4_tts_context* ctx,
-                                 const core_gguf::tensor_map& tensors);
+static bool bind_speaker_encoder(confucius4_tts_context* ctx, const core_gguf::tensor_map& tensors);
 static bool compute_condition_embedding(confucius4_tts_context* ctx);
 // S2A stage-dump helpers (defined further down, next to the flow-matching code)
 static const char* s2a_dump_dir();
@@ -673,8 +672,7 @@ int confucius4_tts_set_vocoder_path(confucius4_tts_context* ctx, const char* pat
 // module layout: blocks.0 is the initial TDNN, blocks.1..3 the SE-Res2Net
 // stack, then mfa / asp / fc.  Returns false if any tensor is missing, in which
 // case condition_emb stays unavailable and the prefix slot stays zero.
-static bool bind_speaker_encoder(confucius4_tts_context* ctx,
-                                 const core_gguf::tensor_map& tensors) {
+static bool bind_speaker_encoder(confucius4_tts_context* ctx, const core_gguf::tensor_map& tensors) {
     auto& t2s = ctx->t2s;
     auto find = [&](const std::string& n) -> ggml_tensor* {
         auto it = tensors.find(n);
@@ -758,6 +756,11 @@ static bool compute_condition_embedding(confucius4_tts_context* ctx) {
         ctx->condition_embedding.resize(enc_dim);
         ggml_backend_tensor_get(out, ctx->condition_embedding.data(), 0, (size_t)enc_dim * sizeof(float));
         ctx->has_condition_emb = true;
+        if (s2a_dump_dir()) {
+            char shp[32];
+            snprintf(shp, sizeof(shp), "%d", enc_dim);
+            s2a_dump_raw("condition_emb", ctx->condition_embedding.data(), (size_t)enc_dim * sizeof(float), shp);
+        }
         if (ctx->params.verbosity >= 1)
             fprintf(stderr, "confucius4: condition_emb computed from %d w2v-BERT frames (%d → %d)\n", T, in_dim,
                     enc_dim);
@@ -1303,6 +1306,14 @@ static std::vector<int32_t> t2s_decode(confucius4_tts_context* ctx, const std::v
     if (vb >= 1)
         fprintf(stderr, "confucius4: prefill done, logits[0..3] = %.3f %.3f %.3f %.3f\n", logits[0], logits[1],
                 logits[2], logits[3]);
+
+    if (s2a_dump_dir()) {
+        char shp[64];
+        snprintf(shp, sizeof(shp), "%d", (int)text_token_ids.size());
+        s2a_dump_raw("text_ids_i32", text_token_ids.data(), text_token_ids.size() * sizeof(int32_t), shp);
+        snprintf(shp, sizeof(shp), "%d", (int)logits.size());
+        s2a_dump_raw("prefill_logits", logits.data(), logits.size() * sizeof(float), shp);
+    }
 
     // ── Step 3: Autoregressive decode ──
     std::vector<int32_t> semantic_codes;

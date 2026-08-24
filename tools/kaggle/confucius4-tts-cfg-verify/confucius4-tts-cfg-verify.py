@@ -173,6 +173,7 @@ prompt_wav = REPO / "samples" / "jfk.wav"
 w2v_stats = None
 
 cond_runs = {}
+t2s_ckpt = None
 for arm in ("s2a-only", "full"):
     cdir = TEMP / f"cond_{arm}"
     cmd = [sys.executable, str(dumper), "--ref-repo", str(REF),
@@ -242,6 +243,30 @@ for tag in ("q4_k", "f16"):
             print("  " + line.rstrip())
     if pres.returncode != 0:
         for line in [l for l in pres.stderr.split("\n") if l.strip()][-25:]:
+            print("  ! " + line.strip())
+
+
+# ── Phase 7b: T2S parity ────────────────────────────────────────────────────
+# S2A is exact yet the reference S2A babbles on these codes, so the codes are
+# wrong and the bug is upstream.  This is the stage the harness never covered.
+kh.step("T2S parity vs PyTorch reference")
+t2s_parity = REPO / "tools" / "t2s_parity.py"
+_full = TEMP / "dump_cond_full"
+_w2v = TEMP / "cond_full" / "w2v_features.bin"
+if not (t2s_parity.exists() and (_full / "shapes.txt").exists() and _w2v.exists()):
+    print("  SKIP: needs the full-conditioning run (dump + w2v features)")
+else:
+    tres = subprocess.run(
+        [sys.executable, str(t2s_parity), "--dump-dir", str(_full), "--ref-repo", str(REF),
+         "--t2s-ckpt", t2s_ckpt, "--w2v-features", str(_w2v)],
+        capture_output=True, text=True, timeout=7200,
+    )
+    print(f"  t2s parity rc={tres.returncode}")
+    for line in tres.stdout.split("\n"):
+        if line.strip():
+            print("  " + line.rstrip())
+    if tres.returncode != 0:
+        for line in [l for l in tres.stderr.split("\n") if l.strip()][-25:]:
             print("  ! " + line.strip())
 
 

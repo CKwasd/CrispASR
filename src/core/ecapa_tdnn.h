@@ -54,10 +54,10 @@ struct asp_w {
 };
 
 struct model {
-    tdnn_w blk0;          // initial TDNN, k=5, d=1
-    se_res2net_w blk[3];  // SE-Res2Net, d = 2/3/4
-    tdnn_w mfa;           // multi-layer feature aggregation, k=1
-    asp_w asp;            // attentive-statistics pooling
+    tdnn_w blk0;         // initial TDNN, k=5, d=1
+    se_res2net_w blk[3]; // SE-Res2Net, d = 2/3/4
+    tdnn_w mfa;          // multi-layer feature aggregation, k=1
+    asp_w asp;           // attentive-statistics pooling
     ggml_tensor* fc_w = nullptr;
     ggml_tensor* fc_b = nullptr; // 2C → enc_dim
     bool loaded = false;
@@ -83,9 +83,9 @@ inline ggml_tensor* tdnn_block(ggml_context* ctx, ggml_tensor* x, const tdnn_w& 
 
 inline ggml_tensor* se_block(ggml_context* ctx, ggml_tensor* x, const se_w& se) {
     const int T = (int)x->ne[1];
-    ggml_tensor* m = ggml_cont(
-        ctx, ggml_transpose(ctx, ggml_scale(ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, x))),
-                                            1.0f / T))); // [C, 1]
+    ggml_tensor* m =
+        ggml_cont(ctx, ggml_transpose(ctx, ggml_scale(ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, x))),
+                                                      1.0f / T))); // [C, 1]
     auto w1 = ggml_reshape_2d(ctx, se.c1w, se.c1w->ne[1], se.c1w->ne[2]);
     ggml_tensor* h = ggml_relu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, w1, m), se.c1b));
     auto w2 = ggml_reshape_2d(ctx, se.c2w, se.c2w->ne[1], se.c2w->ne[2]);
@@ -129,8 +129,8 @@ inline ggml_tensor* asp_block(ggml_context* ctx, ggml_tensor* x, const asp_w& as
     ggml_tensor* mC1 = ggml_cont(ctx, ggml_transpose(ctx, m1C));
     ggml_tensor* mCT = ggml_repeat(ctx, mC1, x);
     ggml_tensor* d2 = ggml_mul(ctx, ggml_sub(ctx, x, mCT), ggml_sub(ctx, x, mCT));
-    ggml_tensor* s1C = ggml_sqrt(
-        ctx, ggml_scale(ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, d2))), 1.0f / T));
+    ggml_tensor* s1C =
+        ggml_sqrt(ctx, ggml_scale(ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, d2))), 1.0f / T));
     ggml_tensor* sCT = ggml_repeat(ctx, ggml_cont(ctx, ggml_transpose(ctx, s1C)), x);
 
     ggml_tensor* att = ggml_concat(ctx, ggml_concat(ctx, x, mCT, 0), sCT, 0);
@@ -143,13 +143,15 @@ inline ggml_tensor* asp_block(ggml_context* ctx, ggml_tensor* x, const asp_w& as
     att = ggml_cont(ctx, ggml_transpose(ctx, att));
 
     ggml_tensor* wx = ggml_mul(ctx, att, x);
-    ggml_tensor* wm =
-        ggml_cont(ctx, ggml_transpose(ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, wx)))));
+    ggml_tensor* wm = ggml_cont(ctx, ggml_transpose(ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(ctx, wx)))));
     ggml_tensor* wmCT = ggml_repeat(ctx, wm, x);
     ggml_tensor* dd = ggml_sub(ctx, x, wmCT);
     ggml_tensor* ws = ggml_sqrt(
-        ctx, ggml_cont(ctx, ggml_transpose(ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_transpose(
-                                                     ctx, ggml_mul(ctx, att, ggml_mul(ctx, dd, dd))))))));
+        ctx,
+        ggml_cont(ctx,
+                  ggml_transpose(
+                      ctx, ggml_sum_rows(
+                               ctx, ggml_cont(ctx, ggml_transpose(ctx, ggml_mul(ctx, att, ggml_mul(ctx, dd, dd))))))));
     return ggml_concat(ctx, wm, ws, 0); // [2C, 1]
 }
 
