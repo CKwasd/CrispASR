@@ -498,7 +498,7 @@ int confucius4_tts_set_s2a_path(confucius4_tts_context* ctx, const char* path_s2
     }
 
     // Detect DiT mel_dim from input_embed.proj weight: proj_in = dim + 2*mel_dim + spk_dim
-    auto proj_w = find("estimator.input_embed.proj.weight");
+    auto proj_w = find("decoder.estimator.input_embed.proj.weight");
     if (proj_w) {
         int proj_in = (int)proj_w->ne[0];
         int det = (proj_in - hp.estimator_hidden_dim - hp.spk_embed_dim) / 2;
@@ -1101,7 +1101,7 @@ static void s2a_sinusoidal_embed(float t, float* out, int freq_dim) {
 }
 
 // Compute timestep embedding on CPU: sinusoidal → Linear → SiLU → Linear.
-// `prefix` is "estimator.t_embedder" or "estimator.t_embedder2".
+// `prefix` is "decoder.estimator.t_embedder" or "decoder.estimator.t_embedder2".
 static std::vector<float> s2a_timestep_embed_cpu(const confucius4_s2a_model& s, float t, const std::string& prefix,
                                                  int dim) {
     const int freq_dim = 256;
@@ -1140,8 +1140,8 @@ static std::vector<float> s2a_input_embed_cpu(confucius4_tts_context* ctx, const
     const int cond_dim = dim; // mu_projection: Linear(cond_dim=dim, dim)
     const int spk_dim = s.hp.spk_embed_dim;
 
-    auto mu_w = s2a_read_f32(s2a_find(s, "estimator.input_embed.mu_projection.weight"));
-    auto mu_b = s2a_read_f32(s2a_find(s, "estimator.input_embed.mu_projection.bias"));
+    auto mu_w = s2a_read_f32(s2a_find(s, "decoder.estimator.input_embed.mu_projection.weight"));
+    auto mu_b = s2a_read_f32(s2a_find(s, "decoder.estimator.input_embed.mu_projection.bias"));
     if (mu_w.empty())
         return {};
 
@@ -1160,8 +1160,8 @@ static std::vector<float> s2a_input_embed_cpu(confucius4_tts_context* ctx, const
             std::memcpy(row + mel_dim * 2 + dim, ctx->speaker_style_embedding.data(), spk_dim * sizeof(float));
     }
 
-    auto proj_w = s2a_read_f32(s2a_find(s, "estimator.input_embed.proj.weight"));
-    auto proj_b = s2a_read_f32(s2a_find(s, "estimator.input_embed.proj.bias"));
+    auto proj_w = s2a_read_f32(s2a_find(s, "decoder.estimator.input_embed.proj.weight"));
+    auto proj_b = s2a_read_f32(s2a_find(s, "decoder.estimator.input_embed.proj.bias"));
     if (proj_w.empty())
         return {};
 
@@ -1187,7 +1187,7 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     const int vb = ctx->params.verbosity;
 
     // Determine FFN intermediate size from w1 weight shape
-    auto w1_0 = s2a_find(s, "estimator.transformer_blocks.0.feed_forward.w1.weight");
+    auto w1_0 = s2a_find(s, "decoder.estimator.transformer_blocks.0.feed_forward.w1.weight");
     const int inter_dim = w1_0 ? (int)w1_0->ne[1] : dim * 4;
 
     if (vb >= 1)
@@ -1234,8 +1234,8 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
             ggml_tensor* skip = skip_stack.back();
             skip_stack.pop_back();
             ggml_tensor* cat = ggml_concat(cache.gctx, x, skip, 0);
-            auto sw = tn("estimator.transformer_blocks.%d.skip_in_linear.weight", i);
-            auto sb = tn("estimator.transformer_blocks.%d.skip_in_linear.bias", i);
+            auto sw = tn("decoder.estimator.transformer_blocks.%d.skip_in_linear.weight", i);
+            auto sb = tn("decoder.estimator.transformer_blocks.%d.skip_in_linear.bias", i);
             if (sw) {
                 x = ggml_mul_mat(cache.gctx, sw, cat);
                 if (sb)
@@ -1245,9 +1245,9 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
 
         // AdaLN attention norm: modulation(t_emb) → [weight, bias]; RMSNorm(x)*w + b
         {
-            auto nw = tn("estimator.transformer_blocks.%d.attention_norm.norm.weight", i);
-            auto mw = tn("estimator.transformer_blocks.%d.attention_norm.modulation.weight", i);
-            auto mb = tn("estimator.transformer_blocks.%d.attention_norm.modulation.bias", i);
+            auto nw = tn("decoder.estimator.transformer_blocks.%d.attention_norm.norm.weight", i);
+            auto mw = tn("decoder.estimator.transformer_blocks.%d.attention_norm.modulation.weight", i);
+            auto mb = tn("decoder.estimator.transformer_blocks.%d.attention_norm.modulation.bias", i);
 
             ggml_tensor* mod = ggml_mul_mat(cache.gctx, mw, cache.t_emb_in);
             if (mb)
@@ -1262,8 +1262,8 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
             normed = ggml_add(cache.gctx, normed, ab);
 
             // Attention: fused wqkv → Q,K,V → RoPE → flash_attn → wo
-            auto wqkv = tn("estimator.transformer_blocks.%d.attention.wqkv.weight", i);
-            auto wo = tn("estimator.transformer_blocks.%d.attention.wo.weight", i);
+            auto wqkv = tn("decoder.estimator.transformer_blocks.%d.attention.wqkv.weight", i);
+            auto wo = tn("decoder.estimator.transformer_blocks.%d.attention.wo.weight", i);
 
             ggml_tensor* qkv = ggml_mul_mat(cache.gctx, wqkv, normed);
             int esz = (int)ggml_element_size(qkv);
@@ -1294,9 +1294,9 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
 
         // AdaLN FFN norm → SwiGLU FFN
         {
-            auto nw = tn("estimator.transformer_blocks.%d.ffn_norm.norm.weight", i);
-            auto mw = tn("estimator.transformer_blocks.%d.ffn_norm.modulation.weight", i);
-            auto mb = tn("estimator.transformer_blocks.%d.ffn_norm.modulation.bias", i);
+            auto nw = tn("decoder.estimator.transformer_blocks.%d.ffn_norm.norm.weight", i);
+            auto mw = tn("decoder.estimator.transformer_blocks.%d.ffn_norm.modulation.weight", i);
+            auto mb = tn("decoder.estimator.transformer_blocks.%d.ffn_norm.modulation.bias", i);
 
             ggml_tensor* mod = ggml_mul_mat(cache.gctx, mw, cache.t_emb_in);
             if (mb)
@@ -1311,9 +1311,9 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
             fn = ggml_add(cache.gctx, fn, fb);
 
             // SwiGLU: w2(silu(w1(x)) * w3(x))
-            auto w1 = tn("estimator.transformer_blocks.%d.feed_forward.w1.weight", i);
-            auto w2 = tn("estimator.transformer_blocks.%d.feed_forward.w2.weight", i);
-            auto w3 = tn("estimator.transformer_blocks.%d.feed_forward.w3.weight", i);
+            auto w1 = tn("decoder.estimator.transformer_blocks.%d.feed_forward.w1.weight", i);
+            auto w2 = tn("decoder.estimator.transformer_blocks.%d.feed_forward.w2.weight", i);
+            auto w3 = tn("decoder.estimator.transformer_blocks.%d.feed_forward.w3.weight", i);
 
             ggml_tensor* gate = ggml_silu(cache.gctx, ggml_mul_mat(cache.gctx, w1, fn));
             ggml_tensor* up = ggml_mul_mat(cache.gctx, w3, fn);
@@ -1329,9 +1329,9 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
 
     // Final AdaLN (transformer_norm)
     {
-        auto nw = s2a_find(s, "estimator.transformer_norm.norm.weight");
-        auto mw = s2a_find(s, "estimator.transformer_norm.modulation.weight");
-        auto mb = s2a_find(s, "estimator.transformer_norm.modulation.bias");
+        auto nw = s2a_find(s, "decoder.estimator.transformer_norm.norm.weight");
+        auto mw = s2a_find(s, "decoder.estimator.transformer_norm.modulation.weight");
+        auto mb = s2a_find(s, "decoder.estimator.transformer_norm.modulation.bias");
 
         ggml_tensor* mod = ggml_mul_mat(cache.gctx, mw, cache.t_emb_in);
         if (mb)
@@ -1347,8 +1347,8 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     }
 
     // skip_linear: cat(x_res, x_mel) → Linear(dim + mel_dim → dim)
-    auto sl_w = s2a_find(s, "estimator.skip_linear.weight");
-    auto sl_b = s2a_find(s, "estimator.skip_linear.bias");
+    auto sl_w = s2a_find(s, "decoder.estimator.skip_linear.weight");
+    auto sl_b = s2a_find(s, "decoder.estimator.skip_linear.bias");
     ggml_tensor* x_res = x; // save for res_projection
     if (sl_w) {
         ggml_tensor* cat = ggml_concat(cache.gctx, x, cache.x_mel_in, 0);
@@ -1361,8 +1361,8 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     // Output path: conv1 → (skip WaveNet) → res_projection → final_layer → conv2
     // The WaveNet is gated behind CRISPASR_CONFUCIUS4_WAVENET=1 (not yet implemented).
     // Without WaveNet: output = res_projection(x_res) → final_layer → conv2
-    auto res_w = s2a_find(s, "estimator.res_projection.weight");
-    auto res_b = s2a_find(s, "estimator.res_projection.bias");
+    auto res_w = s2a_find(s, "decoder.estimator.res_projection.weight");
+    auto res_b = s2a_find(s, "decoder.estimator.res_projection.bias");
     if (res_w) {
         x = ggml_mul_mat(cache.gctx, res_w, x_res);
         if (res_b)
@@ -1370,10 +1370,10 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     }
 
     // FinalLayer: LayerNorm(no affine) → (1+scale)*x + shift → Linear
-    auto fl_w = s2a_find(s, "estimator.final_layer.linear.weight");
-    auto fl_b = s2a_find(s, "estimator.final_layer.linear.bias");
-    auto fm_w = s2a_find(s, "estimator.final_layer.adaLN_modulation.1.weight");
-    auto fm_b = s2a_find(s, "estimator.final_layer.adaLN_modulation.1.bias");
+    auto fl_w = s2a_find(s, "decoder.estimator.final_layer.linear.weight");
+    auto fl_b = s2a_find(s, "decoder.estimator.final_layer.linear.bias");
+    auto fm_w = s2a_find(s, "decoder.estimator.final_layer.adaLN_modulation.1.weight");
+    auto fm_b = s2a_find(s, "decoder.estimator.final_layer.adaLN_modulation.1.bias");
     if (fl_w && fm_w) {
         ggml_tensor* silu_t = ggml_silu(cache.gctx, cache.t_emb_in);
         ggml_tensor* fmod = ggml_mul_mat(cache.gctx, fm_w, silu_t);
@@ -1396,8 +1396,8 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     }
 
     // conv2: Conv1d(wn_dim, mel_dim, 1) = Linear projection to output dim
-    auto c2_w = s2a_find(s, "estimator.conv2.weight");
-    auto c2_b = s2a_find(s, "estimator.conv2.bias");
+    auto c2_w = s2a_find(s, "decoder.estimator.conv2.weight");
+    auto c2_b = s2a_find(s, "decoder.estimator.conv2.bias");
     if (c2_w) {
         // Conv1d weight is 3D (ne=[1, in, out]); reshape to 2D for mul_mat
         ggml_tensor* c2_2d = ggml_reshape_2d(cache.gctx, c2_w, c2_w->ne[0] * c2_w->ne[1], c2_w->ne[2]);
@@ -1472,7 +1472,7 @@ static std::vector<float> s2a_dit_forward(confucius4_tts_context* ctx, const flo
     const int dim = s.hp.estimator_hidden_dim;
 
     // Timestep embedding
-    auto t_emb = s2a_timestep_embed_cpu(s, timestep, "estimator.t_embedder", dim);
+    auto t_emb = s2a_timestep_embed_cpu(s, timestep, "decoder.estimator.t_embedder", dim);
     if (t_emb.empty()) {
         fprintf(stderr, "confucius4: timestep embedding failed\n");
         return {};
