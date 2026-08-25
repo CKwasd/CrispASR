@@ -42,9 +42,7 @@ print("=== Phase 0: clone repo ===", flush=True)
 if not REPO.exists():
     try:
         subprocess.check_call([
-            # feature branch: carries the campplus.*/speaker_encoder.* quantize
-            # keep-rules — flip back to "main" once #377 merges
-            "git", "clone", "--depth", "1", "-b", "feat/confucius4-cfg",
+            "git", "clone", "--depth", "1", "-b", "main",
             "https://github.com/CrispStrobe/CrispASR", str(REPO),
         ])
     except Exception as e:

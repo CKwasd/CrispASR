@@ -20,7 +20,7 @@ from pathlib import Path
 WORK = Path("/kaggle/working")
 REPO = WORK / "CrispASR"
 TEMP = Path("/kaggle/temp") if Path("/kaggle/temp").is_dir() else Path("/tmp")
-BRANCH = "feat/confucius4-cfg"
+BRANCH = "main"
 HF_REPO = "cstr/confucius4-tts-GGUF"
 
 print(f"=== clone {BRANCH} ===", flush=True)

@@ -28,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-BRANCH = "feat/confucius4-cfg"
+BRANCH = "main"
 WORK = Path("/kaggle/working")
 REPO = WORK / "CrispASR"
 TEMP = Path("/kaggle/temp") if Path("/kaggle/temp").is_dir() else Path("/tmp")
