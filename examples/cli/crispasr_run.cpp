@@ -4102,6 +4102,13 @@ int crispasr_run_backend(const whisper_params& params_in) {
             std::vector<std::pair<crispasr_audio_slice, std::string>> step_slice_text;
             bool decoded_segments_this_step = false;
             if (!stream_vad_path.empty()) {
+                // Streaming delta encoding hint: convey how many samples
+                // are new since the last transcribe call.  Backends with
+                // CAP_STREAM_DELTA (e.g. Cohere) use this to avoid
+                // re-encoding the overlapping portion of the rolling window.
+                if (backend->capabilities() & CAP_STREAM_DELTA) {
+                    backend->set_stream_delta((int)n_new);
+                }
                 const auto slices = crispasr_compute_vad_slices(pcm_window.data(), (int)pcm_window.size(), SR,
                                                                 stream_vad_path.c_str(), stream_vad_opts);
                 // Snapshot for the straddling-slice subrange decode below.
@@ -4214,6 +4221,11 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 if (partial_decode_attempted_this_step)
                     last_partial_decode_sample = cumulative_samples;
             } else {
+                // No-VAD path: transcribe the full window.
+                // Also set streaming delta hint for backends that support it.
+                if (backend->capabilities() & CAP_STREAM_DELTA) {
+                    backend->set_stream_delta((int)n_new);
+                }
                 const int64_t no_vad_window_start_cs = (cumulative_samples - (int64_t)pcm_window.size()) * 100 / SR;
                 segs = backend->transcribe(pcm_window.data(), (int)pcm_window.size(), no_vad_window_start_cs, params);
                 if (!segs.empty())

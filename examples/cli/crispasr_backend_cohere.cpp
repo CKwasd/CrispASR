@@ -85,7 +85,7 @@ public:
     uint32_t capabilities() const override {
         return CAP_TIMESTAMPS_NATIVE | CAP_WORD_TIMESTAMPS | CAP_TOKEN_CONFIDENCE | CAP_DIARIZE |
                CAP_PUNCTUATION_TOGGLE | CAP_FLASH_ATTN | CAP_TEMPERATURE | CAP_BEAM_SEARCH | CAP_PARALLEL_PROCESSORS |
-               CAP_AUTO_DOWNLOAD;
+               CAP_AUTO_DOWNLOAD | CAP_STREAM_DELTA;
     }
 
     bool init(const whisper_params& p) override {
@@ -208,6 +208,10 @@ public:
         cohere_result* r = cohere_transcribe_ex(ctx_, silence.data(), (int)silence.size(), "en", 0);
         if (r)
             cohere_result_free(r);
+    }
+void set_stream_delta(int delta_new_samples) override {
+        if (ctx_)
+            cohere_set_stream_delta(ctx_, delta_new_samples);
     }
 
     std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,

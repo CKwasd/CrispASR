@@ -550,6 +550,23 @@ struct cohere_context {
     // place that sets it, and it clears it again in the same function.
     bool reuse_encoder = false;
     int reused_T_enc = 0;
+// Streaming delta-encode mode (phase 1). Instead of re-encoding the full
+    // rolling window every step, only encode the NEW samples and splice the
+    // cross-KV with the cached output from the previous step. This eliminates
+    // ~90% of encoder computation per streaming step once the window is warm.
+    //
+    // Managed by cohere_set_stream_delta(). Call with new_samples=0 (or omit)
+    // to perform a full encode and reset the cache. Non-zero triggers delta
+    // encoding on the next transcribe_ex() call, provided the cache is valid.
+    //
+    // The per-layer CPU F32 cross-KV from the last full/delta encode is
+    // retained in stream_cached_k/v so it can be reused as chunk[0] during
+    // the next delta step. This is only populated when delta encoding is
+    // active; it is freed at the start of any full encode (new_samples=0).
+    int stream_delta_new_samples = 0;
+    int stream_cached_T_enc = 0;
+    std::vector<std::vector<float>> stream_cached_k; // [layer][data]
+    std::vector<std::vector<float>> stream_cached_v;
 
     // Mel spectrogram buffer
     std::vector<float> mel_buf;
@@ -2226,6 +2243,129 @@ static void cohere_fold_batchnorm(cohere_model& model, int verbosity) {
     COHERE_VLOG(verbosity, "cohere: BN folded into conv_dw weights for %d layers\n", model.hparams.enc_n_layers);
 }
 
+// ---------------------------------------------------------------------------
+// Helper: encode an audio span and extract per-layer cross-attention K/V
+// to CPU F32 buffers.  Used by the streaming delta-encode path and by the
+// normal single‑chunk encoder path.
+//
+// Caller supplies mel_fb / window (from ctx->model).  On success out_T_enc
+// is set and out_k_k[il] / out_k_v[il] are populated with the flat F32
+// cross‑KV for each decoder layer (head_dim × T_enc × n_heads elements).
+// ---------------------------------------------------------------------------
+static bool cohere_encode_and_extract_cross_kv(
+    cohere_context* ctx,
+    const float* samples, int n_samples,
+    const std::vector<float>& mel_fb,
+    const std::vector<float>& window,
+    int& out_T_enc,
+    std::vector<std::vector<float>>& out_k_k,
+    std::vector<std::vector<float>>& out_k_v,
+    cohere_perf& perf)
+{
+    const auto& hp = ctx->model.hparams;
+    const int vb = ctx->params.verbosity;
+    int64_t t0, t1;
+
+    // Feature extraction
+    int T_mel_c = 0;
+    t0 = ggml_time_us();
+    auto mel_c = cohere_compute_features(hp, mel_fb.data(), window.data(), samples, n_samples, T_mel_c);
+    t1 = ggml_time_us();
+    perf.t_features_us += (t1 - t0);
+
+    // Build encoder graph
+    t0 = ggml_time_us();
+    struct ggml_cgraph* gf_enc = cohere_build_graph_encoder(ctx, T_mel_c);
+    t1 = ggml_time_us();
+    perf.t_enc_build_us += (t1 - t0);
+
+    // Allocate
+    t0 = ggml_time_us();
+    ggml_backend_sched_reset(ctx->ggml_alloc);
+    if (!ggml_backend_sched_alloc_graph(ctx->ggml_alloc, gf_enc)) {
+        fprintf(stderr, "cohere: failed to allocate encoder graph\n");
+        return false;
+    }
+    t1 = ggml_time_us();
+    perf.t_enc_alloc_us += (t1 - t0);
+
+    // Set mel input
+    struct ggml_tensor* mel_t = ggml_graph_get_tensor(gf_enc, "mel");
+    if (!mel_t) { fprintf(stderr, "error: mel tensor not found\n"); return false; }
+    ggml_backend_tensor_set(mel_t, mel_c.data(), 0, mel_c.size() * sizeof(float));
+
+    // Positional encodings
+    int H1c = (T_mel_c + 2 - 3) / 2 + 1;
+    int H2c = (H1c + 2 - 3) / 2 + 1;
+    int H3c = (H2c + 2 - 3) / 2 + 1;
+    auto pos_enc_c = ct_rel_pos_enc(H3c, hp.enc_d_model);
+    struct ggml_tensor* pos_enc_t = ggml_graph_get_tensor(gf_enc, "pos_enc");
+    if (!pos_enc_t) { fprintf(stderr, "error: pos_enc tensor not found\n"); return false; }
+    ggml_backend_tensor_set(pos_enc_t, pos_enc_c.data(), 0, pos_enc_c.size() * sizeof(float));
+
+    // Compute
+    t0 = ggml_time_us();
+    if (!cohere_sched_graph_compute(ctx->ggml_alloc, gf_enc, ctx->params.n_threads)) {
+        fprintf(stderr, "cohere: failed to compute encoder graph\n");
+        return false;
+    }
+    t1 = ggml_time_us();
+    perf.t_enc_compute_us += (t1 - t0);
+
+    // Determine T_enc (the encoder output temporal dimension)
+    // The last encoder layer output is named "enc_out" in the graph.
+    struct ggml_tensor* enc_out_t = ggml_graph_get_tensor(gf_enc, "enc_out");
+    if (!enc_out_t) { fprintf(stderr, "error: enc_out tensor not found\n"); return false; }
+    out_T_enc = enc_out_t->ne[1]; // [d_model, T_enc]
+
+    // Extract cross-KV from encoder graph for each decoder layer
+    const int n_heads = hp.dec_n_heads;
+    const int head_dim = hp.dec_head_dim;
+    const int n_layers = hp.dec_n_layers;
+
+    out_k_k.resize(n_layers);
+    out_k_v.resize(n_layers);
+
+    const int64_t t_ckr0 = ggml_time_us();
+    for (int il = 0; il < n_layers; il++) {
+        char ck_name[32], cv_name[32];
+        snprintf(ck_name, sizeof(ck_name), "ck_%d", il);
+        snprintf(cv_name, sizeof(cv_name), "cv_%d", il);
+        struct ggml_tensor* ck_src = ggml_graph_get_tensor(gf_enc, ck_name);
+        struct ggml_tensor* cv_src = ggml_graph_get_tensor(gf_enc, cv_name);
+        if (!ck_src || !cv_src) {
+            fprintf(stderr, "error: cross-KV tensor %s or %s not found\n", ck_name, cv_name);
+            return false;
+        }
+        const int64_t nelem = ggml_nelements(ck_src);
+        out_k_k[il].resize(nelem);
+        out_k_v[il].resize(nelem);
+        ggml_backend_tensor_get(ck_src, out_k_k[il].data(), 0, ggml_nbytes(ck_src));
+        ggml_backend_tensor_get(cv_src, out_k_v[il].data(), 0, ggml_nbytes(cv_src));
+    }
+    perf.t_crosskv_read_us += (ggml_time_us() - t_ckr0);
+
+    COHERE_VLOG2(vb, "cohere: extract done T_enc=%d  layers=%d\n", out_T_enc, n_layers);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Enable / disable streaming delta encoding for the next transcribe_ex() call.
+//
+// Pass delta_new_samples > 0 to encode only the final delta_new_samples
+// samples on the next call, reusing the cached cross‑KV for the overlapping
+// portion.  Pass 0 (the default) to perform a full encode and reset the cache.
+// ---------------------------------------------------------------------------
+void cohere_set_stream_delta(struct cohere_context* ctx, int delta_new_samples) {
+    ctx->stream_delta_new_samples = delta_new_samples;
+    if (delta_new_samples == 0) {
+        // Full encode next — discard any cached cross-KV so the delta path
+        // is not accidentally taken with stale data.
+        ctx->stream_cached_k.clear();
+        ctx->stream_cached_v.clear();
+        ctx->stream_cached_T_enc = 0;
+    }
+}
 struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const float* samples, int n_samples,
                                            const char* lang, int64_t t_offset_cs) {
     const auto& hp = ctx->model.hparams;
@@ -2425,7 +2565,69 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
     bool do_prof = !do_chunked && (crispasr_env::get("CRISPASR_COHERE_PROF") != nullptr);
 
     if (!reuse_enc) {
-        cohere_bench_stage _b_enc("encoder (all chunks)");
+        // --- Streaming delta encoding ---
+        // When delta mode is active and we have a valid cached cross-KV from
+        // the previous streaming step, only encode the delta samples and splice
+        // the old + new cross-KV using the proven multi-chunk scatter-copy path.
+        const bool delta = ctx->stream_delta_new_samples > 0 &&
+                           !ctx->stream_cached_k.empty() &&
+                           (int)ctx->stream_cached_k.size() == hp.dec_n_layers &&
+                           ctx->stream_cached_T_enc > 0;
+
+        if (delta) {
+            // ===== DELTA ENCODE PATH =====
+            cohere_bench_stage _b_enc_delta("encoder (delta)");
+            const int delta_n = ctx->stream_delta_new_samples;
+            const float* delta_ptr = samples + n_samples - delta_n;
+
+            std::vector<std::vector<float>> delta_k_k, delta_k_v;
+            int delta_T_enc = 0;
+            if (!cohere_encode_and_extract_cross_kv(ctx, delta_ptr, delta_n, mel_fb, window,
+                                                      delta_T_enc, delta_k_k, delta_k_v, perf)) {
+                return nullptr;
+            }
+            COHERE_VLOG2(vb, "cohere: delta encode done  delta_T_enc=%d  cached_T_enc=%d  delta_n=%d\n",
+                         delta_T_enc, ctx->stream_cached_T_enc, delta_n);
+
+            // Build partial_k/v: chunk[0] = cached old, chunk[1] = delta
+            for (int il = 0; il < hp.dec_n_layers; il++) {
+                partial_k[il].push_back(std::move(ctx->stream_cached_k[il]));
+                partial_v[il].push_back(std::move(ctx->stream_cached_v[il]));
+            }
+            ctx->stream_cached_k.clear();
+            ctx->stream_cached_v.clear();
+            for (int il = 0; il < hp.dec_n_layers; il++) {
+                partial_k[il].push_back(std::move(delta_k_k[il]));
+                partial_v[il].push_back(std::move(delta_k_v[il]));
+            }
+            delta_k_k.clear();
+            delta_k_v.clear();
+
+            T_enc_chunks.push_back(ctx->stream_cached_T_enc);
+            T_enc_chunks.push_back(delta_T_enc);
+            T_enc_total = ctx->stream_cached_T_enc + delta_T_enc;
+
+            // Save combined (cached + delta) cross-KV back to cache for next step
+            ctx->stream_cached_k.resize(hp.dec_n_layers);
+            ctx->stream_cached_v.resize(hp.dec_n_layers);
+            for (int il = 0; il < hp.dec_n_layers; il++) {
+                const auto& k0 = partial_k[il][0];
+                const auto& k1 = partial_k[il][1];
+                ctx->stream_cached_k[il].resize(k0.size() + k1.size());
+                memcpy(ctx->stream_cached_k[il].data(), k0.data(), k0.size() * sizeof(float));
+                memcpy(ctx->stream_cached_k[il].data() + k0.size(), k1.data(), k1.size() * sizeof(float));
+                const auto& v0 = partial_v[il][0];
+                const auto& v1 = partial_v[il][1];
+                ctx->stream_cached_v[il].resize(v0.size() + v1.size());
+                memcpy(ctx->stream_cached_v[il].data(), v0.data(), v0.size() * sizeof(float));
+                memcpy(ctx->stream_cached_v[il].data() + v0.size(), v1.data(), v1.size() * sizeof(float));
+            }
+            ctx->stream_cached_T_enc = T_enc_total;
+            COHERE_VLOG2(vb, "cohere: delta spliced      T_enc_total=%d\n", T_enc_total);
+
+        } else {
+            // ===== FULL ENCODE PATH =====
+            cohere_bench_stage _b_enc("encoder (all chunks)");
         int n_chunks = 0;
         for (int sample_offset = 0; sample_offset < n_samples; sample_offset += CHUNK_SAMPLES) {
             int chunk_n = std::min(CHUNK_SAMPLES, n_samples - sample_offset);
@@ -2659,7 +2861,34 @@ struct cohere_result* cohere_transcribe_ex(struct cohere_context* ctx, const flo
         if (do_prof) {
             cohere_prof_print(prof_state);
         }
-    }
+// Save full cross-KV to cache for future delta streaming steps
+        ctx->stream_cached_k.resize(hp.dec_n_layers);
+        ctx->stream_cached_v.resize(hp.dec_n_layers);
+        if (n_chunks == 1) {
+            for (int il = 0; il < hp.dec_n_layers; il++) {
+                ctx->stream_cached_k[il] = partial_k[il][0];
+                ctx->stream_cached_v[il] = partial_v[il][0];
+            }
+        } else {
+            for (int il = 0; il < hp.dec_n_layers; il++) {
+                size_t total = 0;
+                for (int c = 0; c < n_chunks; c++)
+                    total += partial_k[il][c].size();
+                ctx->stream_cached_k[il].resize(total);
+                ctx->stream_cached_v[il].resize(total);
+                float* kp = ctx->stream_cached_k[il].data();
+                float* vp = ctx->stream_cached_v[il].data();
+                for (int c = 0; c < n_chunks; c++) {
+                    size_t sz = partial_k[il][c].size();
+                    memcpy(kp, partial_k[il][c].data(), sz * sizeof(float));
+                    memcpy(vp, partial_v[il][c].data(), sz * sizeof(float));
+                    kp += sz; vp += sz;
+                }
+            }
+        }
+        ctx->stream_cached_T_enc = T_enc_total;
+    }  // close else (full encode path)
+    }  // close if (!reuse_enc)
 
     // Assemble cross-KV from per-chunk CPU data and upload to backend buffer.
     if (!reuse_enc) {
