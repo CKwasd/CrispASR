@@ -149,6 +149,11 @@ struct wespeaker_context {
 
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
+    // Accelerate/OpenBLAS backend, created lazily and ONLY in im2col conv
+    // mode — the direct-conv graph has no MUL_MAT the BLAS backend could
+    // take (its GEMM is internal to the CPU CONV_2D op), so offering it
+    // would change nothing but sched behaviour.
+    ggml_backend_t backend_blas = nullptr;
     ggml_backend_sched_t sched = nullptr;
 
     std::vector<uint8_t> compute_meta;
@@ -288,6 +293,31 @@ static std::vector<float> wespeaker_fbank(wespeaker_context* ctx, const float* s
 // Graph
 // ===========================================================================
 
+// Conv lowering (#324 perf). "im2col" (DEFAULT) lowers each conv to explicit
+// IM2COL + MUL_MAT graph nodes — same convolution, but the GEMMs become
+// schedulable ops, which lets them reach the Accelerate BLAS backend on CPU
+// and the simdgroup mul_mm kernels on Metal. "direct" restores GGML_OP_CONV_2D,
+// whose CPU path im2cols into scratch and GEMMs via llamafile internally but
+// is a naive scalar kernel on Metal.
+//
+// Measured before the default flip (esrit.wav 215 s, -t 8, M-series):
+// diarization delta 9.8 s -> 5.9 s wall (~1.6x); embeddings cosine 1.0 vs
+// direct (test_wespeaker_live.cpp "im2col conv matches direct conv"); DER on
+// the 8-file VoxConverse shard identical per file, mean 7.32%.
+static bool wespeaker_conv_im2col() {
+    // Read per call (it is once per graph build, so free) so tests can flip
+    // modes with setenv() inside one process.
+    const char* e = crispasr_env::get("CRISPASR_WESPEAKER_CONV");
+    return !(e && strcmp(e, "direct") == 0);
+}
+
+static ggml_tensor* ws_conv_2d(ggml_context* ctx0, ggml_tensor* w, ggml_tensor* x, int s0, int s1, int p0, int p1,
+                               int d0, int d1) {
+    if (wespeaker_conv_im2col())
+        return ggml_conv_2d(ctx0, w, x, s0, s1, p0, p1, d0, d1);
+    return ggml_conv_2d_direct(ctx0, w, x, s0, s1, p0, p1, d0, d1);
+}
+
 // bias is (OC,) — broadcast it across width and height.
 static ggml_tensor* add_conv_bias(ggml_context* ctx0, ggml_tensor* x, ggml_tensor* b) {
     return ggml_add(ctx0, x, ggml_reshape_4d(ctx0, b, 1, 1, b->ne[0], 1));
@@ -296,15 +326,15 @@ static ggml_tensor* add_conv_bias(ggml_context* ctx0, ggml_tensor* x, ggml_tenso
 static ggml_tensor* build_block(ggml_context* ctx0, ggml_tensor* x, const wespeaker_block& blk) {
     const int s = blk.stride;
     // conv1: 3x3, stride s, pad 1 -> relu
-    ggml_tensor* h = ggml_conv_2d_direct(ctx0, blk.conv1_w, x, s, s, 1, 1, 1, 1);
+    ggml_tensor* h = ws_conv_2d(ctx0, blk.conv1_w, x, s, s, 1, 1, 1, 1);
     h = ggml_relu(ctx0, add_conv_bias(ctx0, h, blk.conv1_b));
     // conv2: 3x3, stride 1, pad 1
-    h = ggml_conv_2d_direct(ctx0, blk.conv2_w, h, 1, 1, 1, 1, 1, 1);
+    h = ws_conv_2d(ctx0, blk.conv2_w, h, 1, 1, 1, 1, 1, 1);
     h = add_conv_bias(ctx0, h, blk.conv2_b);
     // shortcut: identity, or 1x1 stride-s projection with NO padding
     ggml_tensor* sc = x;
     if (blk.shortcut_w) {
-        sc = ggml_conv_2d_direct(ctx0, blk.shortcut_w, x, s, s, 0, 0, 1, 1);
+        sc = ws_conv_2d(ctx0, blk.shortcut_w, x, s, s, 0, 0, 1, 1);
         sc = add_conv_bias(ctx0, sc, blk.shortcut_b);
     }
     return ggml_relu(ctx0, ggml_add(ctx0, h, sc));
@@ -370,7 +400,7 @@ static wespeaker_graph build_graph(wespeaker_context* ctx, int T, bool with_stag
         ggml_build_forward_expand(g.gf, d);
     };
 
-    ggml_tensor* h = ggml_conv_2d_direct(g.ctx0, m.stem_w, g.input, 1, 1, 1, 1, 1, 1);
+    ggml_tensor* h = ws_conv_2d(g.ctx0, m.stem_w, g.input, 1, 1, 1, 1, 1, 1);
     h = ggml_relu(g.ctx0, add_conv_bias(g.ctx0, h, m.stem_b));
     snap(h, "stem_out");
 
@@ -422,8 +452,15 @@ static wespeaker_graph build_graph(wespeaker_context* ctx, int T, bool with_stag
 static bool ensure_sched(wespeaker_context* ctx) {
     if (ctx->sched)
         return true;
-    ggml_backend_t backends[2] = {ctx->backend, ctx->backend_cpu};
-    const int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
+    if (wespeaker_conv_im2col() && !ctx->backend_blas)
+        ctx->backend_blas = ggml_backend_init_by_name("BLAS", nullptr); // null on non-BLAS builds — fine
+    ggml_backend_t backends[3];
+    int n_be = 0;
+    if (ctx->backend != ctx->backend_cpu)
+        backends[n_be++] = ctx->backend;
+    if (ctx->backend_blas)
+        backends[n_be++] = ctx->backend_blas;
+    backends[n_be++] = ctx->backend_cpu;
     ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 4096, false, false);
     return ctx->sched != nullptr;
 }
@@ -564,6 +601,8 @@ extern "C" void wespeaker_free(struct wespeaker_context* ctx) {
         return;
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    if (ctx->backend_blas)
+        ggml_backend_free(ctx->backend_blas);
     if (ctx->owns_model && ctx->model.buf)
         core_gguf::release_weight_buffer(ctx->model.buf);
     if (ctx->owns_model && ctx->model.ctx)
