@@ -3335,6 +3335,15 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
                     break;
                 }
             }
+            for (const char* name : {"confucius4-tts-w2v-f16.gguf", "confucius4-tts-w2v-q8_0.gguf"}) {
+                std::string cp = dir + "/" + name;
+                FILE* f = fopen(cp.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    confucius4_tts_set_w2v_path(s->confucius4_ctx, cp.c_str());
+                    break;
+                }
+            }
         }
         return s;
     }

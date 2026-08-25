@@ -82,6 +82,22 @@ public:
         try_vocoder(s2a_path);
         try_vocoder(p.model);
 
+        // w2v-BERT encoder (optional sibling): enables the fully native T2S
+        // condition_emb for --voice. Absent → S2A-side conditioning only
+        // unless CRISPASR_CONFUCIUS4_COND_DIR supplies the features.
+        {
+            std::string dir = p.model.substr(0, p.model.find_last_of("/\\") + 1);
+            for (const char* pat : {"confucius4-tts-w2v-f16.gguf", "confucius4-tts-w2v-q8_0.gguf"}) {
+                std::string path = dir + pat;
+                FILE* f = fopen(path.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    if (confucius4_tts_set_w2v_path(ctx_, path.c_str()) == 0)
+                        break;
+                }
+            }
+        }
+
         // Voice cloning (--voice ref.wav): native CAMPPlus style + prompt mel
         // (needs the campplus.* bake in the S2A GGUF). The T2S condition_emb
         // additionally needs w2v-BERT features via CRISPASR_CONFUCIUS4_COND_DIR

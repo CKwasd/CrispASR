@@ -38,6 +38,10 @@ struct sidon_hparams {
     int input_rate = 16000;
     int output_rate = 48000;
     float eps = 1e-5f;
+    // Encoder-only GGUF (plain w2v-BERT layers, no Sidon LoRA, no DAC
+    // decoder) — serves feature extraction for other backends
+    // (confucius4-tts uses layer-17 hidden states as speaker conditioning).
+    bool encoder_only = false;
 };
 
 struct sidon_ffn {
@@ -181,6 +185,7 @@ static bool load_model(sidon_model& m, const char* path, ggml_backend_t backend)
     m.hp.input_rate = (int)core_gguf::kv_u32(gctx, "sidon.input_sample_rate", m.hp.input_rate);
     m.hp.output_rate = (int)core_gguf::kv_u32(gctx, "sidon.output_sample_rate", m.hp.output_rate);
     m.hp.eps = core_gguf::kv_f32(gctx, "sidon.layer_norm_eps", m.hp.eps);
+    m.hp.encoder_only = core_gguf::kv_u32(gctx, "sidon.encoder_only", 0) != 0;
     const int decoder_blocks = (int)core_gguf::kv_u32(gctx, "sidon.decoder_blocks", 5);
     const int decoder_hop = (int)core_gguf::kv_u32(gctx, "sidon.decoder_hop", 960);
     const int expected_rates[5] = {8, 5, 4, 3, 2};
@@ -200,7 +205,8 @@ static bool load_model(sidon_model& m, const char* path, ggml_backend_t backend)
         m.hp.conv_kernel % 2 == 0 || m.hp.rel_left < 0 || m.hp.rel_left > 4096 || m.hp.rel_right < 0 ||
         m.hp.rel_right > 4096 || m.hp.mel_bins <= 0 || m.hp.mel_bins > 1024 || m.hp.feature_dim != 2 * m.hp.mel_bins ||
         !std::isfinite(m.hp.eps) || m.hp.eps <= 0.0f || m.hp.eps > 1.0f || m.hp.input_rate != 16000 ||
-        m.hp.output_rate != 48000 || decoder_blocks != 5 || decoder_hop != 960 || !decoder_rates_valid) {
+        (!m.hp.encoder_only &&
+         (m.hp.output_rate != 48000 || decoder_blocks != 5 || decoder_hop != 960 || !decoder_rates_valid))) {
         std::fprintf(stderr, "sidon: unsupported or invalid GGUF metadata\n");
         return false;
     }
@@ -255,6 +261,14 @@ static bool load_model(sidon_model& m, const char* path, ggml_backend_t backend)
         l.conv_dw_norm_b = req(m, p + "conv_module.depthwise_layer_norm.bias");
         l.final_norm_w = req(m, p + "final_layer_norm.weight");
         l.final_norm_b = req(m, p + "final_layer_norm.bias");
+    }
+
+    if (m.hp.encoder_only) {
+        if (!m.valid)
+            return false;
+        m.window = core_cpu::to_f32(m.frontend_window);
+        m.mel_filters = core_cpu::to_f32(m.frontend_mels);
+        return !m.window.empty() && !m.mel_filters.empty();
     }
 
     auto& d = m.dac;
@@ -808,9 +822,75 @@ void sidon_free(sidon_context* ctx) {
     delete ctx;
 }
 
+
+// Upload the frontend features and the clipped relative-distance bucket table
+// per (key, query). The table is identical for every head; bucket_direct wants
+// it replicated H times because ggml_get_rows batches the index on (ne2, ne3).
+static void set_predictor_inputs(sidon_context* ctx, const std::vector<float>& feats, int T) {
+    ggml_backend_tensor_set(ctx->predictor_input, feats.data(), 0, feats.size() * sizeof(float));
+    const int n_heads = ctx->model.hp.heads;
+    const size_t plane = (size_t)T * T;
+    const size_t n_planes = ctx->rpe_mode == sidon_rpe_mode::bucket_direct ? (size_t)n_heads : 1;
+    std::vector<int32_t> indices(plane * n_planes);
+    for (int q = 0; q < T; ++q)
+        for (int k = 0; k < T; ++k)
+            indices[(size_t)q * T + k] =
+                std::max(-ctx->model.hp.rel_left, std::min(ctx->model.hp.rel_right, k - q)) + ctx->model.hp.rel_left;
+    for (size_t h = 1; h < n_planes; ++h)
+        std::memcpy(indices.data() + h * plane, indices.data(), plane * sizeof(int32_t));
+    ggml_backend_tensor_set(ctx->relative_indices, indices.data(), 0, indices.size() * sizeof(int32_t));
+}
+
+// Encoder-only feature extraction: SeamlessM4T frontend + the loaded conformer
+// layers, returning the raw hidden states (T x hidden, row-major). This is the
+// PLAIN w2v-BERT forward -- none of sidon_restore's peak normalization or
+// boundary padding, which are restoration-recipe specifics. For a 17-layer
+// encoder-only GGUF the result equals HF `output.hidden_states[17]`.
+std::vector<float> sidon_extract_hidden(sidon_context* ctx, const float* pcm_16k, int n_samples, int* n_frames_out) {
+    if (n_frames_out)
+        *n_frames_out = 0;
+    if (!ctx || !pcm_16k || n_samples < 400)
+        return {};
+    int T = 0;
+    std::vector<float> feats = make_features(ctx->model, pcm_16k, n_samples, T);
+    if (T <= 0)
+        return {};
+    int max_frames = 3000; // same O(T^2) attention guard as sidon_restore
+    if (const char* e = getenv("CRISPASR_SIDON_MAX_FRAMES"); e && e[0]) {
+        const int v = atoi(e);
+        if (v > 0)
+            max_frames = v;
+    }
+    if (T > max_frames) {
+        std::fprintf(stderr, "sidon: extract_hidden input too long (%d frames > %d cap)\n", T, max_frames);
+        return {};
+    }
+    if (!prepare_predictor_graph(ctx, T)) {
+        release_predictor_workspace(ctx);
+        return {};
+    }
+    set_predictor_inputs(ctx, feats, T);
+    if (ggml_backend_sched_graph_compute(ctx->predictor_sched, ctx->predictor_graph) != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "sidon: predictor graph compute failed\n");
+        release_predictor_workspace(ctx);
+        return {};
+    }
+    ggml_backend_sched_synchronize(ctx->predictor_sched);
+    std::vector<float> hidden((size_t)ggml_nelements(ctx->predictor_output));
+    ggml_backend_tensor_get(ctx->predictor_output, hidden.data(), 0, hidden.size() * sizeof(float));
+    release_predictor_workspace(ctx);
+    if (n_frames_out)
+        *n_frames_out = T;
+    return hidden;
+}
+
 std::vector<float> sidon_restore(sidon_context* ctx, const float* samples, int n_samples) {
     if (!ctx || !samples || n_samples < 400)
         return {};
+    if (ctx->model.hp.encoder_only) {
+        std::fprintf(stderr, "sidon: encoder-only GGUF has no DAC decoder; restoration unavailable\n");
+        return {};
+    }
     using clock = std::chrono::steady_clock;
     const auto total_start = clock::now();
     // Match the reference inference recipe's peak normalization.
@@ -875,21 +955,7 @@ std::vector<float> sidon_restore(sidon_context* ctx, const float* samples, int n
     }
     const auto graph_done = clock::now();
 
-    ggml_backend_tensor_set(ctx->predictor_input, feats.data(), 0, feats.size() * sizeof(float));
-    // Clipped relative-distance bucket per (key, query). Identical table for
-    // every head; bucket_direct wants it replicated H times because
-    // ggml_get_rows batches the index on (ne2, ne3).
-    const int n_heads = ctx->model.hp.heads;
-    const size_t plane = (size_t)T * T;
-    const size_t n_planes = ctx->rpe_mode == sidon_rpe_mode::bucket_direct ? (size_t)n_heads : 1;
-    std::vector<int32_t> indices(plane * n_planes);
-    for (int q = 0; q < T; ++q)
-        for (int k = 0; k < T; ++k)
-            indices[(size_t)q * T + k] =
-                std::max(-ctx->model.hp.rel_left, std::min(ctx->model.hp.rel_right, k - q)) + ctx->model.hp.rel_left;
-    for (size_t h = 1; h < n_planes; ++h)
-        std::memcpy(indices.data() + h * plane, indices.data(), plane * sizeof(int32_t));
-    ggml_backend_tensor_set(ctx->relative_indices, indices.data(), 0, indices.size() * sizeof(int32_t));
+    set_predictor_inputs(ctx, feats, T);
     const auto predictor_start = clock::now();
     if (ggml_backend_sched_graph_compute(ctx->predictor_sched, ctx->predictor_graph) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "sidon: predictor graph compute failed\n");

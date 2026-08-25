@@ -68,33 +68,45 @@ def decoder_name(name: str) -> str:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Convert Sidon v0.1 to GGUF")
+    ap = argparse.ArgumentParser(description="Convert Sidon v0.1 (or a plain w2v-BERT encoder) to GGUF")
     ap.add_argument("--base", type=Path, required=True, help="local facebook/w2v-bert-2.0 directory")
-    ap.add_argument("--sidon", type=Path, required=True, help="local sarulab-speech/sidon_raw_weight directory")
+    ap.add_argument("--sidon", type=Path, help="local sarulab-speech/sidon_raw_weight directory")
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--dtype", choices=["f16", "f32"], default="f16")
+    ap.add_argument("--encoder-only", action="store_true",
+                    help="plain w2v-BERT encoder: no Sidon LoRA merge, no DAC decoder; "
+                         "writes sidon.encoder_only=1 (confucius4-tts speaker conditioning)")
+    ap.add_argument("--layers", type=int, default=None,
+                    help="number of encoder layers to write (default: 8, or all for --encoder-only)")
     args = ap.parse_args()
 
+    global N_LAYERS
+    encoder_only = args.encoder_only
+    if not encoder_only and args.sidon is None:
+        sys.exit("--sidon is required unless --encoder-only")
+
     base_weights = args.base / "model.safetensors"
-    adapter_weights = args.sidon / "adapter_model.safetensors"
-    adapter_config = args.sidon / "adapter_config.json"
-    decoder_weights = args.sidon / "decoder_state_dict.pt"
-    for p in (
-        base_weights,
-        adapter_weights,
-        adapter_config,
-        decoder_weights,
-        args.base / "config.json",
-        args.base / "preprocessor_config.json",
-    ):
+    required = [base_weights, args.base / "config.json", args.base / "preprocessor_config.json"]
+    if not encoder_only:
+        adapter_weights = args.sidon / "adapter_model.safetensors"
+        adapter_config = args.sidon / "adapter_config.json"
+        decoder_weights = args.sidon / "decoder_state_dict.pt"
+        required += [adapter_weights, adapter_config, decoder_weights]
+    for p in required:
         if not p.is_file():
             sys.exit(f"missing required file: {p}")
 
     with open(args.base / "config.json", encoding="utf-8") as f:
         cfg = json.load(f)
-    with open(adapter_config, encoding="utf-8") as f:
-        adapter_cfg = json.load(f)
-    if (
+    if args.layers is not None:
+        N_LAYERS = args.layers
+    elif encoder_only:
+        N_LAYERS = int(cfg["num_hidden_layers"])
+    adapter_cfg = None
+    if not encoder_only:
+        with open(adapter_config, encoding="utf-8") as f:
+            adapter_cfg = json.load(f)
+    if not encoder_only and (
         adapter_cfg.get("peft_type") != "LORA"
         or adapter_cfg.get("fan_in_fan_out", False)
         or adapter_cfg.get("use_dora", False)
@@ -102,15 +114,20 @@ def main() -> None:
         or adapter_cfg.get("alpha_pattern")
     ):
         raise ValueError("unsupported Sidon LoRA configuration")
-    lora_rank = int(adapter_cfg["r"])
-    lora_alpha = float(adapter_cfg["lora_alpha"])
-    if lora_rank <= 0 or not np.isfinite(lora_alpha):
-        raise ValueError("invalid Sidon LoRA rank or alpha")
-    lora_scale = lora_alpha / (np.sqrt(lora_rank) if adapter_cfg.get("use_rslora", False) else lora_rank)
+    lora_scale = 0.0
+    if not encoder_only:
+        lora_rank = int(adapter_cfg["r"])
+        lora_alpha = float(adapter_cfg["lora_alpha"])
+        if lora_rank <= 0 or not np.isfinite(lora_alpha):
+            raise ValueError("invalid Sidon LoRA rank or alpha")
+        lora_scale = lora_alpha / (np.sqrt(lora_rank) if adapter_cfg.get("use_rslora", False) else lora_rank)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     writer = gguf.GGUFWriter(str(args.output), "sidon")
-    writer.add_string("general.name", "Sidon v0.1")
+    writer.add_string("general.name",
+                      f"w2v-BERT 2.0 encoder ({N_LAYERS}L)" if encoder_only else "Sidon v0.1")
+    if encoder_only:
+        writer.add_uint32("sidon.encoder_only", 1)
     writer.add_file_type(
         gguf.GGMLQuantizationType.F16 if args.dtype == "f16" else gguf.GGMLQuantizationType.F32
     )
@@ -140,8 +157,10 @@ def main() -> None:
     matrix_cast = f16 if args.dtype == "f16" else f32
     count = 2
 
-    with safe_open(str(adapter_weights), framework="pt", device="cpu") as af:
-        adapter = {k: af.get_tensor(k) for k in af.keys()}
+    adapter = {}
+    if not encoder_only:
+        with safe_open(str(adapter_weights), framework="pt", device="cpu") as af:
+            adapter = {k: af.get_tensor(k) for k in af.keys()}
 
     merged_adapter_keys: set[str] = set()
     with safe_open(str(base_weights), framework="pt", device="cpu") as bf:
@@ -168,15 +187,16 @@ def main() -> None:
             writer.add_tensor(output_name(name), data)
             count += 1
 
-    unused_adapter_keys = set(adapter) - merged_adapter_keys
-    if unused_adapter_keys or len(merged_adapter_keys) != 4 * N_LAYERS:
-        raise ValueError(
-            f"unexpected Sidon LoRA layout: merged {len(merged_adapter_keys)} tensors, "
-            f"unused={sorted(unused_adapter_keys)}"
-        )
+    if not encoder_only:
+        unused_adapter_keys = set(adapter) - merged_adapter_keys
+        if unused_adapter_keys or len(merged_adapter_keys) != 4 * N_LAYERS:
+            raise ValueError(
+                f"unexpected Sidon LoRA layout: merged {len(merged_adapter_keys)} tensors, "
+                f"unused={sorted(unused_adapter_keys)}"
+            )
     del adapter
 
-    decoder = torch.load(decoder_weights, map_location="cpu", weights_only=True)
+    decoder = {} if encoder_only else torch.load(decoder_weights, map_location="cpu", weights_only=True)
     for name in decoder:
         if name.endswith(".weight_g") and name[: -len("weight_g")] + "weight_v" not in decoder:
             raise KeyError(f"missing weight_v pair for {name}")

@@ -16,6 +16,7 @@
 #include "core/audio_resample.h"
 #include "core/wav_reader.h"
 #include "chatterbox_campplus.h"
+#include "sidon.h"
 #include "core/ggml_cpu_backend.h"
 #include "core/gpu_backend_pref.h"
 #include "core/gguf_loader.h"
@@ -227,6 +228,11 @@ struct confucius4_tts_context {
     // (n_prompt_frames, mel_dim), prepended to the flow-matching state.
     std::vector<float> prompt_mel;
     int prompt_n_frames = 0;
+
+    // w2v-BERT 2.0 encoder-only (17L sidon-layout GGUF) for the T2S
+    // condition_emb — layer-17 hidden states, z-normalised with the baked
+    // stats, fed to the native ECAPA.
+    sidon_context* w2v_ctx = nullptr;
 
     // CAMPPlus style encoder (baked into the S2A GGUF under campplus.*)
     cb_campplus_model campplus_model{};
@@ -1026,6 +1032,27 @@ static void load_conditioning_from_env(confucius4_tts_context* ctx) {
                                     pmel.empty() ? nullptr : pmel.data(), n_prompt, mel_dim);
 }
 
+int confucius4_tts_set_w2v_path(confucius4_tts_context* ctx, const char* path_w2v) {
+    if (!ctx || !path_w2v)
+        return -1;
+    if (ctx->w2v_ctx) {
+        sidon_free(ctx->w2v_ctx);
+        ctx->w2v_ctx = nullptr;
+    }
+    sidon_context_params sp = sidon_context_default_params();
+    sp.n_threads = ctx->params.n_threads;
+    sp.verbosity = ctx->params.verbosity;
+    sp.use_gpu = ctx->params.use_gpu;
+    ctx->w2v_ctx = sidon_init_from_file(path_w2v, sp);
+    if (!ctx->w2v_ctx) {
+        fprintf(stderr, "confucius4: failed to load w2v-BERT GGUF '%s'\n", path_w2v);
+        return -1;
+    }
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "confucius4: w2v-BERT encoder loaded (native T2S conditioning)\n");
+    return 0;
+}
+
 // Native voice conditioning from a reference WAV: CAMPPlus style embedding
 // (16 kHz kaldi fbank + CMN, unbiased stats pool — the exact reference
 // recipe) and the 22.05 kHz HiFi-GAN-style prompt mel. The T2S
@@ -1074,9 +1101,30 @@ int confucius4_tts_set_voice_path(confucius4_tts_context* ctx, const char* wav_p
     ctx->prompt_mel = std::move(pmel);
     ctx->prompt_n_frames = T_mel;
 
+    // T2S condition_emb: w2v-BERT layer-17 hidden states, z-normalised with
+    // the stats baked in the T2S GGUF, through the native ECAPA. Runs when the
+    // encoder-only w2v GGUF is loaded (confucius4_tts_set_w2v_path).
+    if (ctx->w2v_ctx && !ctx->w2v_mean.empty() && ctx->w2v_mean.size() == ctx->w2v_var.size()) {
+        int T_w2v = 0;
+        std::vector<float> feats = sidon_extract_hidden(ctx->w2v_ctx, pcm16.data(), (int)pcm16.size(), &T_w2v);
+        const int fdim = (int)ctx->w2v_mean.size();
+        if (!feats.empty() && T_w2v > 0 && (int)feats.size() == T_w2v * fdim) {
+            for (int t = 0; t < T_w2v; t++)
+                for (int d = 0; d < fdim; d++) {
+                    float& v = feats[(size_t)t * fdim + d];
+                    v = (v - ctx->w2v_mean[d]) / std::sqrt(ctx->w2v_var[d]);
+                }
+            ctx->speaker_semantic_features = std::move(feats);
+            ctx->speaker_n_frames = T_w2v;
+            compute_condition_embedding(ctx);
+        } else {
+            fprintf(stderr, "confucius4: w2v-BERT feature extraction failed (%d frames)\n", T_w2v);
+        }
+    }
+
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "confucius4: voice set: style=%d-d, prompt_mel=%d frames @%d Hz%s\n", want_spk, T_mel, tgt_sr,
-                ctx->has_condition_emb ? "" : " (no T2S condition_emb — w2v-BERT not native yet)");
+                ctx->has_condition_emb ? "" : " (no T2S condition_emb — supply w2v-BERT via set_w2v_path/COND_DIR)");
     return 0;
 }
 
@@ -3382,6 +3430,8 @@ void confucius4_tts_free(confucius4_tts_context* ctx) {
         return;
 
     kv_free(ctx->kv);
+    if (ctx->w2v_ctx)
+        sidon_free(ctx->w2v_ctx);
     // Free vocoder
     if (ctx->vocoder)
         indextts_voc_free(ctx->vocoder);

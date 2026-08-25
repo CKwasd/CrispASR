@@ -58,6 +58,13 @@ int confucius4_tts_set_s2a_path(struct confucius4_tts_context* ctx, const char* 
 // Returns 0 on success.
 int confucius4_tts_set_vocoder_path(struct confucius4_tts_context* ctx, const char* path_vocoder);
 
+// Load the encoder-only w2v-BERT 2.0 GGUF (confucius4-tts-w2v-f16.gguf,
+// sidon layout, 17 layers). With it loaded, confucius4_tts_set_voice_path
+// computes the T2S condition_emb fully natively (layer-17 hidden states,
+// z-normalised with the baked stats, through the ECAPA encoder).
+// Returns 0 on success.
+int confucius4_tts_set_w2v_path(struct confucius4_tts_context* ctx, const char* path_w2v);
+
 // Native voice conditioning from a reference WAV (`--voice ref.wav`): computes
 // the CAMPPlus style embedding and the 22.05 kHz prompt mel in-process (needs
 // the campplus.* bake in the S2A GGUF). The T2S condition_emb still requires

@@ -1366,6 +1366,9 @@ constexpr ExtraCompanion k_dots_tts_extras[] = {
 constexpr ExtraCompanion k_confucius4_tts_extras[] = {
     {"confucius4-tts-bigvgan-22k-f16.gguf",
      "https://huggingface.co/cstr/confucius4-tts-GGUF/resolve/main/confucius4-tts-bigvgan-22k-f16.gguf"},
+    // encoder-only w2v-BERT 2.0 (17L): fully native --voice conditioning
+    {"confucius4-tts-w2v-f16.gguf",
+     "https://huggingface.co/cstr/confucius4-tts-GGUF/resolve/main/confucius4-tts-w2v-f16.gguf"},
     {nullptr, nullptr},
 };
 
