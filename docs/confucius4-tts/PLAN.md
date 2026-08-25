@@ -50,6 +50,22 @@ Python embedding), real 93-entry LANGUAGE_TOKEN_MAP, LlamaTokenizer SP-BPE
 native tokenizer (`core/spm_bpe.h`, shared with irodori), reference
 `max_length` TOTAL-length semantics, reference e2e control arm in the kernel.
 
+### Bug 13 — CFG uncond pass ran over T_mel, not T_total (the silence bug)
+
+Run 15's rms print exposed it: every CONDITIONED run since the prompt path
+landed produced **digital silence** (COND-full 3.25s rms=0.0000) while
+unconditioned parity stayed cos=1.000000. solve_euler's uncond arm runs over
+the SAME full sequence (prompt+target; only mu/prompt_x/spks zeroed) — the
+runtime passed `T_mel`, so with a 947-frame prompt the CFG blend read
+`v_uncond` out of bounds past frame 280. Without a prompt `T_total==T_mel`,
+so the parity harness could never see it: **the conditioned S2A path had
+zero harness coverage** (s2a_parity hardcodes prompt_len=0/spks=0 — still
+open to extend). Fixed in `aae66528`; run 16 verifies.
+
+Run 15 also proved: reference e2e control 8/8 again; conditioned beam decode
+produces plausible lengths (163 codes); nocond beam decode EOSes early
+(8 codes) — consistent with an unconditioned prompt being out-of-distribution.
+
 **Queue after roundtrip passes:** converter re-run (vocab already baked by
 converter; ADD CAMPPlus into S2A GGUF) · native conditioning (CAMPPlus bind =
 dots pattern, prompt mel 22k via core/mel.h, w2v-BERT layer-17 via sidon.cpp
