@@ -27,6 +27,17 @@ attn_scale + missing prefill causal mask, CFG-uncond T_mel-vs-T_total). The
 decode is a transformers-4.52.4-faithful beam-sample (num_beams=3 default,
 `CRISPASR_CONFUCIUS4_BEAMS=1` for pure sampling).
 
+## Run 17 — native paths validated (2026-08-25)
+
+- **NATIVE-tok 8/8** — runtime SP-BPE over the baked vocab emits the exact
+  AutoTokenizer ids (36) and BYTE-IDENTICAL audio to the TEXT_IDS arm.
+- **NATIVE-voice 8/8** — `--voice jfk.wav`: native CAMPPlus style (192-d) +
+  native 22.05 kHz prompt mel + native ECAPA condition_emb (w2v features
+  still external via COND_DIR).
+- Checklist landed: c_api session integration, registry entry (+HF license
+  card), S2A/BigVGAN sibling auto-resolve, params unit test, docs/README,
+  whisper.go cgo sync, crispasr-lib linkage.
+
 ## Remaining to ship (docs/contributing.md checklist)
 
 1. **Converter re-run** (chr1str/crispasr-confucius4-tts-convert v6, in
