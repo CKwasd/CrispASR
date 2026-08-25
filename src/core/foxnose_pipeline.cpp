@@ -71,7 +71,8 @@ std::vector<Speech> window_boundaries(const Speech& seg, const std::vector<Speec
 }
 
 Result diarize(const float* pcm, int n_samples, int sample_rate, const std::vector<Speech>& speech, EmbedFn embed,
-               void* userdata, int embed_dim, const Params& params, EmbedWindowsFn embed_windows) {
+               void* userdata, int embed_dim, const Params& params, EmbedWindowsFn embed_windows,
+               EmbedBatchFn embed_batch) {
     Result res;
     if (!pcm || n_samples <= 0 || !embed || embed_dim <= 0 || speech.empty())
         return res;
@@ -133,6 +134,13 @@ Result diarize(const float* pcm, int n_samples, int sample_rate, const std::vect
             spans.push_back({i, j});
             i = j + 1;
         }
+    } else if (embed_batch) {
+        // Batches are independent windows, so unlike spans they may straddle
+        // parent regions — the chunking is pure scheduling. Fixed stride over
+        // the window index keeps the calls (and any failure fallout) identical
+        // for every worker count.
+        for (int i = 0; i < n_win; i += kWindowsPerBatch)
+            spans.push_back({i, std::min(i + kWindowsPerBatch, n_win) - 1});
     } else {
         spans.reserve((size_t)n_win);
         for (int i = 0; i < n_win; i++)
@@ -144,6 +152,29 @@ Result diarize(const float* pcm, int n_samples, int sample_rate, const std::vect
 
     auto do_span = [&](int si, int worker) {
         const Span& sp = spans[(size_t)si];
+        if (!embed_windows && embed_batch) {
+            const int cnt = sp.last - sp.first + 1;
+            std::vector<int64_t> offs((size_t)cnt);
+            std::vector<int> lens((size_t)cnt);
+            for (int k = 0; k < cnt; k++) {
+                offs[(size_t)k] = (int64_t)wins[(size_t)(sp.first + k)].a;
+                lens[(size_t)k] = (int)(wins[(size_t)(sp.first + k)].b - wins[(size_t)(sp.first + k)].a);
+            }
+            if (embed_batch(userdata, worker, pcm, (int64_t)n_samples, offs.data(), lens.data(), cnt,
+                            &all[(size_t)sp.first * embed_dim]) == 0) {
+                for (int k = 0; k < cnt; k++)
+                    ok[(size_t)(sp.first + k)] = true;
+                return;
+            }
+            // A failed batch degrades to the per-window path so only the bad
+            // window is skipped, not its 31 neighbours.
+            for (int k = 0; k < cnt; k++) {
+                const int i = sp.first + k;
+                ok[(size_t)i] = embed(userdata, worker, pcm + wins[(size_t)i].a,
+                                      (int)(wins[(size_t)i].b - wins[(size_t)i].a), &all[(size_t)i * embed_dim]) == 0;
+            }
+            return;
+        }
         if (!embed_windows) {
             const int i = sp.first;
             ok[(size_t)i] = embed(userdata, worker, pcm + wins[(size_t)i].a,
