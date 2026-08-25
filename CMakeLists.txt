@@ -303,6 +303,41 @@ if (NOT TARGET ggml)
                 "or re-clone with:\n"
                 "    git clone --recursive https://github.com/CrispStrobe/CrispASR")
         endif()
+
+        # A submodule at the WRONG commit is nastier than a missing one: it
+        # compiles far enough to fail deep in an unrelated translation unit, and
+        # the error names a ggml API rather than the checkout. That is exactly
+        # how a worktree left on plain upstream ggml (v0.10.2-12, no `K` in
+        # ggml_gated_delta_net) instead of the pinned fork (v0.10.2-463) got
+        # "fixed" by editing talk-llama's caller to match — the code was right
+        # and the checkout was wrong. Warn (never fail: a deliberate local ggml
+        # bump is a normal thing to be doing) and say which way to reconcile.
+        find_package(Git QUIET)
+        if (GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+            execute_process(COMMAND "${GIT_EXECUTABLE}" ls-tree HEAD ggml
+                            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+                            OUTPUT_VARIABLE _crispasr_ggml_pin_line
+                            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+            execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
+                            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ggml"
+                            OUTPUT_VARIABLE _crispasr_ggml_head
+                            OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+            if (_crispasr_ggml_pin_line MATCHES "commit ([0-9a-f]+)")
+                set(_crispasr_ggml_pin "${CMAKE_MATCH_1}")
+                if (_crispasr_ggml_head AND NOT _crispasr_ggml_head STREQUAL _crispasr_ggml_pin)
+                    message(WARNING
+                        "The 'ggml' submodule is NOT at the commit this tree pins.\n"
+                        "  pinned  : ${_crispasr_ggml_pin}\n"
+                        "  checked out: ${_crispasr_ggml_head}\n"
+                        "A build failure naming a ggml function is then the CHECKOUT, not the "
+                        "caller — do not 'fix' the caller to match. Reconcile with:\n"
+                        "    git submodule update --init --recursive ggml   # adopt the pin\n"
+                        "or, if the new ggml is intended, commit the bump:\n"
+                        "    git add ggml && git commit")
+                endif()
+            endif()
+        endif()
+
         add_subdirectory(ggml)
         if(WIN32)
             # The following adds a _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR macro and is a workaround for
