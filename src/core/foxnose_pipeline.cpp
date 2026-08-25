@@ -2,12 +2,12 @@
 
 #include "foxnose_pipeline.h"
 
+#include "parallel_for.h"
+
 #include "diarize_smooth.h"
 #include "spectral_diarize.h"
 
 #include <algorithm>
-#include <atomic>
-#include <thread>
 #include <cmath>
 #include <cstdlib>
 #include <map>
@@ -195,27 +195,11 @@ Result diarize(const float* pcm, int n_samples, int sample_rate, const std::vect
             ok[(size_t)(sp.first + k)] = good;
     };
 
-    if (n_workers == 1) {
-        for (int si = 0; si < n_spans; si++)
-            do_span(si, 0);
-    } else {
-        std::atomic<int> next{0};
-        auto run = [&](int worker) {
-            for (;;) {
-                const int si = next.fetch_add(1);
-                if (si >= n_spans)
-                    return;
-                do_span(si, worker);
-            }
-        };
-        std::vector<std::thread> pool;
-        pool.reserve((size_t)n_workers - 1);
-        for (int t = 1; t < n_workers; t++)
-            pool.emplace_back(run, t);
-        run(0);
-        for (auto& t : pool)
-            t.join();
-    }
+    // Spans are handed out from an atomic counter rather than split into
+    // contiguous per-worker blocks: a span's cost depends on how many windows
+    // it holds, and `slot` is what tells do_span WHICH embedder context to use
+    // (one per worker, never two concurrent calls on the same one).
+    core_parallel::for_each_task(n_spans, n_workers, [&](int si, int slot) { do_span(si, slot); });
 
     for (int i = 0; i < n_win; i++) {
         if (!ok[i]) {
