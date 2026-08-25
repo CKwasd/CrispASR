@@ -46,6 +46,24 @@ trained to produce. Port (`core/canary_chunk_merge.h`) validated two ways:
 unit vectors GENERATED FROM the Python functions (never from the port itself),
 and decoded-output word similarity 1.000/1.000/0.982 vs NeMo's own transcripts.
 
+Independently reproduced 2026-08-25 on a second box (Linux/CPU, q4_k vs the
+NeMo 2.7.3 blueprint transcripts from `tools/kaggle/canary-blueprint-ref`):
+1.0000 / 0.9840 / 0.9866 — and #375's duplication artifact is absent from all
+three. Worth recording what the residual ~1.3 % on the 600 s clip is MADE OF,
+because a single similarity ratio hides the distinction: 6 of the 8 diffs are
+cosmetic (`schlampige`/`schlammige`, `zivilisation`/`civilisation`, proper-noun
+spacing like `rayu kandelwal`/`ryukandelwal`, `nicht juden`/`nichtjuden`), but
+one is a **dropped 10-word clause**, and the 120 s prefix drops a different
+3-word span (`nachdem der Damm`). A drop is qualitatively worse than a
+substitution — it is content loss, which is the #350 failure mode — so the
+number alone should not be read as "1.3 % of words are spelled differently".
+Two things it is NOT: not quantization (q8_0 and q4_k are word-identical on a
+0-40 s single-pass cut, and both KEEP the clause the 600 s run loses), and not a
+seam artifact in any simple sense (the same clause survives a chunked 120 s run;
+the drops are position/window-dependent). Canary has no #350-style gap-fill
+repair pass, which is the obvious thing to reach for if this is ever worth
+closing — measure before building it.
+
 Two corollaries measured on the way:
 - **Chunking is REQUIRED for AED long-form, not a memory nicety**: single-pass
   past the ~40 s trained window EOSes early — a 59 s file silently lost
