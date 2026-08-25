@@ -23,7 +23,10 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <string>
+#include <system_error>
+#include <unistd.h>
 
 using crispasr_voice::read_model_speaker_identity;
 using crispasr_voice::SpeakerIdentity;
@@ -126,4 +129,53 @@ TEST_CASE("the memoised reader returns the same answer twice", "[unit][complianc
     std::error_code ec;
     std::filesystem::remove(path, ec);
     REQUIRE(read_model_speaker_identity(path) == SpeakerIdentity::RealPerson);
+}
+
+// A throwaway directory for the resolver cases below; the resolver only
+// rewrites a name when the file actually exists, so these need a real one.
+static std::string make_temp_dir() {
+    std::error_code ec;
+    const std::filesystem::path d =
+        std::filesystem::temp_directory_path(ec) / ("crispasr-voice-" + std::to_string((unsigned long)::getpid()));
+    std::filesystem::create_directories(d, ec);
+    return d.string();
+}
+
+// ---------------------------------------------------------------------------
+// #384: bare-name resolution is what makes the gate and the adapter agree.
+//
+// The server passes `voice` through VERBATIM by design and documents that the
+// backend adapter owns the interpretation. The provenance gate, meanwhile,
+// always resolves the name against --voice-dir. An adapter that skipped that
+// step therefore treated "reference" as a literal path — /v1/audio/speech
+// failed with "failed to load reference audio 'reference'" while /v1/voices
+// listed it happily, and the CLI worked because it was handed a full path.
+// Worse than the failure: the gate had already decided this was a clone of
+// voices/reference.wav, so the two surfaces disagreed about which file a name
+// meant. These pin the resolver contract the adapters now share.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("#384: a bare name resolves to the recording in --voice-dir", "[unit][compliance]") {
+    const std::string dir = make_temp_dir();
+    const std::string wav = dir + "/reference.wav";
+    { std::ofstream(wav) << "RIFF"; }
+
+    CHECK(crispasr_voice::resolve_voice_path("reference", dir) == wav);
+    // An explicit path is already resolved and must pass through untouched —
+    // this is what keeps the change idempotent for adapters that resolve, and
+    // for a second pass over an already-resolved value.
+    CHECK(crispasr_voice::resolve_voice_path(wav, dir) == wav);
+    std::remove(wav.c_str());
+}
+
+TEST_CASE("#384: a name that is no file in --voice-dir is left alone", "[unit][compliance]") {
+    const std::string dir = make_temp_dir();
+    // Preset / speaker / bank names must survive verbatim, or resolving would
+    // break every backend that selects a voice by name rather than by file.
+    CHECK(crispasr_voice::resolve_voice_path("fleurs-en", dir) == "fleurs-en");
+    CHECK(crispasr_voice::resolve_voice_path("alloy", dir) == "alloy");
+    // No --voice-dir configured: nothing to resolve against.
+    CHECK(crispasr_voice::resolve_voice_path("reference", "") == "reference");
+    // Traversal is refused before the filesystem is touched.
+    CHECK(crispasr_voice::resolve_voice_path("../secrets", dir) == "../secrets");
 }

@@ -10,6 +10,7 @@
 #include "crispasr_backend_utils.h"
 #include "crispasr_model_mgr_cli.h"
 #include "crispasr_model_registry.h"
+#include "crispasr_voice_provenance.h"
 #include "whisper_params.h"
 
 #include "core/audio_resample.h"
@@ -121,16 +122,25 @@ public:
     // Load + encode the reference WAV (voice cloning), re-loading only when the
     // path changes so single-shot and server callers pay the encode once.
     void prepare_voice(const whisper_params& params) {
-        if (params.tts_voice == last_voice_)
+        // Bare voice names resolve against --voice-dir: the server passes
+        // `voice` verbatim by design and the adapter owns the
+        // interpretation, so an unresolved adapter treats the literal name
+        // as a path and cloning silently fails over HTTP (#384). Shared
+        // resolver, so this agrees with the provenance gate; a name that
+        // is not a file there is returned unchanged.
+        const std::string voice = params.tts_voice.empty() || params.tts_voice_dir.empty()
+                                      ? params.tts_voice
+                                      : crispasr_voice::resolve_voice_path(params.tts_voice, params.tts_voice_dir);
+        if (voice == last_voice_)
             return;
-        last_voice_ = params.tts_voice;
-        if (params.tts_voice.empty()) {
+        last_voice_ = voice;
+        if (voice.empty()) {
             moss_tts_set_reference_wav(ctx_, nullptr, 0); // plain TTS
             return;
         }
         std::vector<float> ref;
         int sr = 0;
-        if (!crispasr::core::read_wav_mono_pcm16(params.tts_voice, ref, sr) || ref.empty()) {
+        if (!crispasr::core::read_wav_mono_pcm16(voice, ref, sr) || ref.empty()) {
             fprintf(stderr, "crispasr[moss-tts]: failed to load reference audio '%s'\n", params.tts_voice.c_str());
             last_voice_.clear();
             return;

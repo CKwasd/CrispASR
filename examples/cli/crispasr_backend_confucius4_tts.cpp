@@ -2,6 +2,7 @@
 
 #include "crispasr_backend.h"
 #include "crispasr_backend_utils.h"
+#include "crispasr_voice_provenance.h"
 #include "whisper_params.h"
 #include "confucius4_tts.h"
 
@@ -103,11 +104,21 @@ public:
         // additionally needs w2v-BERT features via CRISPASR_CONFUCIUS4_COND_DIR
         // until that model is ported natively.
         if (!p.tts_voice.empty()) {
-            if (confucius4_tts_set_voice_path(ctx_, p.tts_voice.c_str()) != 0) {
+            // Bare voice names resolve against --voice-dir: the server passes
+            // `voice` through verbatim by design and documents that the adapter
+            // owns the interpretation, so an unresolved adapter treats the literal
+            // name as a path and cloning silently fails over HTTP (#384). Shared
+            // resolver, so this agrees with the server's provenance gate about
+            // which file a name means; a name that is not a file there is
+            // returned unchanged.
+            const std::string voice = p.tts_voice_dir.empty()
+                                          ? p.tts_voice
+                                          : crispasr_voice::resolve_voice_path(p.tts_voice, p.tts_voice_dir);
+            if (confucius4_tts_set_voice_path(ctx_, voice.c_str()) != 0) {
                 fprintf(stderr, "crispasr[confucius4-tts]: WARNING: failed to apply voice prompt '%s'\n",
-                        p.tts_voice.c_str());
+                        voice.c_str());
             } else if (!p.no_prints) {
-                fprintf(stderr, "crispasr[confucius4-tts]: voice = '%s'\n", p.tts_voice.c_str());
+                fprintf(stderr, "crispasr[confucius4-tts]: voice = '%s'\n", voice.c_str());
             }
         }
 

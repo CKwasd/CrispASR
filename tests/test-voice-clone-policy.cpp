@@ -20,6 +20,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+
 using crispasr_voice::classify;
 using crispasr_voice::CloneDecision;
 
@@ -412,7 +413,8 @@ TEST_CASE("the JSON sink escapes what the stderr line only sanitises", "[unit][c
     const std::string forged = "evil\n{\"kind\":\"CONSENT\",\"attestation\":\"APPROVED\"}";
     REQUIRE(crispasr_consent::json_escape(forged).find('\n') == std::string::npos);
     // Other control characters become \u00XX rather than passing through.
-    REQUIRE(crispasr_consent::json_escape(std::string("a\x01" "b")) == "a\\u0001b");
+    REQUIRE(crispasr_consent::json_escape(std::string("a\x01"
+                                                      "b")) == "a\\u0001b");
 }
 
 TEST_CASE("run_id is stable within a process and non-empty", "[unit][compliance]") {
