@@ -61,17 +61,57 @@ def main():
     # Unigram piece scores (log-probs) — required for correct Viterbi tokenization.
     # XLM-RoBERTa's SP model is a Unigram model; greedy longest-match mis-segments
     # multi-subword words, so the engine runs Viterbi over these scores.
-    import sentencepiece as spm
+    # Two sources, because not every checkpoint ships the same files. This used
+    # to demand `sentencepiece.bpe.model` unconditionally and die with a 404 on
+    # any repo that ships only the fast tokenizer — kredor/punctuate-all, for
+    # one, which is a model this script is otherwise perfectly able to convert.
+    #
+    # Getting the scores is not optional. Without them the runtime falls back to
+    # greedy longest-match, and XLM-R's SP model is Unigram, where greedy is
+    # simply the wrong algorithm: `fox` has no `▁fox` piece, so Viterbi gives
+    # `▁`+`fox` while greedy takes the longest prefix `▁fo` and is left with `x`.
+    # Different ids, different embeddings, silently wrong output. The shipped
+    # punctuate-all GGUF carries only `tokenizer.ggml.tokens` and mis-segments
+    # exactly that way — it predates this block.
     from huggingface_hub import hf_hub_download
 
-    sp_path = hf_hub_download(args.input, "sentencepiece.bpe.model")
-    sp = spm.SentencePieceProcessor()
-    sp.Load(sp_path)
-    scores = []
-    for tok in vocab:
-        sid = sp.PieceToId(tok)  # 0 (<unk>) for HF special tokens not in the SP model
-        scores.append(float(sp.GetScore(sid)) if sid > 0 else 0.0)
-    print(f"  SP unigram scores: {len(scores)} (nonzero: {sum(1 for s in scores if s != 0.0)})")
+    scores = None
+    try:
+        import sentencepiece as spm
+
+        sp_path = hf_hub_download(args.input, "sentencepiece.bpe.model")
+        sp = spm.SentencePieceProcessor()
+        sp.Load(sp_path)
+        scores = []
+        for tok in vocab:
+            sid = sp.PieceToId(tok)  # 0 (<unk>) for HF specials not in the SP model
+            scores.append(float(sp.GetScore(sid)) if sid > 0 else 0.0)
+        print(f"  SP unigram scores from sentencepiece.bpe.model: {len(scores)}")
+    except Exception as e:
+        print(f"  no sentencepiece.bpe.model ({type(e).__name__}); trying tokenizer.json")
+
+    if scores is None:
+        # tokenizer.json's Unigram model carries [piece, score] pairs directly —
+        # the same numbers, just serialised by `tokenizers` instead of by
+        # sentencepiece.
+        import json
+
+        tj = json.load(open(hf_hub_download(args.input, "tokenizer.json")))
+        model = tj.get("model", {})
+        if model.get("type") != "Unigram":
+            raise RuntimeError(f"tokenizer.json model type is {model.get('type')!r}, expected Unigram")
+        piece_score = {p: float(sc) for p, sc in model["vocab"]}
+        scores = [piece_score.get(tok, 0.0) for tok in vocab]
+        print(f"  SP unigram scores from tokenizer.json: {len(scores)}")
+
+    nonzero = sum(1 for x in scores if x != 0.0)
+    print(f"  nonzero scores: {nonzero}/{len(scores)}")
+    # A vocab of 250k with almost nothing scored means the lookup silently missed
+    # (a piece-naming mismatch, say) and every score defaulted to 0.0 — which
+    # makes Viterbi degenerate and is worse than not shipping scores at all,
+    # because the runtime would then trust them.
+    if nonzero < len(scores) // 2:
+        raise RuntimeError(f"only {nonzero}/{len(scores)} pieces scored — the score lookup did not match the vocab")
 
     # Get labels
     labels = [config.id2label[i] for i in range(n_classes)]
@@ -81,7 +121,16 @@ def main():
 
     # Create GGUF
     writer = gguf.GGUFWriter(args.output, "fireredpunc")
-    writer.add_name("fullstop-punctuation-multilang-large")
+    # Name the model this actually IS, not the one this script was first written
+    # for. The literal "fullstop-punctuation-multilang-large" used to be
+    # hard-coded here regardless of --input, so a GGUF converted from any other
+    # checkpoint self-identified as the large model. That is not cosmetic: it is
+    # the provenance a reader checks when a result looks wrong, and it is the
+    # attribution that has to be right for the licence. The shipped
+    # `punctuate-all-*.gguf` carries the wrong name for exactly this reason — it
+    # is kredor/punctuate-all, XLM-R BASE (12L, d=768), while the name claims the
+    # 24L/1024 large model. Re-convert to correct an existing artifact.
+    writer.add_name(os.path.basename(str(args.input).rstrip("/")))
 
     writer.add_uint32("fireredpunc.d_model", d_model)
     writer.add_uint32("fireredpunc.d_ffn", d_ffn)
