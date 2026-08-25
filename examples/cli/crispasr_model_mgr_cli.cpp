@@ -202,7 +202,10 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     }
 
     fprintf(stderr, "crispasr: model '%s' not found locally.\n", effective_model_arg.c_str());
-    fprintf(stderr, "  Available for download: %s (%s)\n", match.filename.c_str(), match.approx_size.c_str());
+    if (match.approx_size.empty())
+        fprintf(stderr, "  Available for download: %s\n", match.filename.c_str());
+    else
+        fprintf(stderr, "  Available for download: %s (%s)\n", match.filename.c_str(), match.approx_size.c_str());
     if (!match.license.empty()) {
         const bool is_nc = crispasr_license_requires_acceptance(match.license);
         if (is_nc)

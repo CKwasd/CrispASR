@@ -20,9 +20,9 @@
 #include <string>
 
 #ifdef _WIN32
-#  include <direct.h>
-#  include <process.h>
-#  include <windows.h>
+#include <direct.h>
+#include <process.h>
+#include <windows.h>
 static std::string make_temp_dir() {
     char buf[MAX_PATH];
     GetTempPathA(MAX_PATH, buf);
@@ -33,11 +33,15 @@ static std::string make_temp_dir() {
     _mkdir(dir.c_str());
     return dir;
 }
-static void remove_file(const std::string& path) { DeleteFileA(path.c_str()); }
-static void remove_dir(const std::string& path) { _rmdir(path.c_str()); }
+static void remove_file(const std::string& path) {
+    DeleteFileA(path.c_str());
+}
+static void remove_dir(const std::string& path) {
+    _rmdir(path.c_str());
+}
 #else
-#  include <sys/stat.h>
-#  include <unistd.h>
+#include <sys/stat.h>
+#include <unistd.h>
 static std::string make_temp_dir() {
     const char* env = std::getenv("CRISPASR_SCRATCH_DIR");
     std::string base = (env && *env) ? env : ".scratch";
@@ -47,8 +51,12 @@ static std::string make_temp_dir() {
     char* buf = writable.data();
     return mkdtemp(buf) ? std::string(buf) : base;
 }
-static void remove_file(const std::string& path) { ::unlink(path.c_str()); }
-static void remove_dir(const std::string& path) { ::rmdir(path.c_str()); }
+static void remove_file(const std::string& path) {
+    ::unlink(path.c_str());
+}
+static void remove_dir(const std::string& path) {
+    ::rmdir(path.c_str());
+}
 #endif
 
 static void write_dummy(const std::string& path) {
@@ -84,7 +92,10 @@ TEST_CASE("companion: sibling file found next to model skips resolve", "[unit][c
         REQUIRE(sep != std::string::npos);
         const std::string sibling = model_path.substr(0, sep + 1) + entry.companion_filename;
         FILE* f = fopen(sibling.c_str(), "rb");
-        if (f) { fclose(f); companion_found = true; }
+        if (f) {
+            fclose(f);
+            companion_found = true;
+        }
     }
     REQUIRE(companion_found);
 
@@ -109,7 +120,10 @@ TEST_CASE("companion: sibling file absent triggers resolve path", "[unit][compan
         REQUIRE(sep != std::string::npos);
         const std::string sibling = model_path.substr(0, sep + 1) + entry.companion_filename;
         FILE* f = fopen(sibling.c_str(), "rb");
-        if (f) { fclose(f); companion_found = true; }
+        if (f) {
+            fclose(f);
+            companion_found = true;
+        }
     }
     REQUIRE_FALSE(companion_found);
 
@@ -190,4 +204,27 @@ TEST_CASE("companion: chatterbox-s3gen lookup_by_filename shows vocoder size", "
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup_by_filename("chatterbox-s3gen-q8_0.gguf", e));
     REQUIRE(e.approx_size == "~627 MB");
+}
+
+// #393: `--model-quant f16` rewrote the filename and URL to the f16 artifact
+// but kept the registry row's approx_size, so a 4.7 GB download was announced
+// as "~1.3 GB" (the q4_k figure). Per-quant sizes are not in the registry and
+// a ratio-scaled guess would be an invention — this quantizer keeps norms and
+// embeddings at F16, so the ratio is model-dependent — so a substituted quant
+// reports NO size rather than a wrong one. The un-substituted lookup must keep
+// reporting its size, or this "fix" would just delete information.
+TEST_CASE("quant: a substituted quant reports no size instead of the wrong one (#393)", "[unit][companion]") {
+    CrispasrRegistryEntry base;
+    REQUIRE(crispasr_registry_lookup("qwen3-1.7b", base));
+    const std::string default_name = base.filename;
+    REQUIRE_FALSE(base.approx_size.empty()); // the default row still has its size
+
+    CrispasrRegistryEntry f16;
+    REQUIRE(crispasr_registry_lookup("qwen3-1.7b", f16, "f16"));
+    if (f16.filename == default_name)
+        SKIP("registry default for this backend is already f16");
+
+    INFO("default " << default_name << " (" << base.approx_size << ") vs f16 " << f16.filename);
+    CHECK(f16.url.find(f16.filename) != std::string::npos); // filename/URL did get rewritten
+    CHECK(f16.approx_size.empty());                         // and the stale size is not reported
 }

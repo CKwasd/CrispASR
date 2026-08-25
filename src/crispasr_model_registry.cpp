@@ -1499,11 +1499,21 @@ void fill(CrispasrRegistryEntry& out, const Entry& e, const std::string& preferr
     out.backend = e.backend;
     out.filename = filename;
     out.url = replace_tail_filename(e.url, e.filename, filename);
-    out.approx_size = e.approx_size;
+    // `approx_size` describes the artifact the registry row NAMES. Once
+    // --model-quant has rewritten the filename to a different quant, that
+    // number no longer describes what would be downloaded — reporting the
+    // q4_k size for an f16 fetch understated a 4.7 GB download as "~1.3 GB"
+    // (#393). The per-quant sizes are not in the registry, and a ratio-scaled
+    // guess would be an invention (this quantizer keeps norms and embeddings
+    // at F16, so the ratio is model-dependent), so say nothing rather than
+    // something false; every consumer treats an empty size as "unknown".
+    out.approx_size = (filename == e.filename && e.approx_size) ? e.approx_size : "";
     if (e.companion_file && e.companion_url) {
         out.companion_filename = apply_quant_to_filename(e.companion_file, preferred_quant);
         out.companion_url = replace_tail_filename(e.companion_url, e.companion_file, out.companion_filename);
-        out.companion_approx_size = e.companion_size ? e.companion_size : e.approx_size;
+        out.companion_approx_size = (out.companion_filename == e.companion_file)
+                                        ? (e.companion_size ? e.companion_size : (e.approx_size ? e.approx_size : ""))
+                                        : ""; // same reasoning as approx_size above
     } else {
         out.companion_filename.clear();
         out.companion_url.clear();

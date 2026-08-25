@@ -8,7 +8,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #ifdef __APPLE__
@@ -455,10 +457,23 @@ std::string dir(const std::string& cache_dir_override) {
 }
 
 bool file_present(const std::string& path) {
-    struct stat st;
-    if (stat(path.c_str(), &st) != 0)
+    // std::filesystem, not stat(): on MSVC `stat` resolves to `_stat64i32`,
+    // whose st_size is a 32-bit field, and the call FAILS outright for a file
+    // larger than 2 GiB. Every GGUF worth caching is bigger than that, so the
+    // probe reported "missing" for a model that was sitting right there and
+    // -m auto re-downloaded it (#393); the same helper validates a finished
+    // download, so a >2 GiB fetch could also be judged failed after it
+    // succeeded. Same reasoning as the file_size() note in chat.cpp.
+    // Plain path(std::string), not u8path(): these paths come from getenv /
+    // argv, i.e. the platform's narrow encoding, which is what path() assumes
+    // (u8path would misread a non-ASCII Windows profile dir, and is deprecated
+    // in C++20). Matches chat.cpp's construction.
+    std::error_code ec;
+    const std::filesystem::path fp(path);
+    if (!std::filesystem::is_regular_file(fp, ec) || ec)
         return false;
-    return st.st_size > 0;
+    const std::uintmax_t sz = std::filesystem::file_size(fp, ec);
+    return !ec && sz > 0;
 }
 
 // Worker: download `url` straight into `dest` (which the public fetch() sets to
