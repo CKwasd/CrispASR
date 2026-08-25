@@ -166,9 +166,13 @@ struct confucius4_dit_cache {
     ggml_tensor* t2_emb_in = nullptr; // (dim,)     — timestep embedding (t2 for WaveNet)
     ggml_tensor* x_mel_in = nullptr;  // (mel_dim, T) — original x for skip_linear
     ggml_tensor* pos_in = nullptr;    // (T,) I32   — RoPE position indices
+    ggml_tensor* attn_mask = nullptr; // (2T, 2T) F16 — block-diagonal mask (fused CFG only)
     ggml_tensor* output = nullptr;    // (mel_dim, T) — velocity output
     int T_cached = 0;
     int mel_dim_cached = 0;
+    bool fused_cfg = false;     // graph runs cond+uncond seq-concat with in-graph blend
+    float cfg_rate_cached = 0.0f;
+    std::vector<ggml_fp16_t> mask_host; // host copy of the block-diagonal mask
 
     void reset() {
         if (galloc) {
@@ -180,8 +184,11 @@ struct confucius4_dit_cache {
             gctx = nullptr;
         }
         gf = nullptr;
-        hidden_in = t_emb_in = t2_emb_in = x_mel_in = pos_in = output = nullptr;
+        hidden_in = t_emb_in = t2_emb_in = x_mel_in = pos_in = attn_mask = output = nullptr;
         T_cached = mel_dim_cached = 0;
+        fused_cfg = false;
+        cfg_rate_cached = 0.0f;
+        mask_host.clear();
     }
     ~confucius4_dit_cache() { reset(); }
 };
@@ -2412,9 +2419,20 @@ static std::vector<float> s2a_input_embed_cpu(confucius4_tts_context* ctx, const
 
 // Build the DiT ggml graph for transformer blocks + final output.
 // Produces velocity (mel_dim, T) from hidden input + timestep embedding.
-static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim) {
+//
+// fused=true builds the CFG-fused variant (CRISPASR_CONFUCIUS4_CFG_FUSE=1):
+// cond and uncond are seq-concatenated along time ([0,T) = cond, [T,2T) =
+// uncond) and separated by a block-diagonal flash-attn mask — ONE graph eval
+// per ODE step instead of two (dev-guide: seq-concat beats a 4D batch dim).
+// Every op in the graph is per-frame except attention (masked) and the
+// WaveNet k=5 convs, which would leak ±2 frames/layer across the seam — so
+// the WaveNet runs per-arm on split halves inside the same graph.  The CFG
+// blend (1+cfg)*v_cond - cfg*v_uncond happens in-graph; output is (mel, T).
+static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim, bool fused = false,
+                                float cfg_rate = 0.0f) {
     auto& cache = ctx->dit_cache;
-    if (cache.T_cached == T && cache.mel_dim_cached == mel_dim && cache.galloc)
+    if (cache.T_cached == T && cache.mel_dim_cached == mel_dim && cache.fused_cfg == fused &&
+        (!fused || cache.cfg_rate_cached == cfg_rate) && cache.galloc)
         return true;
     cache.reset();
 
@@ -2425,6 +2443,7 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     const int depth = s.hp.estimator_depth;
     const int half = depth / 2;
     const int vb = ctx->params.verbosity;
+    const int Tg = fused ? 2 * T : T; // graph-side sequence length
 
     // Debug taps: when CRISPASR_CONFUCIUS4_DUMP_S2A is set, mark selected
     // intermediates as graph outputs so gallocr cannot elide them, and read
@@ -2443,8 +2462,8 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     const int inter_dim = w1_0 ? (int)w1_0->ne[1] : dim * 4;
 
     if (vb >= 1)
-        fprintf(stderr, "confucius4: DiT graph: depth=%d dim=%d heads=%d inter=%d mel=%d T=%d\n", depth, dim, n_heads,
-                inter_dim, mel_dim, T);
+        fprintf(stderr, "confucius4: DiT graph: depth=%d dim=%d heads=%d inter=%d mel=%d T=%d%s\n", depth, dim,
+                n_heads, inter_dim, mel_dim, T, fused ? " (CFG-fused, 2T)" : "");
 
     // Allocate graph context: ~35 ops per block × depth + ~20 finals
     struct ggml_init_params p = {4 * 1024 * 1024, nullptr, true};
@@ -2453,7 +2472,7 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
         return false;
 
     // Graph inputs
-    cache.hidden_in = ggml_new_tensor_2d(cache.gctx, GGML_TYPE_F32, dim, T);
+    cache.hidden_in = ggml_new_tensor_2d(cache.gctx, GGML_TYPE_F32, dim, Tg);
     ggml_set_name(cache.hidden_in, "dit_in");
     ggml_set_input(cache.hidden_in);
 
@@ -2461,13 +2480,22 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     ggml_set_name(cache.t_emb_in, "dit_t");
     ggml_set_input(cache.t_emb_in);
 
-    cache.x_mel_in = ggml_new_tensor_2d(cache.gctx, GGML_TYPE_F32, mel_dim, T);
+    cache.x_mel_in = ggml_new_tensor_2d(cache.gctx, GGML_TYPE_F32, mel_dim, Tg);
     ggml_set_name(cache.x_mel_in, "dit_xmel");
     ggml_set_input(cache.x_mel_in);
 
-    cache.pos_in = ggml_new_tensor_1d(cache.gctx, GGML_TYPE_I32, T);
+    cache.pos_in = ggml_new_tensor_1d(cache.gctx, GGML_TYPE_I32, Tg);
     ggml_set_name(cache.pos_in, "dit_pos");
     ggml_set_input(cache.pos_in);
+
+    if (fused) {
+        // Block-diagonal attention mask (n_kv, n_q) F16: each arm attends only
+        // to its own frames.  Re-set on EVERY compute (gallocr may reuse input
+        // buffers as scratch — the §234 aliasing gotcha).
+        cache.attn_mask = ggml_new_tensor_2d(cache.gctx, GGML_TYPE_F16, Tg, Tg);
+        ggml_set_name(cache.attn_mask, "dit_mask");
+        ggml_set_input(cache.attn_mask);
+    }
 
     // Helper to find a DiT tensor by formatted name
     char nbuf[256];
@@ -2519,13 +2547,14 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
 
             ggml_tensor* qkv = ggml_mul_mat(cache.gctx, wqkv, normed);
             int esz = (int)ggml_element_size(qkv);
-            ggml_tensor* q = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, qkv, dim, T, 3 * dim * esz, 0));
-            ggml_tensor* k = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, qkv, dim, T, 3 * dim * esz, dim * esz));
-            ggml_tensor* v = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, qkv, dim, T, 3 * dim * esz, 2 * dim * esz));
+            ggml_tensor* q = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, qkv, dim, Tg, 3 * dim * esz, 0));
+            ggml_tensor* k = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, qkv, dim, Tg, 3 * dim * esz, dim * esz));
+            ggml_tensor* v =
+                ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, qkv, dim, Tg, 3 * dim * esz, 2 * dim * esz));
 
-            q = ggml_reshape_3d(cache.gctx, q, head_dim, n_heads, T);
-            k = ggml_reshape_3d(cache.gctx, k, head_dim, n_heads, T);
-            v = ggml_reshape_3d(cache.gctx, v, head_dim, n_heads, T);
+            q = ggml_reshape_3d(cache.gctx, q, head_dim, n_heads, Tg);
+            k = ggml_reshape_3d(cache.gctx, k, head_dim, n_heads, Tg);
+            v = ggml_reshape_3d(cache.gctx, v, head_dim, n_heads, Tg);
 
             q = ggml_rope_ext(cache.gctx, q, cache.pos_in, nullptr, head_dim, 0, 0, 10000.0f, 1.0f, 0.0f, 1.0f, 0.0f,
                               0.0f);
@@ -2537,8 +2566,8 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
             v = ggml_permute(cache.gctx, v, 0, 2, 1, 3);
 
             float scale = 1.0f / sqrtf((float)head_dim);
-            ggml_tensor* attn = ggml_flash_attn_ext(cache.gctx, q, k, v, nullptr, scale, 0.0f, 0.0f);
-            attn = ggml_reshape_2d(cache.gctx, attn, dim, T);
+            ggml_tensor* attn = ggml_flash_attn_ext(cache.gctx, q, k, v, cache.attn_mask, scale, 0.0f, 0.0f);
+            attn = ggml_reshape_2d(cache.gctx, attn, dim, Tg);
 
             ggml_tensor* attn_proj = ggml_mul_mat(cache.gctx, wo, attn);
             x = ggml_add(cache.gctx, x, attn_proj);
@@ -2640,7 +2669,6 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
     auto cond_w = s2a_find(s, "decoder.estimator.wavenet.cond_layer.conv.weight");
     auto cond_b = s2a_find(s, "decoder.estimator.wavenet.cond_layer.conv.bias");
 
-    ggml_tensor* x_wn = x_conv1; // (T, dim) time-first for ggml_conv_1d
     ggml_tensor* wn_output = nullptr;
 
     if (cond_w) {
@@ -2653,10 +2681,16 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
         if (cond_b)
             g_all = ggml_add(cache.gctx, g_all, cond_b);
 
-        wn_output = ggml_dup(cache.gctx, ggml_scale(cache.gctx, x_wn, 0.0f)); // zeros (T, dim)
+        // One WaveNet stack over a (T_w, dim) time-first input.  Runs once in
+        // the plain graph; in the fused graph it runs once PER ARM — the k=5
+        // convs would otherwise smear cond and uncond into each other across
+        // the concat seam (±2 frames per layer, compounding through the
+        // residual chain).
+        auto build_wavenet = [&](ggml_tensor* x_wn, int T_w) -> ggml_tensor* {
+            ggml_tensor* wn_out = ggml_dup(cache.gctx, ggml_scale(cache.gctx, x_wn, 0.0f)); // zeros (T_w, dim)
 
-        char nbuf[256];
-        for (int il = 0; il < n_wn_layers; il++) {
+            char nbuf[256];
+            for (int il = 0; il < n_wn_layers; il++) {
             // in_layers[il]: Conv1d(dim, 2*dim, k=5, pad=2) — fused weight
             snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.in_layers.%d.conv.weight", il);
             auto il_w = s2a_find(s, nbuf);
@@ -2684,9 +2718,9 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
             // `hidden` ROWS in -- hidden * nb[1], not hidden * element_size.
             // Using the element size offsets by `hidden` samples along TIME
             // instead, which makes the sigmoid half overlap the tanh half.
-            ggml_tensor* xa = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T, hidden, stride1, 0));
+            ggml_tensor* xa = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T_w, hidden, stride1, 0));
             ggml_tensor* xb =
-                ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T, hidden, stride1, (size_t)hidden * stride1));
+                ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T_w, hidden, stride1, (size_t)hidden * stride1));
             // Reshape g_a/g_b from (hidden,) to (1, hidden) for time-first broadcast
             ggml_tensor* ga2 = ggml_reshape_2d(cache.gctx, g_a, 1, hidden);
             ggml_tensor* gb2 = ggml_reshape_2d(cache.gctx, g_b, 1, hidden);
@@ -2713,15 +2747,29 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
                 // rs_out is (T, rs_ch) time-first. Split: res=(T,hidden), skip=(T,hidden)
                 int64_t rs_stride = rs_out->nb[1];
                 // Same channel-axis split as above: offset by rows, not elements.
-                ggml_tensor* res = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, rs_out, T, hidden, rs_stride, 0));
+                ggml_tensor* res = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, rs_out, T_w, hidden, rs_stride, 0));
                 ggml_tensor* skip = ggml_cont(
-                    cache.gctx, ggml_view_2d(cache.gctx, rs_out, T, hidden, rs_stride, (size_t)hidden * rs_stride));
+                    cache.gctx, ggml_view_2d(cache.gctx, rs_out, T_w, hidden, rs_stride, (size_t)hidden * rs_stride));
                 x_wn = ggml_add(cache.gctx, x_wn, res);
-                wn_output = ggml_add(cache.gctx, wn_output, skip);
+                wn_out = ggml_add(cache.gctx, wn_out, skip);
             } else {
                 // Last layer: output += rs_out
-                wn_output = ggml_add(cache.gctx, wn_output, rs_out);
+                wn_out = ggml_add(cache.gctx, wn_out, rs_out);
             }
+            }
+            return wn_out;
+        };
+
+        if (!fused) {
+            wn_output = build_wavenet(x_conv1, T);
+        } else {
+            // Split the fused (2T, dim) time-first tensor into per-arm halves,
+            // run the WaveNet on each, and re-concat along time.
+            ggml_tensor* h_cond =
+                ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_conv1, T, dim, x_conv1->nb[1], 0));
+            ggml_tensor* h_unc = ggml_cont(
+                cache.gctx, ggml_view_2d(cache.gctx, x_conv1, T, dim, x_conv1->nb[1], (size_t)T * sizeof(float)));
+            wn_output = ggml_concat(cache.gctx, build_wavenet(h_cond, T), build_wavenet(h_unc, T), 0);
         }
     }
 
@@ -2776,6 +2824,15 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
             x = ggml_add(cache.gctx, x, c2_b);
     }
 
+    if (fused) {
+        // CFG blend in-graph: rows [0,T) are the cond arm, [T,2T) the uncond
+        // arm.  v = (1 + cfg) * v_cond - cfg * v_uncond, output (out_dim, T).
+        ggml_tensor* v_cond = ggml_view_2d(cache.gctx, x, x->ne[0], T, x->nb[1], 0);
+        ggml_tensor* v_unc = ggml_view_2d(cache.gctx, x, x->ne[0], T, x->nb[1], (size_t)T * x->nb[1]);
+        x = ggml_add(cache.gctx, ggml_scale(cache.gctx, v_cond, 1.0f + cfg_rate),
+                     ggml_scale(cache.gctx, v_unc, -cfg_rate));
+    }
+
     ggml_set_name(x, "velocity");
     ggml_set_output(x);
     cache.output = x;
@@ -2793,6 +2850,8 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
 
     cache.T_cached = T;
     cache.mel_dim_cached = mel_dim;
+    cache.fused_cfg = fused;
+    cache.cfg_rate_cached = cfg_rate;
 
     if (vb >= 1)
         fprintf(stderr, "confucius4: DiT graph built: %d nodes\n", ggml_graph_n_nodes(cache.gf));
@@ -2802,28 +2861,53 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim)
 
 // Run one DiT forward pass. hidden: (T*dim), t1/t2: (dim), x_mel: (T*mel_dim).
 // Returns velocity as (T*out_dim) row-major, or empty on failure.
+// fused=true runs the CFG-fused graph: hidden and x_mel then hold BOTH arms
+// (2T frames, cond first), and the returned velocity is already CFG-blended
+// over T frames.
 static std::vector<float> s2a_dit_run(confucius4_tts_context* ctx, const float* hidden, const float* t1_emb,
-                                      const float* t2_emb, const float* x_mel, int T, int mel_dim) {
+                                      const float* t2_emb, const float* x_mel, int T, int mel_dim, bool fused = false,
+                                      float cfg_rate = 0.0f) {
     auto& cache = ctx->dit_cache;
-    if (!s2a_dit_cache_build(ctx, T, mel_dim))
+    if (!s2a_dit_cache_build(ctx, T, mel_dim, fused, cfg_rate))
         return {};
 
     if (!ggml_gallocr_alloc_graph(cache.galloc, cache.gf))
         return {};
 
     const int dim = ctx->s2a.hp.estimator_hidden_dim;
+    const int Tg = fused ? 2 * T : T;
 
-    ggml_backend_tensor_set(cache.hidden_in, hidden, 0, (size_t)T * dim * sizeof(float));
+    ggml_backend_tensor_set(cache.hidden_in, hidden, 0, (size_t)Tg * dim * sizeof(float));
     ggml_backend_tensor_set(cache.t_emb_in, t1_emb, 0, (size_t)dim * sizeof(float));
     if (cache.t2_emb_in)
         ggml_backend_tensor_set(cache.t2_emb_in, t2_emb, 0, (size_t)dim * sizeof(float));
-    ggml_backend_tensor_set(cache.x_mel_in, x_mel, 0, (size_t)T * mel_dim * sizeof(float));
+    ggml_backend_tensor_set(cache.x_mel_in, x_mel, 0, (size_t)Tg * mel_dim * sizeof(float));
 
-    // Position indices must be re-set each call (gallocr may alias input buffers)
-    std::vector<int32_t> pos(T);
-    for (int i = 0; i < T; i++)
-        pos[i] = i;
-    ggml_backend_tensor_set(cache.pos_in, pos.data(), 0, (size_t)T * sizeof(int32_t));
+    // Position indices must be re-set each call (gallocr may alias input
+    // buffers).  In the fused graph both arms use positions [0, T).
+    std::vector<int32_t> pos(Tg);
+    for (int i = 0; i < Tg; i++)
+        pos[i] = i % T;
+    ggml_backend_tensor_set(cache.pos_in, pos.data(), 0, (size_t)Tg * sizeof(int32_t));
+
+    if (fused && cache.attn_mask) {
+        // Block-diagonal mask, re-set EVERY call (gallocr reuses input buffers
+        // as scratch after their last read — the §234 aliasing gotcha).
+        if ((int64_t)cache.mask_host.size() != (int64_t)Tg * Tg) {
+            cache.mask_host.assign((size_t)Tg * Tg, ggml_fp32_to_fp16(0.0f));
+            const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+            for (int qi = 0; qi < Tg; qi++) {
+                ggml_fp16_t* row = cache.mask_host.data() + (size_t)qi * Tg;
+                // keys of the OTHER arm are masked out
+                if (qi < T)
+                    std::fill(row + T, row + Tg, ninf);
+                else
+                    std::fill(row, row + T, ninf);
+            }
+        }
+        ggml_backend_tensor_set(cache.attn_mask, cache.mask_host.data(), 0,
+                                cache.mask_host.size() * sizeof(ggml_fp16_t));
+    }
 
     if (ggml_backend_graph_compute(ctx->backend, cache.gf) != GGML_STATUS_SUCCESS)
         return {};
@@ -2901,6 +2985,47 @@ static std::vector<float> s2a_dit_forward(confucius4_tts_context* ctx, const flo
 
     // Full ggml graph: DiT blocks + WaveNet + final_layer + conv2 → velocity
     return s2a_dit_run(ctx, hidden.data(), t1.data(), t2.data(), x_flat, T, mel_dim);
+}
+
+// CFG-fused DiT forward (CRISPASR_CONFUCIUS4_CFG_FUSE=1): the cond and uncond
+// estimator passes run as ONE graph eval per ODE step — seq-concat along time
+// with a block-diagonal attention mask, per-arm WaveNet, in-graph blend.
+// Returns the CFG-blended velocity (T*mel_dim) row-major, or empty on failure.
+static std::vector<float> s2a_dit_forward_cfg_fused(confucius4_tts_context* ctx, const float* x_flat, int T,
+                                                    int mel_dim, const float* cond, const float* cond_ref,
+                                                    const float* cond_zeros, const float* cond_ref_zeros,
+                                                    float timestep, float cfg_rate) {
+    const auto& s = ctx->s2a;
+    const int dim = s.hp.estimator_hidden_dim;
+
+    // Timestep embeddings are shared by both arms (same t).
+    auto t1 = s2a_timestep_embed_cpu(s, timestep, "decoder.estimator.t_embedder", dim);
+    auto t2 = s2a_timestep_embed_cpu(s, timestep, "decoder.estimator.t_embedder2", dim);
+    if (t1.empty()) {
+        fprintf(stderr, "confucius4: timestep embedding failed\n");
+        return {};
+    }
+    if (t2.empty())
+        t2 = t1;
+
+    // Per-arm input embeddings, concatenated cond-first along time.
+    auto h_cond = s2a_input_embed_cpu(ctx, x_flat, cond_ref, cond, T, mel_dim, /*use_spk=*/true);
+    auto h_unc = s2a_input_embed_cpu(ctx, x_flat, cond_ref_zeros, cond_zeros, T, mel_dim, /*use_spk=*/false);
+    if (h_cond.empty() || h_unc.empty()) {
+        fprintf(stderr, "confucius4: input embedding failed\n");
+        return {};
+    }
+
+    std::vector<float> hidden2((size_t)2 * T * dim);
+    std::memcpy(hidden2.data(), h_cond.data(), h_cond.size() * sizeof(float));
+    std::memcpy(hidden2.data() + h_cond.size(), h_unc.data(), h_unc.size() * sizeof(float));
+
+    // Both arms see the same noisy x for the skip_linear input.
+    std::vector<float> x_mel2((size_t)2 * T * mel_dim);
+    std::memcpy(x_mel2.data(), x_flat, (size_t)T * mel_dim * sizeof(float));
+    std::memcpy(x_mel2.data() + (size_t)T * mel_dim, x_flat, (size_t)T * mel_dim * sizeof(float));
+
+    return s2a_dit_run(ctx, hidden2.data(), t1.data(), t2.data(), x_mel2.data(), T, mel_dim, /*fused=*/true, cfg_rate);
 }
 
 // ---------------------------------------------------------------------------
@@ -3275,6 +3400,20 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
         cond_ref_zeros.assign(cond_ref.size(), 0.0f);
     }
 
+    // CFG fusion: run cond+uncond as ONE DiT graph eval per ODE step
+    // (seq-concat + block-diagonal mask, s2a_dit_forward_cfg_fused).  Default
+    // OFF until the CUDA A/B validates speed + roundtrip (LEARNING 35); the
+    // parity dumps force it off because the harness expects per-pass
+    // semantics.
+    bool cfg_fuse = false;
+    if (const char* env_fuse = std::getenv("CRISPASR_CONFUCIUS4_CFG_FUSE"))
+        if (*env_fuse)
+            cfg_fuse = atoi(env_fuse) != 0;
+    if (s2a_dump_dir())
+        cfg_fuse = false;
+    if (vb >= 1 && cfg_fuse && cfg_rate > 0.0f)
+        fprintf(stderr, "confucius4: S2A CFG fusion ON (1 fused DiT pass per step)\n");
+
     // Time schedule.  MaskedDiffWithXvecConfig.cfm_t_scheduler defaults to
     // "linear" and config/inference_config.yaml does not override it, so the
     // shipped model solves over a plain linspace(0, 1, n_steps + 1).  (The
@@ -3298,8 +3437,18 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
         float dt = t_span[step] - t_span[step - 1];
         float t = t_span[step - 1];
 
+        std::vector<float> velocity;
+        if (cfg_rate > 0.0f && cfg_fuse) {
+            // Fused CFG: both arms in one graph eval, blend done in-graph.
+            velocity = s2a_dit_forward_cfg_fused(ctx, z.data(), T_total, mel_dim, cond.data(), cond_ref.data(),
+                                                 cond_zeros.data(), cond_ref_zeros.data(), t, cfg_rate);
+            if (velocity.empty()) {
+                fprintf(stderr, "confucius4: fused DiT forward failed at step %d\n", step);
+                return {};
+            }
+        } else {
         // Conditioned pass.
-        auto velocity = s2a_dit_forward(ctx, z.data(), T_total, mel_dim, cond.data(), cond_ref.data(), t);
+        velocity = s2a_dit_forward(ctx, z.data(), T_total, mel_dim, cond.data(), cond_ref.data(), t);
         if (velocity.empty()) {
             fprintf(stderr, "confucius4: DiT forward failed at step %d\n", step);
             return {};
@@ -3323,6 +3472,7 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
             }
             for (size_t i = 0; i < velocity.size(); i++)
                 velocity[i] = (1.0f + cfg_rate) * velocity[i] - cfg_rate * v_uncond[i];
+        }
         }
 
         // Per-step dump: the state the velocity was computed FROM, and the

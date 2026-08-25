@@ -63,6 +63,21 @@ GPU-effort doc: `/mnt/volume1/conf4gpu.md`.
 (seq-concat + block-diagonal mask — now the biggest CUDA lever); bucketed-Lk
 persistent decode; BigVGAN raw-path A/B; Metal/Vulkan validation (Mac).
 
+## CFG fusion (`CRISPASR_CONFUCIUS4_CFG_FUSE=1`)
+
+The two per-step DiT estimator passes (cond + uncond) run as ONE graph eval:
+seq-concat along time (`[0,T)` = cond, `[T,2T)` = uncond) with a
+block-diagonal F16 flash-attn mask, positions `[0..T-1, 0..T-1]`, and the
+CFG blend `(1+cfg)*v_cond - cfg*v_uncond` done in-graph (output is `(mel,
+T)`, halving the readback).  Every graph op is per-frame except attention
+(masked) and the WaveNet k=5 convs — those would smear the arms into each
+other across the seam (±2 frames/layer through the residual chain), so the
+WaveNet runs per-arm on split halves inside the same graph.  The mask and
+positions are re-set on EVERY compute (§234 gallocr aliasing).  Parity dumps
+(`CRISPASR_CONFUCIUS4_DUMP_S2A`) force fusion off — the harness expects
+per-pass semantics.  Default OFF until the CUDA A/B (gpu-verify run 2+)
+proves wall-time win + 8/8 roundtrip on both s2a f16 and q4_k.
+
 ### 13 bugs total — 9–13 this session
 
 ### Bugs 9–12 (this session, all found by line-by-line reading + parity)

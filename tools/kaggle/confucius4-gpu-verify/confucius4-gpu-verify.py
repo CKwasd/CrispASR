@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """Kaggle GPU kernel: validate + time the Confucius4-TTS ggml GPU path (CUDA).
 
-LEARNING 35: "correct on CPU" is not sufficient — CUDA has stricter per-op
-contracts, so the decoded-output roundtrip must run on a real CUDA box before
-any GPU default ships. Arms (all fully native `--voice`, jfk.wav prompt):
+Run 1 (P100) validated the base CUDA path: CPU-ctrl 685.2s, GPU 183.2s
+(3.74x), GPU-persist neutral, roundtrip 8/8 everywhere.  This revision A/Bs
+the CFG fusion lever (CRISPASR_CONFUCIUS4_CFG_FUSE=1: cond+uncond in ONE DiT
+graph eval per ODE step, seq-concat + block-diagonal mask) on BOTH s2a f16
+and s2a q4_k (quant amplifies divergence — dev-guide A/B rule).  Arms (all
+fully native `--voice`, jfk.wav prompt):
 
-  CPU-ctrl     --no-gpu                       — control (matches run 18-20)
-  GPU          default (CUDA)                 — the ggml GPU path under test
-  GPU-persist  + CRISPASR_CONFUCIUS4_PERSIST  — persistent decode graph; on
-                                                GPU per-step dispatch is
-                                                launch-bound, so THIS is where
-                                                it should win (CPU A/B run 20:
-                                                it lost by 1.7%)
+  GPU           s2a f16, fusion off  — baseline (matches run 1: 183.2s)
+  GPU-fuse      s2a f16, fusion on
+  GPU-q4k       s2a q4_k, fusion off — q4_k baseline (first q4_k GPU run)
+  GPU-q4k-fuse  s2a q4_k, fusion on
 
-GPU PCM will NOT be bit-identical to CPU (fp reordering flips sampled
-near-ties) — the gates are the whisper roundtrip transcript + wall time.
+Fused PCM will NOT be bit-identical to unfused (masked flash-attn reorders
+the fp reductions) — the gates are the whisper roundtrip transcript + rms +
+wall time.  Default flip only if fuse wins wall-time AND keeps 8/8
+(LEARNING 35).
 
 Push (chr1s4 is the default account; needs chr1s4/crispasr-ccache for the
 warm CUDA build):
@@ -75,7 +77,7 @@ def grab(repo, fname, **kw):
 
 
 t2s_path = grab("cstr/confucius4-tts-GGUF", "confucius4-tts-t2s-q4_k.gguf")
-grab("cstr/confucius4-tts-GGUF", "confucius4-tts-s2a-q4_k.gguf")
+s2a_q4k = grab("cstr/confucius4-tts-GGUF", "confucius4-tts-s2a-q4_k.gguf")
 s2a_f16 = grab("cstr/confucius4-tts-GGUF", "confucius4-tts-s2a-f16.gguf")
 grab("cstr/confucius4-tts-GGUF", "confucius4-tts-bigvgan-22k-f16.gguf")
 grab("cstr/confucius4-tts-GGUF", "confucius4-tts-w2v-f16.gguf")
@@ -100,20 +102,22 @@ print(f"  binary: {crispasr_bin} ({os.path.getsize(crispasr_bin) / 1024**2:.0f} 
 prompt_wav = REPO / "samples" / "jfk.wav"
 
 kh.step("synthesis arms")
+FUSE = {"CRISPASR_CONFUCIUS4_CFG_FUSE": "1"}
 arms = [
-    ("CPU-ctrl", {}, ["--no-gpu"]),
-    ("GPU", {}, []),
-    ("GPU-persist", {"CRISPASR_CONFUCIUS4_PERSIST": "1"}, []),
+    ("GPU", {}, [], s2a_f16),
+    ("GPU-fuse", FUSE, [], s2a_f16),
+    ("GPU-q4k", {}, [], s2a_q4k),
+    ("GPU-q4k-fuse", FUSE, [], s2a_q4k),
 ]
 results = {}
-for tag, extra_env, extra_args in arms:
+for tag, extra_env, extra_args, s2a_path in arms:
     wav = TEMP / f"c4_gpu_{tag}.wav"
     env = dict(os.environ)
     env.update(extra_env)
     t0 = time.monotonic()
     r = subprocess.run(
         [crispasr_bin, "--backend", "confucius4-tts", "-m", t2s_path,
-         "--codec-model", s2a_f16, "--tts", TEST_TEXT, "-l", LANG,
+         "--codec-model", s2a_path, "--tts", TEST_TEXT, "-l", LANG,
          "--voice", str(prompt_wav), "--i-have-rights",
          "--tts-output", str(wav), "--tts-steps", str(ODE_STEPS), "-v"] + extra_args,
         capture_output=True, text=True, timeout=7200, env=env,
@@ -125,7 +129,7 @@ for tag, extra_env, extra_args in arms:
     for line in r.stderr.split("\n"):
         if any(k in line for k in ("beam decode:", "flow-matching:", "BigVGAN:", "CUDA",
                                    "voice set", "condition_emb computed", "failed", "error",
-                                   "GGML_ASSERT", "unsupported")):
+                                   "GGML_ASSERT", "unsupported", "CFG fusion", "DiT graph")):
             print(f"  [{tag}] " + line.strip()[:220])
     if r.returncode != 0:
         for line in [l for l in (r.stderr + r.stdout).split("\n") if l.strip()][-25:]:
@@ -158,9 +162,8 @@ for tag, res in results.items():
     print(f"  [{tag}] transcript: {clean.strip()[:300]}")
 
 kh.step("summary")
-if results.get("CPU-ctrl", {}).get("ok") and results.get("GPU", {}).get("ok"):
-    c, g = results["CPU-ctrl"]["wall"], results["GPU"]["wall"]
-    gp = results.get("GPU-persist", {}).get("wall")
-    print(f"  CPU {c:.1f}s vs GPU {g:.1f}s ({c/g:.2f}x)"
-          + (f" vs GPU-persist {gp:.1f}s ({c/gp:.2f}x)" if gp else ""))
+for base, fused in (("GPU", "GPU-fuse"), ("GPU-q4k", "GPU-q4k-fuse")):
+    if results.get(base, {}).get("ok") and results.get(fused, {}).get("ok"):
+        b, f = results[base]["wall"], results[fused]["wall"]
+        print(f"  {base} {b:.1f}s vs {fused} {f:.1f}s ({b/f:.2f}x, {100*(b-f)/b:+.1f}% saved)")
 print("=== Done ===", flush=True)
