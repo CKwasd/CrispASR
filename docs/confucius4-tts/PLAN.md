@@ -51,8 +51,17 @@ test ✓ go cgo sync ✓ docs/README ✓ HF license card ✓.
   final mel. Bug 13's blind spot is covered for good.
 - Live test `test-confucius4-tts-live` added (passes locally, 9 assertions).
 
-**Open (perf, optional):** bucketed-Lk persistent decode (256/512+growth) or
-GPU port; BigVGAN raw-path A/B.
+## CUDA GPU path — VALIDATED (gpu-verify run 1, P100, 2026-08-25)
+
+Fully native `--voice` roundtrip on CUDA: **8/8, transcript verbatim, 183.2 s
+vs 685.2 s CPU control = 3.74×** — with zero code changes (the all-gallocr
+single-backend graphs ran as-is). GPU+persist 185.7 s (neutral → persist
+stays gated everywhere). Kernel: `chr1s4/crispasr-confucius4-gpu-verify`.
+GPU-effort doc: `/mnt/volume1/conf4gpu.md`.
+
+**Open (perf, optional):** CFG cond+uncond fusion in one DiT pass
+(seq-concat + block-diagonal mask — now the biggest CUDA lever); bucketed-Lk
+persistent decode; BigVGAN raw-path A/B; Metal/Vulkan validation (Mac).
 
 ### 13 bugs total — 9–13 this session
 
