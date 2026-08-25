@@ -242,6 +242,7 @@ TEST_CASE("every emitted backend name is a name a surface can open", "[unit][arc
         "bark",
         "dia",
         "dots-tts",
+        "confucius4-tts",
         "csm",
         "parler-tts",
         "m2m100",
