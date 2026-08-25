@@ -221,6 +221,10 @@ if os.path.exists(tok_json_path):
     model = tok_j.get("model", {})
     vocab_dict = model.get("vocab", {})
     merges_list = model.get("merges", [])
+    # Newer tokenizer.json stores merges as ["a", "b"] pairs; the C GGUF
+    # reader rejects nested arrays (invalid type 9), and core/bpe keys its
+    # rank table on the textual "a b" form — join.
+    merges_list = [" ".join(m) if isinstance(m, (list, tuple)) else m for m in merges_list]
     # Build ordered token list by ID
     tokens = [""] * len(vocab_dict)
     for token, idx in vocab_dict.items():
