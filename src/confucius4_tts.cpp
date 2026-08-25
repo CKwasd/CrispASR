@@ -197,6 +197,21 @@ struct confucius4_kv_cache {
     ggml_context* ctx = nullptr;
     ggml_backend_buffer_t buf = nullptr;
     int max_seq_len = 0;
+
+    // Persistent single-token decode graph (CRISPASR_CONFUCIUS4_PERSIST=1).
+    // Built ONCE per cache with fixed_kv_len = max_seq_len + kv_indices, so
+    // the topology is invariant across n_past — the per-step ggml context
+    // build + gallocr alloc/free (x3 beams x ~170 steps) disappears. ALL
+    // inputs (x, mask, index) are re-set on EVERY compute (gallocr reuses
+    // input buffers as scratch — the §234 aliasing gotcha).
+    ggml_context* step_ctx = nullptr;
+    ggml_cgraph* step_gf = nullptr;
+    ggml_gallocr_t step_galloc = nullptr;
+    ggml_tensor* step_x = nullptr;      // (D, 1) F32 input embed
+    ggml_tensor* step_mask = nullptr;   // (max_seq, 1) F16: 0 for j<=n_past, -inf beyond
+    ggml_tensor* step_idx = nullptr;    // (1,) I32 = n_past (cache write slot)
+    ggml_tensor* step_logits = nullptr; // (V, 1)
+    ggml_tensor* step_hidden = nullptr; // (D, 1) lm_hidden
 };
 
 struct confucius4_tts_context {
@@ -461,7 +476,8 @@ static bool load_t2s(confucius4_tts_context* ctx, const char* path) {
 static ggml_tensor* gpt2_forward(confucius4_tts_context* ctx, ggml_context* ctx0, ggml_cgraph* gf,
                                  ggml_tensor* input_emb, // (model_dim, T)
                                  ggml_tensor* kv_k, ggml_tensor* kv_v, int n_past,
-                                 ggml_tensor* causal_mask) { // [n_past+T, T] F16 or nullptr (T==1 only)
+                                 ggml_tensor* causal_mask, // [Lk, T] F16 or nullptr (T==1 only)
+                                 int fixed_kv_len = 0, ggml_tensor* kv_indices = nullptr) {
     const auto& m = ctx->t2s;
     const auto& hp = m.hp;
 
@@ -499,8 +515,7 @@ static ggml_tensor* gpt2_forward(confucius4_tts_context* ctx, ggml_context* ctx0
                                     /*q_w=*/nullptr, /*k_w=*/nullptr, /*v_w=*/nullptr, L.attn_proj_w,
                                     /*q_norm_w=*/nullptr, /*k_norm_w=*/nullptr,
                                     /*positions=*/nullptr, causal_mask, kv_k, kv_v, il, n_past, ap,
-                                    /*qkv_w=*/L.attn_qkv_w, /*fixed_kv_len=*/0,
-                                    /*kv_indices=*/nullptr,
+                                    /*qkv_w=*/L.attn_qkv_w, fixed_kv_len, kv_indices,
                                     /*q_b=*/nullptr, /*k_b=*/nullptr, /*v_b=*/nullptr,
                                     /*o_b=*/L.attn_proj_b, /*qkv_b=*/L.attn_qkv_b);
 
@@ -1187,6 +1202,10 @@ static bool kv_init(confucius4_kv_cache& kv, const confucius4_t2s_hparams& hp, i
 }
 
 static void kv_free(confucius4_kv_cache& kv) {
+    if (kv.step_galloc)
+        ggml_gallocr_free(kv.step_galloc);
+    if (kv.step_ctx)
+        ggml_free(kv.step_ctx);
     if (kv.buf)
         ggml_backend_buffer_free(kv.buf);
     if (kv.ctx)
@@ -1498,6 +1517,82 @@ static std::vector<float> embed_semantic_token(confucius4_tts_context* ctx, int3
     return result;
 }
 
+// Persistent single-token decode step (see confucius4_kv_cache doc). Builds
+// the fixed-topology graph lazily on first use for this cache, then reuses it
+// for every subsequent step: only the inputs change. Output-equivalence vs the
+// rebuild-per-step path was byte-compared on the Kaggle roundtrip before this
+// became reachable (CRISPASR_CONFUCIUS4_PERSIST gate).
+static std::vector<float> run_gpt2_step_persistent(confucius4_tts_context* ctx, confucius4_kv_cache& kv,
+                                                   const float* input_emb, int n_past, std::vector<float>* out_hidden) {
+    const auto& hp = ctx->t2s.hp;
+    const int D = hp.model_dim;
+    const int V = hp.semantic_vocab_size;
+    const int Lk = kv.max_seq_len;
+
+    if (!kv.step_gf) {
+        const int n_tensors = hp.num_layers * 50 + 64;
+        size_t ctx_size = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead_custom(8192, false);
+        ggml_init_params ip = {ctx_size, nullptr, true};
+        kv.step_ctx = ggml_init(ip);
+        if (!kv.step_ctx)
+            return {};
+        kv.step_gf = ggml_new_graph_custom(kv.step_ctx, 8192, false);
+
+        kv.step_x = ggml_new_tensor_2d(kv.step_ctx, GGML_TYPE_F32, D, 1);
+        ggml_set_name(kv.step_x, "gpt2_input");
+        ggml_set_input(kv.step_x);
+        kv.step_mask = ggml_new_tensor_2d(kv.step_ctx, GGML_TYPE_F16, Lk, 1);
+        ggml_set_name(kv.step_mask, "step_mask");
+        ggml_set_input(kv.step_mask);
+        kv.step_idx = ggml_new_tensor_1d(kv.step_ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(kv.step_idx, "step_idx");
+        ggml_set_input(kv.step_idx);
+
+        ggml_tensor* logits = gpt2_forward(ctx, kv.step_ctx, kv.step_gf, kv.step_x, kv.k, kv.v,
+                                           /*n_past=*/0, kv.step_mask, /*fixed_kv_len=*/Lk, kv.step_idx);
+        ggml_set_name(logits, "logits");
+        ggml_set_output(logits);
+        ggml_build_forward_expand(kv.step_gf, logits);
+        kv.step_logits = logits;
+        kv.step_hidden = ggml_graph_get_tensor(kv.step_gf, "lm_hidden");
+
+        kv.step_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
+        if (!ggml_gallocr_alloc_graph(kv.step_galloc, kv.step_gf)) {
+            fprintf(stderr, "confucius4: persistent step graph alloc failed\n");
+            ggml_gallocr_free(kv.step_galloc);
+            ggml_free(kv.step_ctx);
+            kv.step_galloc = nullptr;
+            kv.step_ctx = nullptr;
+            kv.step_gf = nullptr;
+            return {};
+        }
+    }
+
+    // Re-set EVERY input each step (gallocr input-buffer reuse).
+    ggml_backend_tensor_set(kv.step_x, input_emb, 0, (size_t)D * sizeof(float));
+    std::vector<ggml_fp16_t> mask((size_t)Lk);
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f), ninf = ggml_fp32_to_fp16(-INFINITY);
+    for (int j = 0; j < Lk; j++)
+        mask[(size_t)j] = j <= n_past ? zero : ninf;
+    ggml_backend_tensor_set(kv.step_mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    int32_t idx = n_past;
+    ggml_backend_tensor_set(kv.step_idx, &idx, 0, sizeof(int32_t));
+
+    if (ggml_backend_graph_compute(ctx->backend, kv.step_gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "confucius4: persistent step compute failed\n");
+        return {};
+    }
+
+    std::vector<float> out_logits(V);
+    ggml_backend_tensor_get(kv.step_logits, out_logits.data(), 0, (size_t)V * sizeof(float));
+    if (out_hidden && kv.step_hidden) {
+        size_t old = out_hidden->size();
+        out_hidden->resize(old + D);
+        ggml_backend_tensor_get(kv.step_hidden, out_hidden->data() + old, 0, (size_t)D * sizeof(float));
+    }
+    return out_logits;
+}
+
 // Run a single GPT-2 forward step via ggml_backend_sched.
 // Input: (D, T) float embeddings. Output: last-token logits (semantic_vocab_size,).
 // Run one GPT-2 step. Returns logits for the last token.
@@ -1509,6 +1604,18 @@ static std::vector<float> run_gpt2_step(confucius4_tts_context* ctx, const float
                                         std::vector<float>* out_hidden_all = nullptr) {
     const auto& hp = ctx->t2s.hp;
     const int D = hp.model_dim;
+
+    // Opt-in persistent-graph decode (A/B: byte-identical output, no per-step
+    // graph build/alloc). Applies to T==1 steps only; prefill and the
+    // teacher-forced latent pass keep the one-off graphs.
+    static const bool persist = [] {
+        const char* e = std::getenv("CRISPASR_CONFUCIUS4_PERSIST");
+        return e && *e && *e != '0';
+    }();
+    if (persist && T == 1 && !out_hidden_all) {
+        confucius4_kv_cache& kv_use0 = kvc ? *kvc : ctx->kv;
+        return run_gpt2_step_persistent(ctx, kv_use0, input_emb, n_past, out_hidden);
+    }
 
     // kv_self_attn creates ~40 intermediates per layer (QKV split, views, permutes,
     // cache writes, softmax, output permute, reshape) + FFN adds ~10.
