@@ -12,14 +12,15 @@
 // over Wav2Vec2-BERT layer-17 features, and text_emb is a frozen
 // Embedding(32k,4096) → SiLU MLP(4096→1280) projector.
 //
-// Two GGUF files:
-//   - T2S (GPT-2 + text projector + speaker encoder): confucius4-tts-t2s-q4_k.gguf
-//   - S2A (DiT + WaveNet + length regulator):          confucius4-tts-s2a-q4_k.gguf
+// GGUF files (all auto-downloaded by `-m auto`):
+//   - T2S (GPT-2 + text projector + ECAPA + baked vocab): confucius4-tts-t2s-q4_k.gguf
+//   - S2A (DiT + WaveNet + length regulator + CAMPPlus):  confucius4-tts-s2a-q4_k.gguf
+//   - BigVGAN v2 22 kHz vocoder:                          confucius4-tts-bigvgan-22k-f16.gguf
+//   - w2v-BERT 2.0 encoder-only (17L, sidon layout):      confucius4-tts-w2v-f16.gguf
 //
-// External models (not yet ported — needed for zero-shot voice cloning):
-//   - Wav2Vec2-BERT 2.0 (semantic feature extraction from reference audio)
-//   - CAMPPlus (speaker style embedding from reference audio)
-//   - BigVGAN v2 22kHz (mel → waveform vocoder)
+// Zero-shot voice cloning (`--voice ref.wav --i-have-rights`) is fully native
+// when all four files are present. Without --voice conditioning the output is
+// unintelligible BY DESIGN — the model is a zero-shot cloner.
 
 #include <stdbool.h>
 #include <stdint.h>

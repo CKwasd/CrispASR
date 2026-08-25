@@ -6,54 +6,40 @@
 
 ---
 
-## NOW — active work (2026-08-25)
+## NOW — status (2026-08-25)
 
-**Branch:** `feat/confucius4-cfg` · **Kernel:** `chr1s4/crispasr-confucius4-cfg-verify`
+# ✅ PORT COMPLETE — FULLY NATIVE ZERO-SHOT PIPELINE, ROUNDTRIP 8/8
 
-# ✅ ACCEPTANCE GATE PASSED (run 16)
+Kernel run 18 (`chr1s4/crispasr-confucius4-cfg-verify`), all green:
 
-**`[COND-full] TTS→ASR roundtrip: 8/8 = 100%`** — the full native pipeline
-(beam-sample T2S q4_k → S2A flow-matching f16 → BigVGAN) synthesizes
-"The quick brown fox jumps over the lazy dog." verbatim (3.25s, rms 0.21).
-Corroborating arms, all 8/8: reference e2e control, reference-generate under
-the dumper's conditioning, and the runtime's codes through the reference S2A.
-Conditioning cross-check: dumper w2v/style/prompt-mel are cos=1.000000 vs the
-reference-internal values. The nocond arms stay 0/8 by design — zero
-conditioning is out-of-distribution for a zero-shot cloning model (the
-reference babbles there too).
+- **`[NATIVE-full] 8/8 = 100%`** — `--voice jfk.wav`, no env escapes, no
+  Python anywhere: native SP-BPE tokenizer (byte-identical to
+  AutoTokenizer), native w2v-BERT layer-17 (sidon encoder-only, cos-1.0
+  ECAPA), native CAMPPlus style + 22.05 kHz prompt mel, beam-sample T2S
+  (transformers-4.52.4-faithful, num_beams=3), S2A CFM (25-step, CFG 0.7),
+  BigVGAN. Even the spoken AI-disclaimer is synthesized natively.
+- NATIVE-tok / NATIVE-voice / COND-full / RUNTIME-codes-through-ref-S2A /
+  REF-dumpercond / reference-e2e-control: all 8/8.
+- nocond arms 0/8 BY DESIGN (zero-shot model; the reference babbles there too).
 
-Thirteen bugs total; 9–13 this session (ln_f, rep-pen, `</s>`, uninitialized
-attn_scale + missing prefill causal mask, CFG-uncond T_mel-vs-T_total). The
-decode is a transformers-4.52.4-faithful beam-sample (num_beams=3 default,
-`CRISPASR_CONFUCIUS4_BEAMS=1` for pure sampling).
+**Artifacts** (cstr/confucius4-tts-GGUF, Apache-2.0 card): T2S f16/q8_0/q4_k
+(baked vocab), S2A f16/q8_0/q4_k (baked CAMPPlus), BigVGAN f16/q8_0, w2v f16.
+`-m auto` downloads T2S q4_k + S2A q4_k + BigVGAN + w2v.
 
-## Run 17 — native paths validated (2026-08-25)
+**Usage:** `crispasr --backend confucius4-tts -m auto --tts "..." -l en \
+--voice ref.wav --i-have-rights --tts-output out.wav`
 
-- **NATIVE-tok 8/8** — runtime SP-BPE over the baked vocab emits the exact
-  AutoTokenizer ids (36) and BYTE-IDENTICAL audio to the TEXT_IDS arm.
-- **NATIVE-voice 8/8** — `--voice jfk.wav`: native CAMPPlus style (192-d) +
-  native 22.05 kHz prompt mel + native ECAPA condition_emb (w2v features
-  still external via COND_DIR).
-- Checklist landed: c_api session integration, registry entry (+HF license
-  card), S2A/BigVGAN sibling auto-resolve, params unit test, docs/README,
-  whisper.go cgo sync, crispasr-lib linkage.
+**Checklist:** src runtime ✓ CLI adapter ✓ factory ✓ CMake ✓ c_api session ✓
+registry ✓ quantize rules ✓ parity harnesses (s2a/t2s_parity) ✓ params unit
+test ✓ go cgo sync ✓ docs/README ✓ HF license card ✓.
 
-## Remaining to ship (docs/contributing.md checklist)
+**In flight:** run 19 A/Bs the host-table embedding fast path (expected
+byte-identical). **Open (perf, non-blocking):** persistent decode graph for
+the 3-beam T2S (3 graph builds/step now); extend s2a_parity to the
+conditioned/prompt path (bug 13 taught why); BigVGAN raw path A/B; merge to
+main after run 19.
 
-1. **Converter re-run** (chr1str/crispasr-confucius4-tts-convert v6, in
-   flight): baked vocab (tokens+scores fixed to string merges) + CAMPPlus
-   into S2A. Then a verify run on the NEW GGUFs exercising the native
-   SP-BPE tokenizer (drop TEXT_IDS) and native CAMPPlus/prompt-mel
-   (`--voice jfk.wav` arm; w2v_features.bin still external).
-2. **w2v-BERT native** (the last external piece): convert
-   facebook/w2v-bert-2.0 layers 0..16 into a sidon-layout GGUF; add an
-   encoder-only + hidden-states API to sidon.cpp; wire into
-   `confucius4_tts_set_voice_path`.
-3. Registry entry (+ Apache-2.0 license field), c_api 9-point integration,
-   CLI factory/detect already?, tests (unit-params + live), README/docs,
-   Go cgo LDFLAGS sync, regression entry.
-4. Perf (after correctness ships): persistent decode graph for the 3-beam
-   T2S (3× forwards/step now), BigVGAN raw path, ODE-step embeds in-graph.
+### 13 bugs total — 9–13 this session
 
 ### Bugs 9–12 (this session, all found by line-by-line reading + parity)
 
