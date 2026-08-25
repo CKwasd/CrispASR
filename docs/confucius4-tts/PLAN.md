@@ -6,28 +6,43 @@
 
 ---
 
-## NOW — active work (2026-08-24, late)
+## NOW — active work (2026-08-25)
 
-**Branch:** `feat/confucius4-cfg` (worktree `.claude/worktrees/feat-confucius4-cfg`)
-**Kernel:** `chr1s4/crispasr-confucius4-cfg-verify` — run 14 in flight (beam decode)
+**Branch:** `feat/confucius4-cfg` · **Kernel:** `chr1s4/crispasr-confucius4-cfg-verify`
 
-**T2S graph is now EXACT** (kernel run 12): `prefix_emb` cos=0.999998,
-`prefill_logits` cos=0.998 **argmax match** (1527==1527), `lm_latent`
-cos=0.999, `condition_emb` (native ggml ECAPA) cos=1.000000. Residual is Q4_K
-quantization noise. Three more bugs fixed to get here (bugs 9–12 below).
+# ✅ ACCEPTANCE GATE PASSED (run 16)
 
-**Run 13 control: the reference end-to-end pipeline (beam-sample T2S +
-reference S2A + BigVGAN, transformers pinned 4.52.4) scores 8/8 = 100% on the
-same text + jfk.wav prompt.** So model + conditioning + harness are all fine;
-the only remaining delta was the decode strategy. The C++ pure-sampling decode
-still babbles (0/8) — the reference decode is `num_beams=3` beam-sample.
+**`[COND-full] TTS→ASR roundtrip: 8/8 = 100%`** — the full native pipeline
+(beam-sample T2S q4_k → S2A flow-matching f16 → BigVGAN) synthesizes
+"The quick brown fox jumps over the lazy dog." verbatim (3.25s, rms 0.21).
+Corroborating arms, all 8/8: reference e2e control, reference-generate under
+the dumper's conditioning, and the runtime's codes through the reference S2A.
+Conditioning cross-check: dumper w2v/style/prompt-mel are cos=1.000000 vs the
+reference-internal values. The nocond arms stay 0/8 by design — zero
+conditioning is out-of-distribution for a zero-shot cloning model (the
+reference babbles there too).
 
-**Now on the branch:** a beam-sample decoder faithful to transformers 4.52.4
-`_beam_search(do_sample=True)` (processors/warpers on LOG-PROBS in order
-rep-pen → temp → top-k → top-p; joint multinomial 2·beams w/o replacement;
-first-beams-only EOS finishing, length-penalized; early stop when beams
-finished; teacher-forced latent pass over the winner). Default beams=3;
-`CRISPASR_CONFUCIUS4_BEAMS=1` restores sampling. Run 14 verdict pending.
+Thirteen bugs total; 9–13 this session (ln_f, rep-pen, `</s>`, uninitialized
+attn_scale + missing prefill causal mask, CFG-uncond T_mel-vs-T_total). The
+decode is a transformers-4.52.4-faithful beam-sample (num_beams=3 default,
+`CRISPASR_CONFUCIUS4_BEAMS=1` for pure sampling).
+
+## Remaining to ship (docs/contributing.md checklist)
+
+1. **Converter re-run** (chr1str/crispasr-confucius4-tts-convert v6, in
+   flight): baked vocab (tokens+scores fixed to string merges) + CAMPPlus
+   into S2A. Then a verify run on the NEW GGUFs exercising the native
+   SP-BPE tokenizer (drop TEXT_IDS) and native CAMPPlus/prompt-mel
+   (`--voice jfk.wav` arm; w2v_features.bin still external).
+2. **w2v-BERT native** (the last external piece): convert
+   facebook/w2v-bert-2.0 layers 0..16 into a sidon-layout GGUF; add an
+   encoder-only + hidden-states API to sidon.cpp; wire into
+   `confucius4_tts_set_voice_path`.
+3. Registry entry (+ Apache-2.0 license field), c_api 9-point integration,
+   CLI factory/detect already?, tests (unit-params + live), README/docs,
+   Go cgo LDFLAGS sync, regression entry.
+4. Perf (after correctness ships): persistent decode graph for the 3-beam
+   T2S (3× forwards/step now), BigVGAN raw path, ODE-step embeds in-graph.
 
 ### Bugs 9–12 (this session, all found by line-by-line reading + parity)
 
