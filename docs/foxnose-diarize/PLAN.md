@@ -286,9 +286,52 @@ Where the time goes on a 215 s file (~45 s wall, ~4.8x realtime):
 | stage | share |
 |---|---|
 | WeSpeaker ResNet34 forward | ~70% (94% of the embedder) |
-| speaker-count estimation (GMM/BIC + silhouette) | ~12% (58 s -> 51 s when `--diarize-num-speakers` pins it) |
+| speaker-count estimation (GMM/BIC + silhouette) | ~12% (58 s -> 51 s when `--diarize-num-speakers` pins it), before the parallel sweep below |
 | Kaldi fbank | ~4% |
 | VAD, clustering, smoothing, I/O | remainder |
+
+**Speaker counting was single-threaded and recomputed its inputs (2026-08).**
+`cluster_speakers` rebuilt the same O(n^2 d) cosine affinity up to ~10 times
+per call — once inside the `run(k)` lambda and at three more sites — and then
+ran both k-sweeps serially: the GMM/BIC sweep (`n_init=5`, `max_iter=300` per
+k) and the spectral+silhouette sweep (a dense Laplacian, a subspace iteration
+and `10x300` k-means per k, for every k in `[2, max_speakers]`). Every k is
+independent — `gmm_bic` seeds its own RNG per init, and the spectral runs take
+the same `seed` per candidate — so the sweeps parallelise with the reductions
+left serial in ascending k, which is what keeps the tie-breaks (and therefore
+the chosen count) bit-identical.
+
+The fan-out is a file-local `parallel_tasks` in `spectral_diarize.cpp`, kept
+local to match every other parallelism helper in the tree
+(`firered_parallel_for`, `marblenet_parallel_for`, `ov_parallel_for`, and the
+inline loops in `core/mel.cpp` and `core/foxnose_pipeline.cpp` — none of them
+sit in a shared header). It differs from those four in handing out task
+INDICES from an atomic counter rather than splitting [0, n) into contiguous
+per-thread chunks: they parallelise uniform-cost items like audio frames,
+whereas a k=8 spectral run costs many times a k=2 one, so a static split
+leaves the thread holding the cheap candidates idle. Unifying all five behind
+one helper is a reasonable cleanup, but it has its own testing surface (two
+VAD models plus omnivoice) and does not belong in a diarization perf change.
+
+⚠ Note for anyone extending this: neither of the "just use the standard/
+platform" routes works here, and both were tested rather than assumed.
+`std::execution::par` is in-standard for core (C++17) but does not build on
+the Apple toolchain — libc++ gates `<execution>` behind
+`_LIBCPP_HAS_EXPERIMENTAL_PSTL`, and force-enabling it fails to LINK
+(`__pstl::__libdispatch::__dispatch_apply` is not in the shipped dylib);
+libstdc++ implements it over Intel TBB, which is nowhere in this tree. OpenMP
+is used heavily elsewhere (~28 pragma sites, including `schedule(dynamic)` at
+`mel_band_roformer.cpp:666`), but every site is `#ifdef _OPENMP`-guarded and
+OpenMP is NOT found on the stock macOS toolchain, so a pragma-based sweep
+would have delivered 0% of the speedup below on the machine it was measured
+on — the same trap the firered-asr note in `src/CMakeLists.txt` records.
+
+Measured on an M-series box, `-t 8`, esrit.wav (215 s), warm runs, arms
+interleaved base/PR: ASR-only 2.39 s; foxnose end-to-end **10.82 s -> 9.63 s**,
+i.e. **diarization delta 8.43 s -> 7.24 s (1.16x)**. Labels are bit-identical
+(259 spectral assertions unchanged, shard DER identical per file at 7.32%).
+The remaining estimation cost is real work, not redundancy: pinning the count
+with `--diarize-num-speakers` still saves ~1 s on top of this.
 
 ### Levers that were tried and LOST — do not re-litigate without new evidence
 
