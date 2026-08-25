@@ -87,7 +87,9 @@ public:
         if (!ctx_)
             return {};
 
-        const std::string lang = params.language.empty() ? "en" : params.language;
+        // "-l auto" is the CLI default; there is no LID for TTS input text, and
+        // "auto" must not leak into the LANGUAGE_TOKEN_MAP prompt.
+        const std::string lang = (params.language.empty() || params.language == "auto") ? "en" : params.language;
         int n_samples = 0;
         float* pcm = confucius4_tts_synthesize(ctx_, text.c_str(), lang.c_str(), &n_samples);
         if (!pcm || n_samples <= 0)

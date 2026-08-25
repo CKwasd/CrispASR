@@ -229,6 +229,47 @@ for arm in ("s2a-only", "full"):
             print(f"  [{arm}] ! " + line.strip())
     cond_runs[arm] = {"wav": wav, "ok": ok}
 
+# ── Phase 6b2: native-path arms (need the re-converted GGUFs) ───────────────
+# NATIVE-tok  : no CRISPASR_CONFUCIUS4_TEXT_IDS — the runtime's SP-BPE
+#               tokenizer (baked vocab) must reproduce the AutoTokenizer ids.
+# NATIVE-voice: --voice jfk.wav — CAMPPlus style + prompt mel computed
+#               in-process from the campplus.* bake; the cond dir supplies
+#               ONLY w2v_features.bin (ECAPA condition_emb runs natively).
+import shutil
+
+_native_arms = {}
+_nat_cond = TEMP / "cond_native"
+_nat_cond.mkdir(parents=True, exist_ok=True)
+if (TEMP / "cond_full" / "w2v_features.bin").exists():
+    shutil.copy(TEMP / "cond_full" / "w2v_features.bin", _nat_cond / "w2v_features.bin")
+for arm, extra_env, extra_args in (
+    ("NATIVE-tok", {"CRISPASR_CONFUCIUS4_COND_DIR": str(TEMP / "cond_full")}, []),
+    ("NATIVE-voice", {"CRISPASR_CONFUCIUS4_COND_DIR": str(_nat_cond)},
+     ["--voice", str(prompt_wav), "--i-have-rights"]),
+):
+    wav = TEMP / f"confucius4_{arm}.wav"
+    env = dict(os.environ)  # NOTE: no TEXT_IDS for NATIVE-tok
+    if arm != "NATIVE-tok":
+        env["CRISPASR_CONFUCIUS4_TEXT_IDS"] = token_ids_str
+    env.update(extra_env)
+    r = subprocess.run(
+        [crispasr_bin, "--backend", "confucius4-tts", "-m", t2s_path,
+         "--codec-model", s2a_f16, "--tts", TEST_TEXT, "-l", LANG,
+         "--tts-output", str(wav), "--tts-steps", str(ODE_STEPS), "-v"] + extra_args,
+        capture_output=True, text=True, timeout=7200, env=env,
+    )
+    ok = wav.exists() and os.path.getsize(str(wav)) > 100
+    print(f"  [{arm}] TTS rc={r.returncode} wav={'%d B' % os.path.getsize(str(wav)) if ok else 'NONE'}")
+    for line in r.stderr.split("\n"):
+        if any(k in line for k in ("conditioning set", "tokenized", "voice set", "CAMPPlus",
+                                   "beam decode", "BigVGAN:", "WARNING", "condition_emb computed")):
+            print(f"  [{arm}] " + line.strip())
+    if r.returncode != 0:
+        for line in [l for l in r.stderr.split("\n") if l.strip()][-15:]:
+            print(f"  [{arm}] ! " + line.strip())
+    _native_arms[arm] = {"wav": wav, "ok": ok}
+print(f"  expected AutoTokenizer ids: n={len(ids)} (runtime 'tokenized' line above must match)")
+
 
 # ── Phase 6c: REFERENCE end-to-end control ──────────────────────────────────
 # T2S parity now passes (prefill argmax matches, lm_latent cos 0.999) yet the
@@ -415,6 +456,8 @@ asr_score("REF-mel/torch-voc", str(TEMP / "vocoded" / "ref_mel.wav"))
 asr_score("REF-E2E-control", str(ref_e2e_wav) if ref_e2e_wav.exists() else None)
 asr_score("REF-dumpercond", str(ref_dcond_wav) if ref_dcond_wav.exists() else None)
 asr_score("RUNTIME-codes/ref-S2A", str(runtime_codes_wav) if runtime_codes_wav.exists() else None)
+for _arm, _r in _native_arms.items():
+    asr_score(_arm, str(_r["wav"]) if _r["ok"] else None)
 print("  NOTE: if REF-mel is also ~0%, the port is not the blocker -- the model is")
 print("        zero-shot and always has a speaker prompt, which is still all zeros.")
 
