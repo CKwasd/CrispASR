@@ -33,11 +33,26 @@ Kernel run 18 (`chr1s4/crispasr-confucius4-cfg-verify`), all green:
 registry ✓ quantize rules ✓ parity harnesses (s2a/t2s_parity) ✓ params unit
 test ✓ go cgo sync ✓ docs/README ✓ HF license card ✓.
 
-**In flight:** run 19 A/Bs the host-table embedding fast path (expected
-byte-identical). **Open (perf, non-blocking):** persistent decode graph for
-the 3-beam T2S (3 graph builds/step now); extend s2a_parity to the
-conditioned/prompt path (bug 13 taught why); BigVGAN raw path A/B; merge to
-main after run 19.
+## Post-merge verification (runs 19–20 + VPS, 2026-08-25)
+
+- **Run 19**: host-table embedding fast path byte-identical → default ON.
+- **VPS run (8 GB, no GPU)**: fully native `--voice` roundtrip transcribes
+  verbatim; **peak RSS 2.23 GB**. Slow on CPU (~3-4 min/sentence on quiet
+  4-core Kaggle; VPS wall scales with contention — 20-70 min at load 13-22).
+- **Run 20, persistent decode graph A/B (clean box)**: PCM BIT-IDENTICAL but
+  867.4 s vs 882.0 s — the fixed-Lk=1521 attention outweighs the saved
+  per-step graph builds on CPU. **Default stays the rebuild path**; the
+  correct persistent path is kept behind `CRISPASR_CONFUCIUS4_PERSIST=1` for
+  a future GPU port (launch-bound dispatch is where it wins — see the
+  parakeet/nemotron precedent) or a bucketed-Lk variant.
+- **Run 20, conditioned S2A parity** (new `--style`/`--prompt-mel` mode +
+  kernel cond-full arm): **cos=1.000000 at every stage** over the full
+  947-frame prompt path — regulator, input_embed, WaveNet, v steps 1–25,
+  final mel. Bug 13's blind spot is covered for good.
+- Live test `test-confucius4-tts-live` added (passes locally, 9 assertions).
+
+**Open (perf, optional):** bucketed-Lk persistent decode (256/512+growth) or
+GPU port; BigVGAN raw-path A/B.
 
 ### 13 bugs total — 9–13 this session
 
