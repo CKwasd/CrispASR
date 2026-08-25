@@ -795,6 +795,21 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
   mul_mm kernels on Metal; `direct` restores GGML_OP_CONV_2D. Measured on
   esrit.wav (215 s, `-t 8`): diarization delta 9.8 s -> 5.9 s (~1.6x),
   embeddings cosine 1.0 vs direct, DER identical per file (7.32 % shard mean)
+- `CRISPASR_WESPEAKER_GPU=1` — run the WeSpeaker embedder on the GPU backend
+  (single context; the CPU worker pool is stood down because workers borrow
+  weights that now live in a GPU buffer). With the im2col default and batched
+  windows Metal reaches parity with the 8-worker CPU schedule on an M-series
+  (8.5 s vs 8.7 s wall on esrit.wav) but does not beat it, so CPU stays the
+  default; the switch exists for machines where the GPU/CPU balance differs
+- `CRISPASR_DIARIZE_BATCH_EMBED` — batch independent 1.2 s windows into one
+  graph along ne[3] (arithmetic-identical to per-window; cosine 1.0). Default:
+  ON under `CRISPASR_WESPEAKER_GPU=1` (collapses ~350 Metal dispatches into
+  ~11 and is what got Metal from a 2x loss to parity), OFF on CPU (measured
+  12.1 -> 14.9 s wall on esrit.wav: ggml's CPU conv loops ne[3], so fusing
+  buys no GEMM shape and the 32-window chunks starve the worker schedule).
+  `1`/`0` forces either way
+- `CRISPASR_WESPEAKER_BATCH` — max windows per batched graph (default 32 on
+  GPU, 16 on CPU; cap 32). Only meaningful where the batch path is active
 
 ### GigaAM-v3
 

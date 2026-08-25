@@ -357,12 +357,15 @@ static ggml_tensor* build_tstp(ggml_context* ctx0, ggml_tensor* x, float eps, bo
     // graph context. ggml_scale_bias folds the constant into the op instead.
     ggml_tensor* stdv = ggml_sqrt(ctx0, ggml_scale_bias(ctx0, var, 1.0f, eps));
 
-    // Flatten (1, F, C) -> F*C with freq fastest, matching torch's
-    // flatten(start_dim=1) over (C, F): index c*F + f.
+    // Flatten (1, F, C, N) -> (F*C, N) with freq fastest, matching torch's
+    // flatten(start_dim=1) over (C, F): index c*F + f. N is the window batch
+    // (ne[3]); for the unbatched paths N == 1 and this is the old 1-D flatten
+    // with a trailing singleton, same memory, same arithmetic.
     const int64_t n = mean->ne[1] * mean->ne[2];
-    mean = ggml_reshape_1d(ctx0, ggml_cont(ctx0, mean), n);
-    stdv = ggml_reshape_1d(ctx0, ggml_cont(ctx0, stdv), n);
-    return ggml_concat(ctx0, mean, stdv, 0); // cat((mean, std)) -> 2*F*C
+    const int64_t N = mean->ne[3];
+    mean = ggml_reshape_2d(ctx0, ggml_cont(ctx0, mean), n, N);
+    stdv = ggml_reshape_2d(ctx0, ggml_cont(ctx0, stdv), n, N);
+    return ggml_concat(ctx0, mean, stdv, 0); // cat((mean, std)) -> (2*F*C, N)
 }
 
 struct wespeaker_graph {
@@ -374,8 +377,13 @@ struct wespeaker_graph {
 // `wins`, when non-empty, asks for ONE embedding per (start, end) frame range
 // instead of one over the whole input. The trunk runs once and each range is
 // then sliced out of its output — see wespeaker_embed_windows.
+//
+// `n_batch` > 1 instead batches that many INDEPENDENT same-T inputs along
+// ne[3] — one forward pass, one (embed_dim, n_batch) output, no arithmetic
+// shared between them. Mutually exclusive with `wins` and `with_stages`; see
+// wespeaker_embed_batch.
 static wespeaker_graph build_graph(wespeaker_context* ctx, int T, bool with_stages,
-                                   const std::vector<std::pair<int, int>>& wins = {}) {
+                                   const std::vector<std::pair<int, int>>& wins = {}, int n_batch = 1) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
 
@@ -386,8 +394,8 @@ static wespeaker_graph build_graph(wespeaker_context* ctx, int T, bool with_stag
     // and projection.
     g.gf = ggml_new_graph_custom(g.ctx0, 1024 + 16 * wins.size(), false);
 
-    // ne = [W=time, H=freq, C=1, N=1]
-    g.input = ggml_new_tensor_4d(g.ctx0, GGML_TYPE_F32, T, (int64_t)hp.n_mels, 1, 1);
+    // ne = [W=time, H=freq, C=1, N=batch]
+    g.input = ggml_new_tensor_4d(g.ctx0, GGML_TYPE_F32, T, (int64_t)hp.n_mels, 1, (int64_t)n_batch);
     ggml_set_name(g.input, "fbank");
     ggml_set_input(g.input);
 
@@ -764,4 +772,151 @@ extern "C" int wespeaker_embed(struct wespeaker_context* ctx, const float* sampl
     if (!out_embedding)
         return 1;
     return wespeaker_embed_staged(ctx, samples, n_samples, nullptr, nullptr, out_embedding);
+}
+
+// ---------------------------------------------------------------------------
+// Batched embedding (#324 perf): N independent same-T windows, one graph.
+// ---------------------------------------------------------------------------
+
+// Max windows per graph. Bigger batches amortise dispatch further but grow the
+// activation buffers ~N-fold. On the GPU the dispatch overhead dominates, so
+// the cap defaults to the ceiling (measured on esrit.wav: batch 32 8.5 s vs
+// batch 16 9.9 s wall); on CPU it stays at 16, though the CPU default doesn't
+// batch at all — see CRISPASR_DIARIZE_BATCH_EMBED.
+static int wespeaker_max_batch(const wespeaker_context* ctx) {
+    // Read per call so tests can vary the cap with setenv() in-process.
+    int v = (ctx && ctx->backend != ctx->backend_cpu) ? 32 : 16;
+    if (const char* e = crispasr_env::get("CRISPASR_WESPEAKER_BATCH")) {
+        const int x = atoi(e);
+        if (x > 0)
+            v = std::min(x, 32);
+    }
+    return v;
+}
+
+// One forward pass over `n` fbanks that all have exactly T frames, writing
+// n * embed_dim floats to `out`. Purely a fused dispatch of the per-window
+// graph — same weights, same ops, same per-window inputs.
+static int run_graph_batched(wespeaker_context* ctx, const float* const* feats, int T, int n, float* out) {
+    const auto& hp = ctx->model.hparams;
+    if (!ensure_sched(ctx))
+        return 1;
+
+    wespeaker_graph g = build_graph(ctx, T, false, {}, n);
+    struct Guard {
+        ggml_context* c;
+        ~Guard() {
+            if (c)
+                ggml_free(c);
+        }
+    } guard{g.ctx0};
+    if (!g.gf)
+        return 1;
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, g.gf)) {
+        // Activation buffers grow ~n-fold with the batch; report and let the
+        // caller halve the batch rather than failing the windows outright.
+        fprintf(stderr, "wespeaker: sched alloc failed (T=%d, batch=%d)\n", T, n);
+        return 1;
+    }
+
+    // Same transpose-on-upload as run_graph, once per batch slot: slot w of
+    // the (T, n_mels, 1, n) input starts at w * T * n_mels.
+    {
+        const int F = (int)hp.n_mels;
+        std::vector<float> in((size_t)n * T * F);
+        for (int w = 0; w < n; w++) {
+            const float* feat = feats[w];
+            float* dst = in.data() + (size_t)w * T * F;
+            for (int t = 0; t < T; t++)
+                for (int f = 0; f < F; f++)
+                    dst[(size_t)f * T + t] = feat[(size_t)t * F + f];
+        }
+        ggml_backend_tensor_set(g.input, in.data(), 0, in.size() * sizeof(float));
+    }
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, g.gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "wespeaker: batched graph compute failed (T=%d, batch=%d)\n", T, n);
+        return 1;
+    }
+
+    ggml_tensor* e = ggml_graph_get_tensor(g.gf, "embedding");
+    if (!e)
+        return 1;
+    ggml_backend_tensor_get(e, out, 0, (size_t)n * hp.embed_dim * sizeof(float));
+    return 0;
+}
+
+// Run one same-T chunk, halving on alloc/compute failure so an oversized
+// batch degrades to smaller batches (and ultimately the per-window graph)
+// instead of failing the windows.
+static int wespeaker_run_chunk(wespeaker_context* ctx, const std::vector<std::vector<float>>& feats, const int* idx,
+                               int cnt, int T, int dim, float* out_embeddings) {
+    if (cnt == 1) {
+        // The existing per-window graph — bit-identical to wespeaker_embed().
+        return run_graph(ctx, feats[(size_t)idx[0]].data(), T, nullptr, nullptr, out_embeddings + (size_t)idx[0] * dim);
+    }
+    std::vector<float> chunk_out((size_t)cnt * dim);
+    std::vector<const float*> ptrs((size_t)cnt);
+    for (int k = 0; k < cnt; k++)
+        ptrs[(size_t)k] = feats[(size_t)idx[k]].data();
+    if (run_graph_batched(ctx, ptrs.data(), T, cnt, chunk_out.data()) == 0) {
+        for (int k = 0; k < cnt; k++)
+            memcpy(out_embeddings + (size_t)idx[k] * dim, chunk_out.data() + (size_t)k * dim,
+                   (size_t)dim * sizeof(float));
+        return 0;
+    }
+    const int half = cnt / 2;
+    if (wespeaker_run_chunk(ctx, feats, idx, half, T, dim, out_embeddings) != 0)
+        return 1;
+    return wespeaker_run_chunk(ctx, feats, idx + half, cnt - half, T, dim, out_embeddings);
+}
+
+extern "C" int wespeaker_embed_batch(struct wespeaker_context* ctx, const float* samples, int64_t n_samples,
+                                     const int64_t* offsets, const int* lengths, int n_win, float* out_embeddings) {
+    if (!ctx || !samples || n_samples <= 0 || !offsets || !lengths || n_win <= 0 || !out_embeddings)
+        return 1;
+    const int min_n = wespeaker_min_samples(ctx);
+    for (int i = 0; i < n_win; i++) {
+        if (offsets[i] < 0 || lengths[i] <= 0 || offsets[i] + lengths[i] > n_samples)
+            return 1;
+        if (lengths[i] < min_n)
+            return 2; // caller falls back per-window to isolate the short one
+    }
+
+    // Per-window fbank + per-window CMN — the arithmetic-identity guarantee.
+    std::vector<std::vector<float>> feats((size_t)n_win);
+    std::vector<int> Ts((size_t)n_win);
+    {
+        wespeaker_bench_stage _b("fbank");
+        for (int i = 0; i < n_win; i++) {
+            int T = 0;
+            feats[(size_t)i] = wespeaker_fbank(ctx, samples + offsets[i], lengths[i], T);
+            if (feats[(size_t)i].empty() || T <= 0)
+                return 1;
+            Ts[(size_t)i] = T;
+        }
+    }
+
+    // Group by exact frame count — same T means same graph shape, and only
+    // same-shape windows share a batch. No padding, ever.
+    std::map<int, std::vector<int>> by_T;
+    for (int i = 0; i < n_win; i++)
+        by_T[Ts[(size_t)i]].push_back(i);
+
+    const int dim = (int)ctx->model.hparams.embed_dim;
+    const int max_batch = wespeaker_max_batch(ctx);
+    wespeaker_bench_stage _b("resnet_batch");
+    for (auto& kv : by_T) {
+        std::vector<int>& idx = kv.second;
+        for (size_t at = 0; at < idx.size(); at += (size_t)max_batch) {
+            const int cnt = (int)std::min((size_t)max_batch, idx.size() - at);
+            if (wespeaker_debug_enabled() && cnt > 1)
+                fprintf(stderr, "wespeaker: batch T=%d n=%d\n", kv.first, cnt);
+            if (wespeaker_run_chunk(ctx, feats, idx.data() + (int)at, cnt, kv.first, dim, out_embeddings) != 0)
+                return 1;
+        }
+    }
+    return 0;
 }
