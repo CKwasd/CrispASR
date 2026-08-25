@@ -789,6 +789,12 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_DIARIZE_SPAN_WINDOWS` — windows per span (default 32). Measured NOT
   to affect the accuracy cost — identical from N=2 to N=32 — so there is
   nothing to tune here; larger is simply faster
+- `CRISPASR_WESPEAKER_CONV` — conv lowering for the WeSpeaker embedder:
+  `im2col` (default) lowers each conv to explicit IM2COL + MUL_MAT nodes so
+  the GEMMs reach the Accelerate BLAS backend on CPU and the simdgroup
+  mul_mm kernels on Metal; `direct` restores GGML_OP_CONV_2D. Measured on
+  esrit.wav (215 s, `-t 8`): diarization delta 9.8 s -> 5.9 s (~1.6x),
+  embeddings cosine 1.0 vs direct, DER identical per file (7.32 % shard mean)
 
 ### GigaAM-v3
 

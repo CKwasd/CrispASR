@@ -299,9 +299,15 @@ Where the time goes on a 215 s file (~45 s wall, ~4.8x realtime):
 | **Persistent graph + `gallocr`** (the `bananamind_tts` / `beat_this` trick) | **~0.1% available.** Instrumented build/alloc/compute per call: **0.050 ms build, 0.049 ms alloc, 103.430 ms compute.** There is no per-call overhead to remove. The graph is already rebuilt-and-thrown-away for free. |
 | **More threads** | wash. `-t 4` 44.72 / 44.58 s vs `-t 8` 45.05 / 44.60 s. The M1's 4 E-cores contribute nothing; the default `n_threads = 4` is already right. |
 
-BLAS is not a factor on this path: with `use_gpu = false` the embedder runs on
-a plain `ggml_backend_cpu_init()` backend and never schedules to the BLAS
-backend, even though the binary reports `backends: cpu,metal,blas`.
+BLAS *was* not a factor on this path, and the reason turned out to be fixable:
+the embedder ran on a plain `ggml_backend_cpu_init()` backend and never
+scheduled to the BLAS backend even though the binary reports
+`backends: cpu,metal,blas`. That was not a scheduler quirk — `ggml_conv_2d_direct`
+emits ONE `GGML_OP_CONV_2D` node that does its im2col + GEMM internally, so
+there is no `MUL_MAT` for the BLAS backend to claim (it supports `MUL_MAT` /
+`OUT_PROD` and nothing else). Lowering the convs to explicit IM2COL + MUL_MAT
+nodes and putting the BLAS backend in the scheduler is what the 2026-08 round
+below does, and it is the single biggest win recorded on this model.
 
 ### The lever that is actually left: stop embedding the same audio twice
 
@@ -327,3 +333,31 @@ above), not a cosine check. A cheaper variant with the same shape: batch N
 windows into one graph along `ne[3]` — the `parakeet` / `nemotron` batched
 decode trick — which changes no arithmetic at all, improves CPU GEMM shapes,
 and is the change most likely to make the GPU path win instead of lose.
+
+### 2026-08 round — reaching Accelerate (different machine: M-series, `-t 8`)
+
+Baselines on this box, esrit.wav (215 s) through the unified runner, warm
+runs only, arms always interleaved base/PR/base/PR. ASR-only **2.39 s**.
+
+⚠ This is a desktop, not a quiet bench, and the ratio moves with load — so
+both conditions are recorded rather than the flattering one. Interleaving is
+what makes them comparable at all; a non-interleaved arm on this machine is
+worthless.
+
+| condition | base delta | PR delta | speedup |
+|---|---|---|---|
+| loadavg ~1 (4 samples/arm) | 8.43 s | 5.96 s | **1.41x** |
+| loadavg ~7, desktop apps busy (3 samples/arm) | 9.13 s | 6.77 s | **1.35x** |
+
+Output JSON is byte-identical to base in every row below, and the 8-file
+VoxConverse shard scores identically per file (mean 7.32%).
+
+| lever | result |
+|---|---|
+| **im2col conv lowering + BLAS backend in the sched** (`CRISPASR_WESPEAKER_CONV`, now the DEFAULT) | **WON — 1.35-1.41x on the diarization delta** (see the table above), end-to-end 10.82 → 8.35 s quiet. See the corrected BLAS note above for why the direct-conv op could never reach Accelerate. Embeddings cosine 1.0 vs direct (`test_wespeaker_live.cpp` "im2col conv matches direct conv"), DER identical per file. |
+| **Kaldi fbank SIMD/Accelerate** | **skipped on measurement** — 697 ms out of 43 s of single-threaded embed compute (~1.6%) on this box, not the ~4% the M1 table above shows. Below the effort line; the `kaldi_fbank.cpp` scalar mel projection and per-call FFT scratch remain unoptimised. |
+
+⚠ The `~70% / ~12% / ~4%` split at the top of this section is the M1 measurement
+and is now stale for the embedder: with the conv lowering in, the ResNet
+forward no longer dominates by that margin. Re-measure before using those
+shares to pick the next lever.
