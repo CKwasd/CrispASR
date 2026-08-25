@@ -46,6 +46,7 @@
 #include "crispasr_stream_finalize.h"
 #include "crispasr_stream_partial_decode.h"
 #include "crispasr_stream_punc.h"
+#include "crispasr_stream_postprocess.h"
 #include "whisper_params.h"
 #include "fireredpunc.h"
 #include "truecaser.h"
@@ -348,6 +349,14 @@ static bool stream_punc_partials_enabled(const whisper_params& params) {
 
 static bool stream_punc_finals_enabled(const whisper_params& params) {
     return crispasr_stream_punc_finals_enabled(params.stream_punc);
+}
+
+static bool stream_postprocess_partials_enabled(const whisper_params& params) {
+    return crispasr_stream_postprocess_partials_enabled(params.stream_postprocess);
+}
+
+static bool stream_postprocess_finals_enabled(const whisper_params& params) {
+    return crispasr_stream_postprocess_finals_enabled(params.stream_postprocess);
 }
 
 // Apply PCS (punctuation + capitalization + segmentation) to all segments.
@@ -4176,10 +4185,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             decoded_segments_this_step = true;
                         if (stream_punc_partials_enabled(params))
                             apply_punc_model(punc_ctx.get(), sl_for_text);
-                        apply_truecase_model(tc_ctx.get(), sl_for_text);
-                        apply_truecase_crf_model(tc_crf_ctx.get(), sl_for_text);
-                        apply_truecase_lstm_model(tc_lstm_ctx.get(), sl_for_text);
-                        apply_pcs_model(pcs_ctx.get(), sl_for_text);
+                        if (stream_postprocess_partials_enabled(params)) {
+                            apply_truecase_model(tc_ctx.get(), sl_for_text);
+                            apply_truecase_crf_model(tc_crf_ctx.get(), sl_for_text);
+                            apply_truecase_lstm_model(tc_lstm_ctx.get(), sl_for_text);
+                            apply_pcs_model(pcs_ctx.get(), sl_for_text);
+                        }
                         if (!params.punctuation) {
                             for (auto& seg : sl_for_text)
                                 crispasr_strip_punctuation(seg);
@@ -4303,10 +4314,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
                                 backend->transcribe(utterance_pcm.data(), (int)utterance_pcm.size(), 0, decode_params);
                             if (stream_punc_finals_enabled(params))
                                 apply_punc_model(punc_ctx.get(), utt_segs);
-                            apply_truecase_model(tc_ctx.get(), utt_segs);
-                            apply_truecase_crf_model(tc_crf_ctx.get(), utt_segs);
-                            apply_truecase_lstm_model(tc_lstm_ctx.get(), utt_segs);
-                            apply_pcs_model(pcs_ctx.get(), utt_segs);
+                            if (stream_postprocess_finals_enabled(params)) {
+                                apply_truecase_model(tc_ctx.get(), utt_segs);
+                                apply_truecase_crf_model(tc_crf_ctx.get(), utt_segs);
+                                apply_truecase_lstm_model(tc_lstm_ctx.get(), utt_segs);
+                                apply_pcs_model(pcs_ctx.get(), utt_segs);
+                            }
                             if (!params.punctuation) {
                                 for (auto& seg : utt_segs)
                                     crispasr_strip_punctuation(seg);
@@ -4609,10 +4622,12 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         backend->transcribe(utterance_pcm.data(), (int)utterance_pcm.size(), 0, decode_params);
                     if (stream_punc_finals_enabled(params))
                         apply_punc_model(punc_ctx.get(), utt_segs);
-                    apply_truecase_model(tc_ctx.get(), utt_segs);
-                    apply_truecase_crf_model(tc_crf_ctx.get(), utt_segs);
-                    apply_truecase_lstm_model(tc_lstm_ctx.get(), utt_segs);
-                    apply_pcs_model(pcs_ctx.get(), utt_segs);
+                    if (stream_postprocess_finals_enabled(params)) {
+                        apply_truecase_model(tc_ctx.get(), utt_segs);
+                        apply_truecase_crf_model(tc_crf_ctx.get(), utt_segs);
+                        apply_truecase_lstm_model(tc_lstm_ctx.get(), utt_segs);
+                        apply_pcs_model(pcs_ctx.get(), utt_segs);
+                    }
                     if (!params.punctuation) {
                         for (auto& seg : utt_segs)
                             crispasr_strip_punctuation(seg);

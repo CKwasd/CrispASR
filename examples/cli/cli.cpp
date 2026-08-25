@@ -11,6 +11,7 @@
 #include "crispasr_diarize_cli.h"      // crispasr_apply_diarize / pyannote cache (#107)
 #include "crispasr_speaker_embedder.h" // pluggable speaker embedder (#107 P3)
 #include "crispasr_stream_punc.h"      // streaming punctuation mode helpers (#112)
+#include "crispasr_stream_postprocess.h" // streaming postprocess mode helpers
 #include "crispasr_cache.h"            // crispasr_cache::ensure_cached_file (for --hf-repo, #128)
 #include "core/asr_sensitivity.h"      // --sensitivity presets (PLAN.md §W7)
 #include "core/gpu_backend_pref.h"     // crispasr_set_gpu_backend_pref (#214)
@@ -819,6 +820,13 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
             exit(2);
         }
         params.stream_punc = mode;
+    } else if (arg == "--stream-postprocess-mode") {
+        std::string mode = ARGV_NEXT;
+        if (!crispasr_stream_postprocess_mode_valid(mode)) {
+            fprintf(stderr, "crispasr: --stream-postprocess-mode must be 'off', 'final', or 'partial' (got '%s')\n", mode.c_str());
+            exit(2);
+        }
+        params.stream_postprocess = mode;
     } else if (arg == "--stream-final-mode") {
         std::string mode = ARGV_NEXT;
         if (mode != "redecode" && mode != "prefix") {
@@ -1305,6 +1313,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.stream_partial_decode_ms);
     fprintf(stderr, "  --stream-punc MODE                [%-7s] JSON+VAD FireRedPunc mode: off, final, or partial\n",
             params.stream_punc.c_str());
+    fprintf(stderr, "  --stream-postprocess-mode MODE   [%-7s] JSON+VAD PCS+truecaser mode: off, final, or partial\n",
+            params.stream_postprocess.c_str());
     fprintf(stderr,
             "  --stream-final-mode MODE          [%-7s] final.text source: 'redecode' (re-runs on the utterance "
             "PCM, best quality) or 'prefix' (LCP-accumulated, no extra encoder pass)\n",

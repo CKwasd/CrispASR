@@ -373,6 +373,12 @@ struct whisper_params {
     // --punc-model is loaded. "final" avoids the high-frequency partial
     // punc path; "partial" preserves the older partial+final behavior.
     std::string stream_punc = "final"; // off|final|partial
+    // JSON streaming + VAD only: control PCS and truecaser placement
+    // when those models are loaded. "final" runs them only on finalized
+    // utterances (the default, matching --stream-punc's default), keeping
+    // the high-frequency partial path cheap. "partial" runs them on every
+    // partial decode (historical behaviour).
+    std::string stream_postprocess = "final"; // off|final|partial
     // Issue #84 round 2 (CKwasd retest): how to compute `final.text`
     // when an utterance closes. The round-1 design just echoed the
     // last rolling-window partial — wrong because the rolling window

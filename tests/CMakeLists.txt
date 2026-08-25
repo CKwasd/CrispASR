@@ -644,6 +644,22 @@ catch_discover_tests(test-stream-punc
     PROPERTIES LABELS "unit;stream-json"
 )
 
+# JSON streaming post-process policy (PCS + truecaser). Pure string-to-bool
+# predicate covered exhaustively; no model load, no audio.
+add_executable(test-stream-postprocess
+    test-stream-postprocess.cpp
+)
+target_include_directories(test-stream-postprocess PRIVATE
+    ${PROJECT_SOURCE_DIR}/examples/cli
+)
+target_link_libraries(test-stream-postprocess PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-stream-postprocess
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;stream-json"
+)
+
 # JSON streaming partial-decode cadence (PR #113). Pure arithmetic on
 # the throttle predicate + interval conversion; no model, no audio.
 add_executable(test-stream-partial-decode
