@@ -28,6 +28,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="HF model ID or local path")
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--restore-zeroed-embeddings-from", metavar="HF_MODEL", default=None,
+        help="Fill all-zero token-embedding rows from this model (e.g. xlm-roberta-base). "
+             "kredor/punctuate-all zeroes 9531 rows — four contiguous ranges that look like "
+             "pruned token ranges for languages it does not serve. A zero embedding gives the "
+             "encoder no information for those tokens; the base model's pretrained vector is "
+             "what the fine-tune started from, and kredor's surviving rows sit only ~0.05 away "
+             "from base, so restoring base is close to undoing the prune. OFF by default: it "
+             "makes the artifact diverge from what transformers loads, so it is a deliberate "
+             "choice, not a silent improvement.")
     args = parser.parse_args()
 
     import torch
@@ -171,6 +181,26 @@ def main():
         name = name.replace("LayerNorm.", "ln.")
         name = name.replace("classifier.", "cls.")
         return name
+
+    # Optional: undo the embedding prune. Done on the state dict BEFORE the write
+    # loop so the restored rows go through the same f16 path as everything else.
+    if args.restore_zeroed_embeddings_from:
+        from transformers import AutoModel
+
+        emb_key = next(k for k in sd if k.endswith("word_embeddings.weight"))
+        W = sd[emb_key]
+        norms = torch.linalg.norm(W.float(), dim=1)
+        zero_rows = (norms < 1e-3).nonzero().flatten()
+        print(f"  zeroed embedding rows: {len(zero_rows)} / {W.shape[0]}")
+        if len(zero_rows):
+            base = AutoModel.from_pretrained(args.restore_zeroed_embeddings_from, dtype=torch.float32)
+            Wb = base.get_input_embeddings().weight.detach()
+            if Wb.shape != W.shape:
+                raise RuntimeError(f"embedding shape mismatch: base {tuple(Wb.shape)} vs model {tuple(W.shape)}")
+            W = W.clone()
+            W[zero_rows] = Wb[zero_rows].to(W.dtype)
+            sd[emb_key] = W
+            print(f"  restored {len(zero_rows)} rows from {args.restore_zeroed_embeddings_from}")
 
     tensor_count = 0
     for name in sorted(sd.keys()):

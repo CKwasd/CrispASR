@@ -23,6 +23,7 @@
 
 #include <cctype>
 #include "core/activation.h"
+#include "core/parallel_for.h"
 #include "core/attention.h"
 #include "core/bpe.h"
 #include "core/conv.h"
@@ -116,25 +117,6 @@ struct ov_bench_stage {
 // Parallel-for over [0, n) in contiguous chunks (scoring hot loop)
 // ---------------------------------------------------------------------------
 
-static void ov_parallel_for(int n_threads, int n, const std::function<void(int, int)>& fn) {
-    n_threads = std::max(1, std::min(n_threads, n));
-    if (n_threads == 1) {
-        fn(0, n);
-        return;
-    }
-    const int chunk = (n + n_threads - 1) / n_threads;
-    std::vector<std::thread> workers;
-    workers.reserve(n_threads);
-    for (int i = 0; i < n_threads; i++) {
-        const int a = i * chunk;
-        const int b = std::min(n, a + chunk);
-        if (a >= b)
-            break;
-        workers.emplace_back(fn, a, b);
-    }
-    for (auto& w : workers)
-        w.join();
-}
 
 // ---------------------------------------------------------------------------
 // Hyperparameters
@@ -2171,7 +2153,7 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
         // loop. This pass is ~13M exp() calls per step at T_target≈545.
         {
             ov_bench_stage b("  score_cfg");
-            ov_parallel_for(ctx->n_threads, T_target, [&](int t0, int t1) {
+            core_parallel::for_each_chunk(T_target, ctx->n_threads, [&](int t0, int t1) {
                 std::vector<float> c_lp(V), u_lp(V), guided(V), final_lp(V);
                 for (int t = t0; t < t1; t++) {
                     for (uint32_t cb = 0; cb < hp.n_codebooks; cb++) {
@@ -2209,7 +2191,7 @@ static ov_gen_result generate_iterative(omnivoice_context* ctx, const std::strin
                 for (size_t i = 0; i < pos_noise.size(); i++)
                     pos_noise[i] = gumbel_noise();
             }
-            ov_parallel_for(ctx->n_threads, T_target, [&](int t0, int t1) {
+            core_parallel::for_each_chunk(T_target, ctx->n_threads, [&](int t0, int t1) {
                 for (int t = t0; t < t1; t++) {
                     for (uint32_t cb = 0; cb < hp.n_codebooks; cb++) {
                         const float* lp = log_probs.data() + (size_t)t * out_dim + cb * V;

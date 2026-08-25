@@ -859,6 +859,7 @@ add_library(crispasr-core STATIC
             # Speaker-count estimation + spectral clustering (#324). Lives in
             # crispasr-core because both the diarizer and its unit tests use it
             # and it depends on nothing but the standard library.
+            core/parallel_for.h
             core/spectral_diarize.h
             core/spectral_diarize.cpp
             core/diarize_smooth.h

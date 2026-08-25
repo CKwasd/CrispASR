@@ -23,6 +23,7 @@
 #include <thread>
 #include <vector>
 #include "core/crispasr_env.h"
+#include "core/parallel_for.h"
 #include "core/ggml_cpu_backend.h"
 
 #ifndef M_PI
@@ -119,28 +120,6 @@ static int marblenet_vad_nthreads() {
     return v;
 }
 
-// Run fn(begin, end) over a partition of [0, n) across threads; sub-ranges are
-// disjoint (each frame writes its own mel column), so this is bit-identical.
-template <class F> static void marblenet_parallel_for(int n, F&& fn) {
-    const int nt = std::min(marblenet_vad_nthreads(), n);
-    if (nt <= 1) {
-        fn(0, n);
-        return;
-    }
-    std::vector<std::thread> pool;
-    pool.reserve(nt - 1);
-    const int chunk = (n + nt - 1) / nt;
-    for (int t = 1; t < nt; t++) {
-        const int a = t * chunk, b = std::min(n, a + chunk);
-        if (a >= b)
-            break;
-        pool.emplace_back([&fn, a, b]() { fn(a, b); });
-    }
-    fn(0, std::min(n, chunk));
-    for (auto& th : pool)
-        th.join();
-}
-
 // ── Mel ────────────────────────────────────────────────────────────────────
 
 static void mbn_fft_dft(const float* in, int N, float* out) {
@@ -207,7 +186,7 @@ static std::vector<float> mbn_compute_mel(const float* pcm, int n_samples, const
 
     // Frames are independent (each writes its own mel column t); give each thread
     // its own FFT scratch. Bit-identical to the serial loop (#305).
-    marblenet_parallel_for(n_frames, [&](int t0, int t1) {
+    core_parallel::for_each_chunk(n_frames, marblenet_vad_nthreads(), [&](int t0, int t1) {
         std::vector<float> si(4 * n_fft, 0), so(8 * n_fft, 0);
         for (int t = t0; t < t1; t++) {
             // Window (win_len) centered in n_fft-sized frame, zero-padded
