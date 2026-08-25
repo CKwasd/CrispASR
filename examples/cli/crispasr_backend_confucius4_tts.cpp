@@ -16,7 +16,7 @@ class Confucius4TtsBackend : public CrispasrBackend {
 public:
     const char* name() const override { return "confucius4-tts"; }
 
-    uint32_t capabilities() const override { return CAP_TTS | CAP_AUTO_DOWNLOAD; }
+    uint32_t capabilities() const override { return CAP_TTS | CAP_VOICE_CLONING | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE; }
 
     bool init(const whisper_params& p) override {
         auto cp = confucius4_tts_default_params();
