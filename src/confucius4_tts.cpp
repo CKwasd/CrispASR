@@ -229,6 +229,14 @@ struct confucius4_tts_context {
     std::vector<float> prompt_mel;
     int prompt_n_frames = 0;
 
+    // Host-side F32 copies of the semantic token + position embedding tables.
+    // embed_semantic_token used to build a 2-op ggml graph PER TOKEN (x3 beams
+    // per decode step); a dequantized table lookup is byte-identical (same
+    // ggml to_float dequant) and free. CRISPASR_CONFUCIUS4_GRAPH_EMBED=1
+    // restores the graph path for A/B.
+    std::vector<float> sem_embed_tab; // (semantic_vocab, model_dim)
+    std::vector<float> sem_pos_tab;   // (max_semantic, model_dim)
+
     // w2v-BERT 2.0 encoder-only (17L sidon-layout GGUF) for the T2S
     // condition_emb — layer-17 hidden states, z-normalised with the baked
     // stats, fed to the native ECAPA.
@@ -427,6 +435,17 @@ static bool load_t2s(confucius4_tts_context* ctx, const char* path) {
         fprintf(stderr, "confucius4: T2S loaded %zu tensors OK\n", wl.tensors.size());
 
     bind_speaker_encoder(ctx, wl.tensors);
+
+    // Bake the host-side embedding tables (see sem_embed_tab comment).
+    if (std::getenv("CRISPASR_CONFUCIUS4_GRAPH_EMBED") == nullptr) {
+        ctx->sem_embed_tab = s2a_read_f32(m.semantic_embed_w);
+        ctx->sem_pos_tab = s2a_read_f32(m.sem_pos_embed_w);
+        if ((int)ctx->sem_embed_tab.size() != hp.semantic_vocab_size * hp.model_dim ||
+            (int)ctx->sem_pos_tab.size() != hp.max_semantic_seq_lens * hp.model_dim) {
+            ctx->sem_embed_tab.clear();
+            ctx->sem_pos_tab.clear();
+        }
+    }
 
     return true;
 }
@@ -1422,6 +1441,16 @@ static std::vector<float> embed_semantic_token(confucius4_tts_context* ctx, int3
         fprintf(stderr, "confucius4: embed_semantic_token: sem_pos=%d OUT OF RANGE [0,%lld)\n", sem_pos,
                 (long long)m.sem_pos_embed_w->ne[1]);
         return {};
+    }
+
+    // Host-table fast path: identical dequant as ggml_get_rows, no graph.
+    if (!ctx->sem_embed_tab.empty() && !ctx->sem_pos_tab.empty()) {
+        std::vector<float> out(D);
+        const float* e = ctx->sem_embed_tab.data() + (size_t)token_id * D;
+        const float* p = ctx->sem_pos_tab.data() + (size_t)sem_pos * D;
+        for (int i = 0; i < D; i++)
+            out[i] = e[i] + p[i];
+        return out;
     }
 
     size_t ctx_size = ggml_tensor_overhead() * 16 + ggml_graph_overhead_custom(64, false);
