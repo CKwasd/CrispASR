@@ -1082,6 +1082,25 @@ catch_discover_tests(test-diarize-slice-rewalk
     PROPERTIES LABELS "unit;diarize;issue324"
 )
 
+# ─── test-confucius4-tts-live — live integration tests for Confucius4-TTS
+if (TARGET confucius4-tts)
+add_executable(test-confucius4-tts-live
+    test_confucius4_tts_live.cpp
+)
+target_include_directories(test-confucius4-tts-live PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-confucius4-tts-live PRIVATE
+    Catch2::Catch2WithMain
+    confucius4-tts
+    indextts
+)
+catch_discover_tests(test-confucius4-tts-live
+    TEST_SPEC "[live]"
+    PROPERTIES LABELS "live;confucius4-tts"
+)
+endif()
+
 # ─── test-miotts-live — live integration tests for MioTTS backend
 add_executable(test-miotts-live
     test_miotts_live.cpp
