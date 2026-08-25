@@ -3224,8 +3224,10 @@ int crispasr_run_backend(const whisper_params& params_in) {
 
     // #80e: optional warmup — transcribe a short silence buffer to
     // amortize first-call overhead (graph alloc, GPU kernel compile).
-    // Enabled via --warmup or CRISPASR_WARMUP=1.
-    if (params.warmup || getenv("CRISPASR_WARMUP")) {
+    // Enabled via --warmup, CRISPASR_WARMUP=1, or automatically in
+    // JSON+VAD streaming mode (--stream-json) to eliminate startup
+    // latency spikes from GPU kernel compilation.
+    if (params.stream_json || params.warmup || getenv("CRISPASR_WARMUP")) {
         auto t_warmup_start = std::chrono::steady_clock::now();
         backend->warmup();
         if (params.verbose || !params.no_prints) {
