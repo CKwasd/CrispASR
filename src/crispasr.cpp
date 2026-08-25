@@ -8621,12 +8621,33 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                             }
                         }
                         text = "";
-                        while (i < (int)tokens_cur.size() && tokens_cur[i].id > whisper_token_beg(ctx) &&
-                               ctx->vocab.is_timestamp(tokens_cur[i].id)) {
-                            i++;
-                        }
-                        i--;
+                        // Issue #388 (backport of ggml-org/whisper.cpp#2279, fixing
+                        // whisper.cpp#2271): around a pause the model emits TWO
+                        // timestamp tokens — the end of this utterance and the start
+                        // of the next. Consuming them and then setting t0 = t1 threw
+                        // the second one away, so every segment began where the
+                        // previous one ended and the silence between utterances
+                        // vanished from the transcript / SRT.
+                        //
+                        // Look AHEAD at i + 1 instead, and take t0 from the LAST
+                        // timestamp consumed — that is the next utterance's real
+                        // start. Index-equivalent to the old loop (which advanced
+                        // past the run and backed off one), so only t0 and the
+                        // print_special echo change.
+                        //
+                        // The is_timestamp() guard is kept, deliberately diverging
+                        // from upstream: CrispASR has extra special tokens above
+                        // token_beg ([SOLM], <|speakerN|>) that must not be eaten
+                        // as timestamps.
                         t0 = t1;
+                        while (i + 1 < (int)tokens_cur.size() && tokens_cur[i + 1].id > whisper_token_beg(ctx) &&
+                               ctx->vocab.is_timestamp(tokens_cur[i + 1].id)) {
+                            i++;
+                            if (params.print_special) {
+                                text += whisper_token_to_str(ctx, tokens_cur[i].id);
+                            }
+                            t0 = seek + 2 * (tokens_cur[i].tid - whisper_token_beg(ctx));
+                        }
                         i0 = i + 1;
                         speaker_turn_next = false;
                     }
@@ -8644,8 +8665,8 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
                                    text.c_str());
                         } else {
                             printf("%s", text.c_str());
-                            fflush(stdout);
                         }
+                        fflush(stdout); // #388: flush the timestamped form too, as whisper.cpp master does
                     }
 
                     result_all.push_back({tt0, tt1, text, state->no_speech_prob, {}, speaker_turn_next, {}});
