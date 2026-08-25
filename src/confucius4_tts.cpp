@@ -3411,8 +3411,10 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
     // on q4_k, harmless on f16); CRISPASR_CONFUCIUS4_CFG_FUSE=0/1 forces
     // either way.  The parity dumps force it off because the harness expects
     // per-pass semantics.
-    bool cfg_fuse = ctx->backend && !ggml_backend_is_cpu(ctx->backend) &&
-                    std::strstr(ggml_backend_name(ctx->backend), "Metal") != nullptr;
+    // NB: ggml names the Metal DEVICE "MTL0" — match on the registry name via
+    // core_cpu_backend::is_metal (the ggml_backend_name("Metal") form never
+    // fires; red-verified 2026-08-25).
+    bool cfg_fuse = ctx->backend && !ggml_backend_is_cpu(ctx->backend) && core_cpu_backend::is_metal(ctx->backend);
     if (const char* env_fuse = std::getenv("CRISPASR_CONFUCIUS4_CFG_FUSE"))
         if (*env_fuse)
             cfg_fuse = atoi(env_fuse) != 0;
