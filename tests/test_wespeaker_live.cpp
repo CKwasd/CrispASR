@@ -213,3 +213,34 @@ TEST_CASE("wespeaker: same speaker is closer than a different speaker", "[wespea
     CHECK(same > 0.3);
     wespeaker_free(ctx);
 }
+
+// #324 perf: the im2col conv lowering must be numerically interchangeable with
+// the direct conv it replaces — same convolution, different summation order.
+// The bar is the same one the port itself was held to against the Python
+// oracle (cosine ~0.999997), an order of magnitude above what a wrong stride,
+// pad, or kernel layout would score.
+TEST_CASE("wespeaker: im2col conv matches direct conv", "[wespeaker][.live]") {
+    if (get_env("CRISPASR_MODEL_WESPEAKER").empty())
+        SKIP("CRISPASR_MODEL_WESPEAKER not set");
+    auto pcm = load_wav_16k_mono("samples/jfk.wav");
+    REQUIRE(pcm.size() > 16000 * 6);
+
+    setenv("CRISPASR_WESPEAKER_CONV", "direct", 1);
+    wespeaker_context* ctx_d = open_model();
+    REQUIRE(ctx_d != nullptr);
+    auto a = embed_window(ctx_d, pcm, 0.5, 2.5);
+    wespeaker_free(ctx_d);
+
+    setenv("CRISPASR_WESPEAKER_CONV", "im2col", 1);
+    wespeaker_context* ctx_i = open_model();
+    REQUIRE(ctx_i != nullptr);
+    auto b = embed_window(ctx_i, pcm, 0.5, 2.5);
+    wespeaker_free(ctx_i);
+    unsetenv("CRISPASR_WESPEAKER_CONV");
+
+    REQUIRE(a.size() == 256);
+    REQUIRE(b.size() == 256);
+    const double cos = cosine(a, b);
+    INFO("cos(direct, im2col) = " << cos);
+    CHECK(cos > 0.99999);
+}
