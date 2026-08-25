@@ -257,20 +257,29 @@ if HAVE_W2V:
     # THE fully native zero-shot path: no COND_DIR, no TEXT_IDS — tokenizer,
     # w2v-BERT layer-17, ECAPA, CAMPPlus, prompt mel all in-process.
     _arms.append(("NATIVE-full", {}, ["--voice", str(prompt_wav), "--i-have-rights"]))
+    # Persistent-decode-graph timing A/B on a clean box (the VPS is too noisy).
+    # PCM must stay bit-identical to NATIVE-full (only the timestamped C2PA
+    # manifest may differ); the wall-time delta decides the default.
+    _arms.append(("PERSIST-ab", {"CRISPASR_CONFUCIUS4_PERSIST": "1"},
+                  ["--voice", str(prompt_wav), "--i-have-rights"]))
+import time as _time
 for arm, extra_env, extra_args in _arms:
     wav = TEMP / f"confucius4_{arm}.wav"
     env = dict(os.environ)  # NATIVE-tok / NATIVE-full run the native tokenizer
     if arm == "NATIVE-voice":
         env["CRISPASR_CONFUCIUS4_TEXT_IDS"] = token_ids_str
     env.update(extra_env)
+    _t0 = _time.monotonic()
     r = subprocess.run(
         [crispasr_bin, "--backend", "confucius4-tts", "-m", t2s_path,
          "--codec-model", s2a_f16, "--tts", TEST_TEXT, "-l", LANG,
          "--tts-output", str(wav), "--tts-steps", str(ODE_STEPS), "-v"] + extra_args,
         capture_output=True, text=True, timeout=7200, env=env,
     )
+    _wall = _time.monotonic() - _t0
     ok = wav.exists() and os.path.getsize(str(wav)) > 100
-    print(f"  [{arm}] TTS rc={r.returncode} wav={'%d B' % os.path.getsize(str(wav)) if ok else 'NONE'}")
+    print(f"  [{arm}] TTS rc={r.returncode} wall={_wall:.1f}s "
+          f"wav={'%d B' % os.path.getsize(str(wav)) if ok else 'NONE'}")
     for line in r.stderr.split("\n"):
         if any(k in line for k in ("conditioning set", "tokenized", "voice set", "CAMPPlus",
                                    "beam decode", "BigVGAN:", "WARNING", "condition_emb computed")):
@@ -280,6 +289,12 @@ for arm, extra_env, extra_args in _arms:
             print(f"  [{arm}] ! " + line.strip())
     _native_arms[arm] = {"wav": wav, "ok": ok}
 print(f"  expected AutoTokenizer ids: n={len(ids)} (runtime 'tokenized' line above must match)")
+if "PERSIST-ab" in _native_arms and _native_arms.get("NATIVE-full", {}).get("ok"):
+    import wave as _wave
+    def _pcm(p):
+        w = _wave.open(str(p)); d = w.readframes(w.getnframes()); w.close(); return d
+    _same = _pcm(_native_arms["NATIVE-full"]["wav"]) == _pcm(_native_arms["PERSIST-ab"]["wav"])
+    print(f"  PERSIST-ab PCM vs NATIVE-full: {'BIT-IDENTICAL' if _same else 'DIFFERS (investigate!)'}")
 
 
 # ── Phase 6c: REFERENCE end-to-end control ──────────────────────────────────
