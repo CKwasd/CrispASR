@@ -33,11 +33,50 @@ Kernel run 18 (`chr1s4/crispasr-confucius4-cfg-verify`), all green:
 registry ✓ quantize rules ✓ parity harnesses (s2a/t2s_parity) ✓ params unit
 test ✓ go cgo sync ✓ docs/README ✓ HF license card ✓.
 
-**In flight:** run 19 A/Bs the host-table embedding fast path (expected
-byte-identical). **Open (perf, non-blocking):** persistent decode graph for
-the 3-beam T2S (3 graph builds/step now); extend s2a_parity to the
-conditioned/prompt path (bug 13 taught why); BigVGAN raw path A/B; merge to
-main after run 19.
+## Post-merge verification (runs 19–20 + VPS, 2026-08-25)
+
+- **Run 19**: host-table embedding fast path byte-identical → default ON.
+- **VPS run (8 GB, no GPU)**: fully native `--voice` roundtrip transcribes
+  verbatim; **peak RSS 2.23 GB**. Slow on CPU (~3-4 min/sentence on quiet
+  4-core Kaggle; VPS wall scales with contention — 20-70 min at load 13-22).
+- **Run 20, persistent decode graph A/B (clean box)**: PCM BIT-IDENTICAL but
+  867.4 s vs 882.0 s — the fixed-Lk=1521 attention outweighs the saved
+  per-step graph builds on CPU. **Default stays the rebuild path**; the
+  correct persistent path is kept behind `CRISPASR_CONFUCIUS4_PERSIST=1` for
+  a future GPU port (launch-bound dispatch is where it wins — see the
+  parakeet/nemotron precedent) or a bucketed-Lk variant.
+- **Run 20, conditioned S2A parity** (new `--style`/`--prompt-mel` mode +
+  kernel cond-full arm): **cos=1.000000 at every stage** over the full
+  947-frame prompt path — regulator, input_embed, WaveNet, v steps 1–25,
+  final mel. Bug 13's blind spot is covered for good.
+- Live test `test-confucius4-tts-live` added (passes locally, 9 assertions).
+
+## CUDA GPU path — VALIDATED (gpu-verify run 1, P100, 2026-08-25)
+
+Fully native `--voice` roundtrip on CUDA: **8/8, transcript verbatim, 183.2 s
+vs 685.2 s CPU control = 3.74×** — with zero code changes (the all-gallocr
+single-backend graphs ran as-is). GPU+persist 185.7 s (neutral → persist
+stays gated everywhere). Kernel: `chr1s4/crispasr-confucius4-gpu-verify`.
+GPU-effort doc: `/mnt/volume1/conf4gpu.md`.
+
+**Open (perf, optional):** CFG cond+uncond fusion in one DiT pass
+(seq-concat + block-diagonal mask — now the biggest CUDA lever); bucketed-Lk
+persistent decode; BigVGAN raw-path A/B; Metal/Vulkan validation (Mac).
+
+## CFG fusion (`CRISPASR_CONFUCIUS4_CFG_FUSE=1`)
+
+The two per-step DiT estimator passes (cond + uncond) run as ONE graph eval:
+seq-concat along time (`[0,T)` = cond, `[T,2T)` = uncond) with a
+block-diagonal F16 flash-attn mask, positions `[0..T-1, 0..T-1]`, and the
+CFG blend `(1+cfg)*v_cond - cfg*v_uncond` done in-graph (output is `(mel,
+T)`, halving the readback).  Every graph op is per-frame except attention
+(masked) and the WaveNet k=5 convs — those would smear the arms into each
+other across the seam (±2 frames/layer through the residual chain), so the
+WaveNet runs per-arm on split halves inside the same graph.  The mask and
+positions are re-set on EVERY compute (§234 gallocr aliasing).  Parity dumps
+(`CRISPASR_CONFUCIUS4_DUMP_S2A`) force fusion off — the harness expects
+per-pass semantics.  Default OFF until the CUDA A/B (gpu-verify run 2+)
+proves wall-time win + 8/8 roundtrip on both s2a f16 and q4_k.
 
 ### 13 bugs total — 9–13 this session
 
