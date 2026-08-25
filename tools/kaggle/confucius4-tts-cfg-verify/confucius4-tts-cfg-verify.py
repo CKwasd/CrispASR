@@ -95,6 +95,12 @@ s2a_path = grab("cstr/confucius4-tts-GGUF", "confucius4-tts-s2a-q4_k.gguf")
 s2a_f16 = grab("cstr/confucius4-tts-GGUF", "confucius4-tts-s2a-f16.gguf")
 voc_path = grab("cstr/confucius4-tts-GGUF", "confucius4-tts-bigvgan-22k-f16.gguf")
 s2a_ckpt = grab("netease-youdao/Confucius4-TTS", "s2a_model.pt", d=str(TEMP / "torch"))
+try:  # encoder-only w2v-BERT: enables the FULLY native --voice arm (sibling of the T2S)
+    grab("cstr/confucius4-tts-GGUF", "confucius4-tts-w2v-f16.gguf")
+    HAVE_W2V = True
+except Exception as _e:  # noqa: BLE001
+    print(f"  (no w2v GGUF yet: {_e}) -- NATIVE-full arm will be skipped")
+    HAVE_W2V = False
 
 # ── Phase 4: tokenize with the CORRECT prompt ───────────────────────────────
 kh.step("tokenize (real LANGUAGE_TOKEN_MAP)")
@@ -242,14 +248,19 @@ _nat_cond = TEMP / "cond_native"
 _nat_cond.mkdir(parents=True, exist_ok=True)
 if (TEMP / "cond_full" / "w2v_features.bin").exists():
     shutil.copy(TEMP / "cond_full" / "w2v_features.bin", _nat_cond / "w2v_features.bin")
-for arm, extra_env, extra_args in (
+_arms = [
     ("NATIVE-tok", {"CRISPASR_CONFUCIUS4_COND_DIR": str(TEMP / "cond_full")}, []),
     ("NATIVE-voice", {"CRISPASR_CONFUCIUS4_COND_DIR": str(_nat_cond)},
      ["--voice", str(prompt_wav), "--i-have-rights"]),
-):
+]
+if HAVE_W2V:
+    # THE fully native zero-shot path: no COND_DIR, no TEXT_IDS — tokenizer,
+    # w2v-BERT layer-17, ECAPA, CAMPPlus, prompt mel all in-process.
+    _arms.append(("NATIVE-full", {}, ["--voice", str(prompt_wav), "--i-have-rights"]))
+for arm, extra_env, extra_args in _arms:
     wav = TEMP / f"confucius4_{arm}.wav"
-    env = dict(os.environ)  # NOTE: no TEXT_IDS for NATIVE-tok
-    if arm != "NATIVE-tok":
+    env = dict(os.environ)  # NATIVE-tok / NATIVE-full run the native tokenizer
+    if arm == "NATIVE-voice":
         env["CRISPASR_CONFUCIUS4_TEXT_IDS"] = token_ids_str
     env.update(extra_env)
     r = subprocess.run(
