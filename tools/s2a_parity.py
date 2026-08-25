@@ -67,6 +67,13 @@ def main():
                          "(ref_mel.wav / cpp_mel.wav) so each can be ASR'd separately")
     ap.add_argument("--cfg", type=float, default=0.7)
     ap.add_argument("--steps", type=int, default=25)
+    # Conditioned/prompt path (bug 13 lived here with ZERO parity coverage):
+    # style_embedding.bin (spk_embed_dim,) + prompt_mel.bin (T_ref, mel_dim)
+    # from the conditioning dumper. When given, the ODE mirrors solve_euler
+    # with a non-zero prompt span: prompt_cond prepend, prompt_x, spks,
+    # per-step prompt re-zero, and the final prompt strip.
+    ap.add_argument("--style", default=None, help="style_embedding.bin (spk_embed_dim,)")
+    ap.add_argument("--prompt-mel", default=None, help="prompt_mel.bin (T_ref, mel_dim)")
     a = ap.parse_args()
 
     MaskedDiffWithXvec, MaskedDiffWithXvecConfig = _import_ref(a.ref_repo)
@@ -82,8 +89,14 @@ def main():
     mel_cpp = load(d, "mel", shp)            # (T_mel, mel_dim)
 
     T_sem = codes.shape[0]
-    T_mel, mel_dim = z_init.shape
-    print(f"T_sem={T_sem} T_mel={T_mel} mel_dim={mel_dim}")
+    T_total, mel_dim = z_init.shape
+    style = prompt_mel_np = None
+    if a.style and a.prompt_mel and os.path.exists(a.style) and os.path.exists(a.prompt_mel):
+        style = np.fromfile(a.style, dtype=np.float32)
+        prompt_mel_np = np.fromfile(a.prompt_mel, dtype=np.float32).reshape(-1, mel_dim)
+    T_ref = 0 if prompt_mel_np is None else prompt_mel_np.shape[0]
+    T_mel = T_total - T_ref  # regulator target length (prompt span excluded)
+    print(f"T_sem={T_sem} T_total={T_total} T_ref={T_ref} T_target={T_mel} mel_dim={mel_dim}")
 
     # Build from the SHIPPED config, not the dataclass defaults: the checkpoint
     # has estimator_mlp_ratio=3.0 (ff 1536, not 2048), and cfm_t_scheduler stays
@@ -115,13 +128,23 @@ def main():
         cmp("cond (regulator)", cond_cpp, cond_ref[0].numpy())
 
         # --- stage 2: the Euler ODE, driven on the C++ noise ---
-        # mirrors ConditionalCFM.solve_euler with prompt_len == 0
+        # mirrors ConditionalCFM.solve_euler; with --style/--prompt-mel the
+        # prompt span is live (prompt_len == T_ref), matching
+        # MaskedDiffWithXvec.inference exactly.
         dec = model.decoder
-        x = torch.from_numpy(z_init.T.copy()).unsqueeze(0)   # (1, mel_dim, T_mel)
-        mu = cond_ref
-        spks = torch.zeros(1, model.spk_embed_dim)
-        mask = torch.ones(1, T_mel, dtype=torch.bool)
-        prompt_x = torch.zeros_like(x)
+        x = torch.from_numpy(z_init.T.copy()).unsqueeze(0)   # (1, mel_dim, T_total)
+        if T_ref > 0:
+            prompt_condition = model.prompt_cond.expand(1, T_ref, -1)
+            mu = torch.cat([prompt_condition, cond_ref], dim=1)
+            spks = torch.from_numpy(style).unsqueeze(0)
+            prompt_x = torch.zeros_like(x)
+            prompt_x[..., :T_ref] = torch.from_numpy(prompt_mel_np.T.copy()).unsqueeze(0)
+            x[..., :T_ref] = 0
+        else:
+            mu = cond_ref
+            spks = torch.zeros(1, model.spk_embed_dim)
+            prompt_x = torch.zeros_like(x)
+        mask = torch.ones(1, T_total, dtype=torch.bool)
 
         t_span = torch.linspace(0, 1, a.steps + 1)
         if cfg.cfm_t_scheduler == "cosine":
@@ -145,9 +168,11 @@ def main():
             t = t + dt
             if step < len(t_span) - 1:
                 dt = t_span[step + 1] - t
+            if T_ref > 0:
+                x[..., :T_ref] = 0  # solve_euler re-zeroes the prompt span every step
             print(f"  step {step:2d}/{a.steps} t={float(t):.4f} |v|max={v.abs().max():.4f}", flush=True)
 
-        mel_ref = x[0].numpy().T   # back to (T_mel, mel_dim) row-major
+        mel_ref = x[0, :, T_ref:].numpy().T   # prompt stripped, (T_target, mel_dim) row-major
         cmp("mel (final)", mel_cpp, mel_ref)
 
         # --- stage 2b: inside the estimator, at step 1 ----------------------
@@ -162,10 +187,12 @@ def main():
         if "dit_t2" in shp and hasattr(est, "t_embedder2"):
             t2_ref = est.t_embedder2(torch.tensor([0.0]))[0].numpy()
             cmp("dit t2 (wavenet ts)", load(d, "dit_t2", shp), t2_ref)
+        z0 = torch.from_numpy(load(d, "z_init", shp).T.copy()).unsqueeze(0)
+        if T_ref > 0:
+            z0[..., :T_ref] = 0
         if "dit_x_in" in shp:
-            z0 = torch.from_numpy(load(d, "z_init", shp).T.copy()).unsqueeze(0)
             x_in_ref = est.input_embed(z0.transpose(1, 2),
-                                       torch.zeros_like(z0).transpose(1, 2),
+                                       prompt_x.transpose(1, 2),
                                        mu, spks)
             cmp("dit x_in (input_embed)", load(d, "dit_x_in", shp), x_in_ref[0].numpy())
 
@@ -194,8 +221,7 @@ def main():
                 est.wavenet.register_forward_hook(grab("dbg_wn")),
                 est.final_layer.register_forward_hook(grab("dbg_fin")),
             ]
-            z0 = torch.from_numpy(load(d, "z_init", shp).T.copy()).unsqueeze(0)
-            est(z0, mask, mu, torch.tensor([0.0]), spks, torch.zeros_like(z0))
+            est(z0, mask, mu, torch.tensor([0.0]), spks, prompt_x)
             for h in handles:
                 h.remove()
 
@@ -232,12 +258,11 @@ def main():
                                       torch.cat([mu, torch.zeros_like(mu)], 0),
                                       torch.full((2,), t_k),
                                       torch.cat([spks, torch.zeros_like(spks)], 0),
-                                      torch.zeros(2, model.output_size, T_mel))
+                                      torch.cat([prompt_x, torch.zeros_like(prompt_x)], 0))
                     vc, vu = torch.split(v, [1, 1], dim=0)
                     v = (1.0 + a.cfg) * vc - a.cfg * vu
                 else:
-                    v = dec.estimator(xk, mask, mu, torch.tensor([t_k]), spks,
-                                      torch.zeros_like(xk))
+                    v = dec.estimator(xk, mask, mu, torch.tensor([t_k]), spks, prompt_x)
                 cmp(f"  v step {step:2d} (t={t_k:.3f})", v_k, v[0].numpy().T)
         np.save(os.path.join(d, "mel_ref.npy"), mel_ref)
         print("wrote", os.path.join(d, "mel_ref.npy"))

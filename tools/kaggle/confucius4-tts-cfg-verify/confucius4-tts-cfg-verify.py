@@ -374,8 +374,13 @@ except Exception as e:  # noqa: BLE001 — control arm must never sink the run
 # ── Phase 7: per-stage parity against the real PyTorch S2A ──────────────────
 kh.step("S2A parity vs PyTorch reference")
 parity = REPO / "tools" / "s2a_parity.py"
-for tag in ("q4_k", "f16"):
-    dump = runs[tag]["dump"]
+# third arm: the CONDITIONED dump — exercises the prompt path (prompt_cond
+# prepend, prompt_x, spks, per-step re-zero, strip), which had zero parity
+# coverage when bug 13 (CFG-uncond over T_mel) shipped.
+_parity_arms = [("q4_k", runs["q4_k"]["dump"], None),
+                ("f16", runs["f16"]["dump"], None),
+                ("cond-full", TEMP / "dump_cond_full", TEMP / "cond_full")]
+for tag, dump, cdir in _parity_arms:
     print(f"  --- {tag} ---")
     if not (dump / "shapes.txt").exists():
         print("  SKIP: no dump produced")
@@ -383,6 +388,9 @@ for tag in ("q4_k", "f16"):
     cmd = [sys.executable, str(parity), "--dump-dir", str(dump),
            "--ref-repo", str(REF), "--s2a-ckpt", s2a_ckpt,
            "--steps", str(ODE_STEPS), "--cfg", "0.7"]
+    if cdir is not None:
+        cmd += ["--style", str(cdir / "style_embedding.bin"),
+                "--prompt-mel", str(cdir / "prompt_mel.bin")]
     if tag == "q4_k":                       # vocode once, from the shipped quant
         cmd += ["--vocode-out", str(TEMP / "vocoded")]
     pres = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
