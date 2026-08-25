@@ -170,7 +170,7 @@ struct confucius4_dit_cache {
     ggml_tensor* output = nullptr;    // (mel_dim, T) — velocity output
     int T_cached = 0;
     int mel_dim_cached = 0;
-    bool fused_cfg = false;     // graph runs cond+uncond seq-concat with in-graph blend
+    bool fused_cfg = false; // graph runs cond+uncond seq-concat with in-graph blend
     float cfg_rate_cached = 0.0f;
     std::vector<ggml_fp16_t> mask_host; // host copy of the block-diagonal mask
 
@@ -2462,8 +2462,8 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim,
     const int inter_dim = w1_0 ? (int)w1_0->ne[1] : dim * 4;
 
     if (vb >= 1)
-        fprintf(stderr, "confucius4: DiT graph: depth=%d dim=%d heads=%d inter=%d mel=%d T=%d%s\n", depth, dim,
-                n_heads, inter_dim, mel_dim, T, fused ? " (CFG-fused, 2T)" : "");
+        fprintf(stderr, "confucius4: DiT graph: depth=%d dim=%d heads=%d inter=%d mel=%d T=%d%s\n", depth, dim, n_heads,
+                inter_dim, mel_dim, T, fused ? " (CFG-fused, 2T)" : "");
 
     // Allocate graph context: ~35 ops per block × depth + ~20 finals
     struct ggml_init_params p = {4 * 1024 * 1024, nullptr, true};
@@ -2691,71 +2691,72 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim,
 
             char nbuf[256];
             for (int il = 0; il < n_wn_layers; il++) {
-            // in_layers[il]: Conv1d(dim, 2*dim, k=5, pad=2) — fused weight
-            snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.in_layers.%d.conv.weight", il);
-            auto il_w = s2a_find(s, nbuf);
-            snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.in_layers.%d.conv.bias", il);
-            auto il_b = s2a_find(s, nbuf);
+                // in_layers[il]: Conv1d(dim, 2*dim, k=5, pad=2) — fused weight
+                snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.in_layers.%d.conv.weight", il);
+                auto il_w = s2a_find(s, nbuf);
+                snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.in_layers.%d.conv.bias", il);
+                auto il_b = s2a_find(s, nbuf);
 
-            ggml_tensor* x_in_l = il_w ? ggml_conv_1d(cache.gctx, il_w, x_wn, 1, 2, 1) : x_wn;
-            if (il_b) {
-                ggml_tensor* b2d = ggml_reshape_2d(cache.gctx, il_b, 1, il_b->ne[0]);
-                x_in_l = ggml_add(cache.gctx, x_in_l, b2d);
-            }
+                ggml_tensor* x_in_l = il_w ? ggml_conv_1d(cache.gctx, il_w, x_wn, 1, 2, 1) : x_wn;
+                if (il_b) {
+                    ggml_tensor* b2d = ggml_reshape_2d(cache.gctx, il_b, 1, il_b->ne[0]);
+                    x_in_l = ggml_add(cache.gctx, x_in_l, b2d);
+                }
 
-            // Slice g_all for this layer: g_l = g_all[il*2*hidden .. (il+1)*2*hidden]
-            ggml_tensor* g_l = ggml_view_1d(cache.gctx, g_all, 2 * hidden, (size_t)il * 2 * hidden * sizeof(float));
+                // Slice g_all for this layer: g_l = g_all[il*2*hidden .. (il+1)*2*hidden]
+                ggml_tensor* g_l = ggml_view_1d(cache.gctx, g_all, 2 * hidden, (size_t)il * 2 * hidden * sizeof(float));
 
-            // x_in_l is (T, 2*hidden) time-first from conv1d. Split into two (T, hidden).
-            // g_l is (2*hidden,) — broadcast over T.
-            ggml_tensor* g_a = ggml_view_1d(cache.gctx, g_l, hidden, 0);
-            ggml_tensor* g_b = ggml_view_1d(cache.gctx, g_l, hidden, hidden * sizeof(float));
+                // x_in_l is (T, 2*hidden) time-first from conv1d. Split into two (T, hidden).
+                // g_l is (2*hidden,) — broadcast over T.
+                ggml_tensor* g_a = ggml_view_1d(cache.gctx, g_l, hidden, 0);
+                ggml_tensor* g_b = ggml_view_1d(cache.gctx, g_l, hidden, hidden * sizeof(float));
 
-            // ne[0]=T, ne[1]=2*hidden. Split along ne[1]:
-            int64_t stride1 = x_in_l->nb[1];
-            // x_in_l is time-first (T, 2*hidden): ne[0]=T, ne[1]=channel.  The
-            // split is along the CHANNEL axis, so the second half starts
-            // `hidden` ROWS in -- hidden * nb[1], not hidden * element_size.
-            // Using the element size offsets by `hidden` samples along TIME
-            // instead, which makes the sigmoid half overlap the tanh half.
-            ggml_tensor* xa = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T_w, hidden, stride1, 0));
-            ggml_tensor* xb =
-                ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T_w, hidden, stride1, (size_t)hidden * stride1));
-            // Reshape g_a/g_b from (hidden,) to (1, hidden) for time-first broadcast
-            ggml_tensor* ga2 = ggml_reshape_2d(cache.gctx, g_a, 1, hidden);
-            ggml_tensor* gb2 = ggml_reshape_2d(cache.gctx, g_b, 1, hidden);
-            xa = ggml_add(cache.gctx, xa, ga2);
-            xb = ggml_add(cache.gctx, xb, gb2);
+                // ne[0]=T, ne[1]=2*hidden. Split along ne[1]:
+                int64_t stride1 = x_in_l->nb[1];
+                // x_in_l is time-first (T, 2*hidden): ne[0]=T, ne[1]=channel.  The
+                // split is along the CHANNEL axis, so the second half starts
+                // `hidden` ROWS in -- hidden * nb[1], not hidden * element_size.
+                // Using the element size offsets by `hidden` samples along TIME
+                // instead, which makes the sigmoid half overlap the tanh half.
+                ggml_tensor* xa = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T_w, hidden, stride1, 0));
+                ggml_tensor* xb = ggml_cont(
+                    cache.gctx, ggml_view_2d(cache.gctx, x_in_l, T_w, hidden, stride1, (size_t)hidden * stride1));
+                // Reshape g_a/g_b from (hidden,) to (1, hidden) for time-first broadcast
+                ggml_tensor* ga2 = ggml_reshape_2d(cache.gctx, g_a, 1, hidden);
+                ggml_tensor* gb2 = ggml_reshape_2d(cache.gctx, g_b, 1, hidden);
+                xa = ggml_add(cache.gctx, xa, ga2);
+                xb = ggml_add(cache.gctx, xb, gb2);
 
-            // Gated activation: tanh(xa) * sigmoid(xb)
-            ggml_tensor* acts = ggml_mul(cache.gctx, ggml_tanh(cache.gctx, xa), ggml_sigmoid(cache.gctx, xb));
+                // Gated activation: tanh(xa) * sigmoid(xb)
+                ggml_tensor* acts = ggml_mul(cache.gctx, ggml_tanh(cache.gctx, xa), ggml_sigmoid(cache.gctx, xb));
 
-            // res_skip_layers[il]: Conv1d(hidden, rs_ch, 1) — fused weight
-            snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.res_skip_layers.%d.conv.weight", il);
-            auto rs_w = s2a_find(s, nbuf);
-            snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.res_skip_layers.%d.conv.bias", il);
-            auto rs_b = s2a_find(s, nbuf);
+                // res_skip_layers[il]: Conv1d(hidden, rs_ch, 1) — fused weight
+                snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.res_skip_layers.%d.conv.weight", il);
+                auto rs_w = s2a_find(s, nbuf);
+                snprintf(nbuf, sizeof(nbuf), "decoder.estimator.wavenet.res_skip_layers.%d.conv.bias", il);
+                auto rs_b = s2a_find(s, nbuf);
 
-            ggml_tensor* rs_out = rs_w ? ggml_conv_1d(cache.gctx, rs_w, acts, 1, 0, 1) : acts;
-            if (rs_b) {
-                ggml_tensor* b2d = ggml_reshape_2d(cache.gctx, rs_b, 1, rs_b->ne[0]);
-                rs_out = ggml_add(cache.gctx, rs_out, b2d);
-            }
+                ggml_tensor* rs_out = rs_w ? ggml_conv_1d(cache.gctx, rs_w, acts, 1, 0, 1) : acts;
+                if (rs_b) {
+                    ggml_tensor* b2d = ggml_reshape_2d(cache.gctx, rs_b, 1, rs_b->ne[0]);
+                    rs_out = ggml_add(cache.gctx, rs_out, b2d);
+                }
 
-            int rs_ch = rs_w ? (int)rs_w->ne[2] : hidden;
-            if (il < n_wn_layers - 1 && rs_ch >= 2 * hidden) {
-                // rs_out is (T, rs_ch) time-first. Split: res=(T,hidden), skip=(T,hidden)
-                int64_t rs_stride = rs_out->nb[1];
-                // Same channel-axis split as above: offset by rows, not elements.
-                ggml_tensor* res = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, rs_out, T_w, hidden, rs_stride, 0));
-                ggml_tensor* skip = ggml_cont(
-                    cache.gctx, ggml_view_2d(cache.gctx, rs_out, T_w, hidden, rs_stride, (size_t)hidden * rs_stride));
-                x_wn = ggml_add(cache.gctx, x_wn, res);
-                wn_out = ggml_add(cache.gctx, wn_out, skip);
-            } else {
-                // Last layer: output += rs_out
-                wn_out = ggml_add(cache.gctx, wn_out, rs_out);
-            }
+                int rs_ch = rs_w ? (int)rs_w->ne[2] : hidden;
+                if (il < n_wn_layers - 1 && rs_ch >= 2 * hidden) {
+                    // rs_out is (T, rs_ch) time-first. Split: res=(T,hidden), skip=(T,hidden)
+                    int64_t rs_stride = rs_out->nb[1];
+                    // Same channel-axis split as above: offset by rows, not elements.
+                    ggml_tensor* res =
+                        ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, rs_out, T_w, hidden, rs_stride, 0));
+                    ggml_tensor* skip = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, rs_out, T_w, hidden, rs_stride,
+                                                                           (size_t)hidden * rs_stride));
+                    x_wn = ggml_add(cache.gctx, x_wn, res);
+                    wn_out = ggml_add(cache.gctx, wn_out, skip);
+                } else {
+                    // Last layer: output += rs_out
+                    wn_out = ggml_add(cache.gctx, wn_out, rs_out);
+                }
             }
             return wn_out;
         };
@@ -2765,8 +2766,7 @@ static bool s2a_dit_cache_build(confucius4_tts_context* ctx, int T, int mel_dim,
         } else {
             // Split the fused (2T, dim) time-first tensor into per-arm halves,
             // run the WaveNet on each, and re-concat along time.
-            ggml_tensor* h_cond =
-                ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_conv1, T, dim, x_conv1->nb[1], 0));
+            ggml_tensor* h_cond = ggml_cont(cache.gctx, ggml_view_2d(cache.gctx, x_conv1, T, dim, x_conv1->nb[1], 0));
             ggml_tensor* h_unc = ggml_cont(
                 cache.gctx, ggml_view_2d(cache.gctx, x_conv1, T, dim, x_conv1->nb[1], (size_t)T * sizeof(float)));
             wn_output = ggml_concat(cache.gctx, build_wavenet(h_cond, T), build_wavenet(h_unc, T), 0);
@@ -3456,32 +3456,32 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
                 return {};
             }
         } else {
-        // Conditioned pass.
-        velocity = s2a_dit_forward(ctx, z.data(), T_total, mel_dim, cond.data(), cond_ref.data(), t);
-        if (velocity.empty()) {
-            fprintf(stderr, "confucius4: DiT forward failed at step %d\n", step);
-            return {};
-        }
-
-        // Classifier-free guidance: a second pass with mu, the reference mel and
-        // the speaker embedding all zeroed, blended as
-        //   v = (1 + cfg) * v_cond - cfg * v_uncond
-        // (confuciustts/flow/flow_matching.py, solve_euler).
-        if (cfg_rate > 0.0f) {
-            // The uncond arm runs over the SAME T_total frames (solve_euler
-            // feeds x to both halves and zeroes only mu/prompt_x/spks). This
-            // used to pass T_mel — harmless without a prompt (T_total==T_mel),
-            // but with one the blend read v_uncond OUT OF BOUNDS past the
-            // first T_mel frames and every conditioned run decayed to silence.
-            auto v_uncond = s2a_dit_forward(ctx, z.data(), T_total, mel_dim, cond_zeros.data(), cond_ref_zeros.data(),
-                                            t, /*use_spk=*/false);
-            if (v_uncond.empty()) {
-                fprintf(stderr, "confucius4: DiT uncond forward failed at step %d\n", step);
+            // Conditioned pass.
+            velocity = s2a_dit_forward(ctx, z.data(), T_total, mel_dim, cond.data(), cond_ref.data(), t);
+            if (velocity.empty()) {
+                fprintf(stderr, "confucius4: DiT forward failed at step %d\n", step);
                 return {};
             }
-            for (size_t i = 0; i < velocity.size(); i++)
-                velocity[i] = (1.0f + cfg_rate) * velocity[i] - cfg_rate * v_uncond[i];
-        }
+
+            // Classifier-free guidance: a second pass with mu, the reference mel and
+            // the speaker embedding all zeroed, blended as
+            //   v = (1 + cfg) * v_cond - cfg * v_uncond
+            // (confuciustts/flow/flow_matching.py, solve_euler).
+            if (cfg_rate > 0.0f) {
+                // The uncond arm runs over the SAME T_total frames (solve_euler
+                // feeds x to both halves and zeroes only mu/prompt_x/spks). This
+                // used to pass T_mel — harmless without a prompt (T_total==T_mel),
+                // but with one the blend read v_uncond OUT OF BOUNDS past the
+                // first T_mel frames and every conditioned run decayed to silence.
+                auto v_uncond = s2a_dit_forward(ctx, z.data(), T_total, mel_dim, cond_zeros.data(),
+                                                cond_ref_zeros.data(), t, /*use_spk=*/false);
+                if (v_uncond.empty()) {
+                    fprintf(stderr, "confucius4: DiT uncond forward failed at step %d\n", step);
+                    return {};
+                }
+                for (size_t i = 0; i < velocity.size(); i++)
+                    velocity[i] = (1.0f + cfg_rate) * velocity[i] - cfg_rate * v_uncond[i];
+            }
         }
 
         // Per-step dump: the state the velocity was computed FROM, and the
