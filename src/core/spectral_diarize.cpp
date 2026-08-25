@@ -15,56 +15,13 @@
 #include <string>
 #include <thread>
 
+#include "parallel_for.h"
+
 namespace core_spectral {
 
 namespace {
 
 constexpr double kTiny = 1e-12;
-
-// Run fn(0..n_tasks-1) across the machine's cores, handing out task INDICES
-// from an atomic counter rather than splitting the range into contiguous
-// per-thread chunks the way firered_parallel_for / marblenet_parallel_for /
-// ov_parallel_for / core/mel.cpp do. Those are right for uniform-cost items
-// like audio frames; here a k=8 spectral run costs many times a k=2 one, so a
-// static split would leave the thread holding the cheap candidates idle.
-// Same shape as the inline loop in core/foxnose_pipeline.cpp.
-//
-// Not std::execution::par (libc++ gates it behind _LIBCPP_HAS_EXPERIMENTAL_PSTL
-// and does not ship the backend to link against) and not OpenMP (optional, and
-// absent on the stock macOS toolchain this was measured on, so the pragma would
-// compile to a serial loop). See the PR for the tested details.
-//
-// DETERMINISM: fn must write only to its own task index, and callers reduce
-// SERIALLY afterwards in ascending order, so tie-breaks land where the old
-// sequential loop put them.
-template <typename F> void parallel_tasks(int n_tasks, F&& fn) {
-    if (n_tasks <= 0)
-        return;
-    const unsigned hw = std::thread::hardware_concurrency();
-    const int n_threads = std::max(1, std::min(n_tasks, (int)(hw == 0 ? 1u : hw)));
-    if (n_threads == 1) {
-        for (int i = 0; i < n_tasks; i++)
-            fn(i);
-        return;
-    }
-    std::atomic<int> next{0};
-    auto run = [&]() {
-        for (;;) {
-            const int i = next.fetch_add(1);
-            if (i >= n_tasks)
-                return;
-            fn(i);
-        }
-    };
-    std::vector<std::thread> pool;
-    pool.reserve((size_t)n_threads - 1);
-    for (int t = 1; t < n_threads; t++)
-        pool.emplace_back(run);
-    run(); // the calling thread pulls tasks too
-    for (auto& t : pool)
-        t.join();
-}
-
 
 // ── Portable RNG draws ────────────────────────────────────────────────────
 //
@@ -959,7 +916,7 @@ std::vector<int> refine_spherical(const float* x, int n, int d, const std::vecto
 }
 
 static SpeakerEstimate estimate_speakers_impl(const float* x, int n, int d, int min_k, int max_k, unsigned seed,
-                                              const float* sim_precomputed) {
+                                              const float* sim_precomputed, int n_threads) {
     SpeakerEstimate est;
     est.min_k_used = std::max(1, min_k);
     est.best_k = std::max(1, min_k);
@@ -1046,7 +1003,7 @@ static SpeakerEstimate estimate_speakers_impl(const float* x, int n, int d, int 
     const int k_cnt = std::max(0, k_upper - k_lo);
     std::vector<float> bics((size_t)k_cnt, 0.0f);
     std::vector<char> bic_ok((size_t)k_cnt, 0);
-    parallel_tasks(k_cnt, [&](int i) {
+    core_parallel::for_each_task(k_cnt, n_threads, [&](int i, int) {
         float bic = 0.0f;
         if (gmm_bic(proj.data(), n, pca_dim, k_lo + i, kGmmNInit, kGmmMaxIter, seed, &bic)) {
             bics[(size_t)i] = bic;
@@ -1075,12 +1032,12 @@ static SpeakerEstimate estimate_speakers_impl(const float* x, int n, int d, int 
     return est;
 }
 
-SpeakerEstimate estimate_speakers(const float* x, int n, int d, int min_k, int max_k, unsigned seed) {
-    return estimate_speakers_impl(x, n, d, min_k, max_k, seed, nullptr);
+SpeakerEstimate estimate_speakers(const float* x, int n, int d, int min_k, int max_k, unsigned seed, int n_threads) {
+    return estimate_speakers_impl(x, n, d, min_k, max_k, seed, nullptr, n_threads);
 }
 
 std::vector<int> cluster_speakers(const float* x, int n, int d, int min_speakers, int max_speakers, int num_speakers,
-                                  SpeakerEstimate* out_estimate, unsigned seed) {
+                                  SpeakerEstimate* out_estimate, unsigned seed, int n_threads) {
     if (n <= 0)
         return {};
     if (n < 2)
@@ -1139,7 +1096,7 @@ std::vector<int> cluster_speakers(const float* x, int n, int d, int min_speakers
         // the silhouette pass — which is what saturates — is skipped.
         return run(est.best_k);
     }
-    est = estimate_speakers_impl(x, n, d, min_speakers, max_speakers, seed, sim.data());
+    est = estimate_speakers_impl(x, n, d, min_speakers, max_speakers, seed, sim.data(), n_threads);
     if (out_estimate)
         *out_estimate = est;
     const int k = est.best_k;
@@ -1196,7 +1153,7 @@ std::vector<int> cluster_speakers(const float* x, int n, int d, int min_speakers
     const int n_cand = upper - lower + 1;
     std::vector<std::vector<int>> cand_labels((size_t)n_cand);
     std::vector<float> cand_sil((size_t)n_cand, 0.0f);
-    parallel_tasks(n_cand, [&](int i) {
+    core_parallel::for_each_task(n_cand, n_threads, [&](int i, int) {
         const int c = lower + i;
         cand_labels[(size_t)i] = refine_spherical(x, n, d, spectral_labels(aff.data(), n, c, seed));
         cand_sil[(size_t)i] = silhouette_precomputed(dist.data(), n, cand_labels[(size_t)i]);

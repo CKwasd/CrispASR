@@ -217,8 +217,9 @@ Result diarize(const float* pcm, int n_samples, int sample_rate, const std::vect
     // ---- cluster ----
     const int n = (int)win_times.size();
     core_spectral::SpeakerEstimate est;
-    std::vector<int> labels = core_spectral::cluster_speakers(
-        emb.data(), n, embed_dim, params.min_speakers, params.max_speakers, params.num_speakers, &est, params.seed);
+    std::vector<int> labels =
+        core_spectral::cluster_speakers(emb.data(), n, embed_dim, params.min_speakers, params.max_speakers,
+                                        params.num_speakers, &est, params.seed, params.n_workers);
     res.reason = est.reason ? est.reason : "";
 
     // ---- per-segment temporal smoothing ----

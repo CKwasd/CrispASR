@@ -1216,7 +1216,8 @@ void crispasr_remap_speakers_via_embeddings(std::vector<crispasr_segment>& segs,
     } else {
         core_spectral::SpeakerEstimate est;
         labels = core_spectral::cluster_speakers(embeddings.data(), n_emb, d, /*min_speakers=*/min_spk, max_spk,
-                                                 /*num_speakers=*/params.diarize_num_speakers, &est);
+                                                 /*num_speakers=*/params.diarize_num_speakers, &est,
+                                                 /*seed=*/42, /*n_threads=*/params.n_threads);
         if (std::getenv("CRISPASR_DIARIZE_DEBUG"))
             fprintf(stderr, "crispasr[diarize]: n_emb=%d dim=%d -> k=%d (min_spk=%d, %s, cos_p10=%.4f, pca=%d)\n",
                     n_emb, d, est.best_k, min_spk, est.reason, est.cosine_sim_p10, est.pca_dim);
