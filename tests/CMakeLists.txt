@@ -1572,6 +1572,26 @@ catch_discover_tests(test-dots-tts-params
 )
 endif()
 
+# ─── test-confucius4-tts-params — Catch2 unit tests for confucius4_tts_params
+# defaults and null-guard coverage. No GGUF required. ──────────────────────────
+if (TARGET confucius4-tts)
+add_executable(test-confucius4-tts-params
+    test-confucius4-tts-params.cpp
+)
+target_include_directories(test-confucius4-tts-params PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-confucius4-tts-params PRIVATE
+    Catch2::Catch2WithMain
+    confucius4-tts
+    indextts
+)
+catch_discover_tests(test-confucius4-tts-params
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit;confucius4-tts"
+)
+endif()
+
 # ─── test-funasr-params — Catch2 unit tests for funasr_context_params defaults
 # and null-guard coverage. No GGUF required. ───────────────────────────────────
 add_executable(test-funasr-params

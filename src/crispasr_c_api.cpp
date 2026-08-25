@@ -171,6 +171,10 @@
 #include "miotts.h"
 #define CA_HAVE_MIOTTS 1
 #endif
+#if __has_include("confucius4_tts.h")
+#include "confucius4_tts.h"
+#define CA_HAVE_CONFUCIUS4_TTS 1
+#endif
 #if __has_include("piano_transcription.h")
 #include "piano_transcription.h"
 #define CA_HAVE_PIANO_TRANSCRIPTION 1
@@ -1866,6 +1870,9 @@ struct crispasr_session {
 #ifdef CA_HAVE_MIOTTS
     miotts_context* miotts_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_CONFUCIUS4_TTS
+    confucius4_tts_context* confucius4_ctx = nullptr;
+#endif
 #ifdef CA_HAVE_PIANO_TRANSCRIPTION
     piano_transcription_ctx* piano_ctx = nullptr;
 #endif
@@ -3288,6 +3295,50 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_CONFUCIUS4_TTS
+    if (s->backend == "confucius4-tts" || s->backend == "confucius4_tts" || s->backend == "confucius4") {
+        s->backend = "confucius4-tts";
+        confucius4_tts_params p = confucius4_tts_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = g_open_use_gpu_tls;
+        if (g_open_temperature_tls > 0.0f)
+            p.temperature = g_open_temperature_tls;
+        p.seed = g_open_seed_tls;
+        s->confucius4_ctx = confucius4_tts_init_from_file(model_path, p);
+        if (!s->confucius4_ctx) {
+            delete s;
+            return nullptr;
+        }
+        // Auto-resolve the S2A + BigVGAN companions next to the model (the
+        // registry downloads them as siblings of the T2S).
+        {
+            std::string mp = model_path ? model_path : "";
+            auto sep = mp.find_last_of("/\\");
+            std::string dir = (sep == std::string::npos) ? std::string(".") : mp.substr(0, sep);
+            for (const char* name :
+                 {"confucius4-tts-s2a-q4_k.gguf", "confucius4-tts-s2a-q8_0.gguf", "confucius4-tts-s2a-f16.gguf"}) {
+                std::string cp = dir + "/" + name;
+                FILE* f = fopen(cp.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    confucius4_tts_set_s2a_path(s->confucius4_ctx, cp.c_str());
+                    break;
+                }
+            }
+            for (const char* name : {"confucius4-tts-bigvgan-22k-f16.gguf", "confucius4-tts-bigvgan-22k-q8_0.gguf"}) {
+                std::string cp = dir + "/" + name;
+                FILE* f = fopen(cp.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    confucius4_tts_set_vocoder_path(s->confucius4_ctx, cp.c_str());
+                    break;
+                }
+            }
+        }
+        return s;
+    }
+#endif
 #ifdef CA_HAVE_POCKET
     if (s->backend == "pocket-tts" || s->backend == "pocket_tts" || s->backend == "pocket") {
         s->backend = "pocket-tts";
@@ -4063,6 +4114,10 @@ CA_EXPORT int crispasr_session_output_sample_rate(crispasr_session* s) {
     if (s->miotts_ctx)
         return 24000;
 #endif
+#ifdef CA_HAVE_CONFUCIUS4_TTS
+    if (s->confucius4_ctx)
+        return 22050;
+#endif
 #ifdef CA_HAVE_OMNIVOICE
     if (s->omnivoice_ctx)
         return 24000;
@@ -4231,6 +4286,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_MIOTTS
     list += ",miotts";
+#endif
+#ifdef CA_HAVE_CONFUCIUS4_TTS
+    list += ",confucius4-tts";
 #endif
 #ifdef CA_HAVE_PIANO_TRANSCRIPTION
     list += ",piano-transcription";
@@ -8124,6 +8182,16 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         return zonos_tts_set_voice(s->zonos_ctx, path);
     }
 #endif
+#ifdef CA_HAVE_CONFUCIUS4_TTS
+    if (s->confucius4_ctx) {
+        // Native CAMPPlus style + 22.05 kHz prompt mel from the reference WAV.
+        // T2S condition_emb additionally needs w2v-BERT features
+        // (CRISPASR_CONFUCIUS4_COND_DIR) until that encoder is native.
+        if (!ends_with_wav(path))
+            return -2;
+        return confucius4_tts_set_voice_path(s->confucius4_ctx, path);
+    }
+#endif
 #ifdef CA_HAVE_DOTS_TTS
     if (s->dots_tts_ctx) {
         // Voice cloning from a reference WAV (the speaker encoder was loaded at
@@ -8731,6 +8799,20 @@ static float* crispasr_session_synthesize_raw_impl(crispasr_session* s, const ch
     if (s->miotts_ctx) {
         int n = 0;
         float* pcm = miotts_synthesize(s->miotts_ctx, text, &n);
+        if (out_n_samples)
+            *out_n_samples = n;
+        return pcm;
+    }
+#endif
+#ifdef CA_HAVE_CONFUCIUS4_TTS
+    if (s->confucius4_ctx) {
+        // ISO lang code drives the LANGUAGE_TOKEN_MAP prompt; "auto" must not
+        // leak into it (mirrors the CLI adapter).
+        std::string tts_lang = !s->target_language.empty() ? s->target_language : s->source_language;
+        if (tts_lang.empty() || tts_lang == "auto")
+            tts_lang = "en";
+        int n = 0;
+        float* pcm = confucius4_tts_synthesize(s->confucius4_ctx, text, tts_lang.c_str(), &n);
         if (out_n_samples)
             *out_n_samples = n;
         return pcm;
@@ -10349,6 +10431,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_MIOTTS
     if (s->miotts_ctx)
         miotts_free(s->miotts_ctx);
+#endif
+#ifdef CA_HAVE_CONFUCIUS4_TTS
+    if (s->confucius4_ctx)
+        confucius4_tts_free(s->confucius4_ctx);
 #endif
 #ifdef CA_HAVE_PIANO_TRANSCRIPTION
     if (s->piano_ctx)

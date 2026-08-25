@@ -39,12 +39,29 @@ public:
             return false;
         }
 
-        // Load the S2A companion model (--codec-model or auto-resolved sibling)
-        if (!p.tts_codec_model.empty()) {
-            if (confucius4_tts_set_s2a_path(ctx_, p.tts_codec_model.c_str()) != 0) {
-                fprintf(stderr, "crispasr[confucius4-tts]: failed to load S2A model '%s'\n", p.tts_codec_model.c_str());
+        // Load the S2A companion model (--codec-model or auto-resolved sibling —
+        // the registry downloads confucius4-tts-s2a-q4_k.gguf next to the T2S)
+        std::string s2a_path = p.tts_codec_model;
+        if (s2a_path.empty()) {
+            std::string dir = p.model.substr(0, p.model.find_last_of("/\\") + 1);
+            for (const char* pat :
+                 {"confucius4-tts-s2a-q4_k.gguf", "confucius4-tts-s2a-q8_0.gguf", "confucius4-tts-s2a-f16.gguf"}) {
+                std::string path = dir + pat;
+                FILE* f = fopen(path.c_str(), "rb");
+                if (f) {
+                    fclose(f);
+                    s2a_path = path;
+                    break;
+                }
+            }
+        }
+        if (!s2a_path.empty()) {
+            if (confucius4_tts_set_s2a_path(ctx_, s2a_path.c_str()) != 0) {
+                fprintf(stderr, "crispasr[confucius4-tts]: failed to load S2A model '%s'\n", s2a_path.c_str());
                 // Non-fatal: T2S works without S2A (generates codes but no audio)
             }
+        } else if (!p.no_prints) {
+            fprintf(stderr, "crispasr[confucius4-tts]: WARNING: no S2A model (--codec-model) — no audio\n");
         }
 
         // Auto-discover BigVGAN vocoder: look for *bigvgan* sibling next to T2S or S2A model
@@ -62,7 +79,7 @@ public:
                 }
             }
         };
-        try_vocoder(p.tts_codec_model);
+        try_vocoder(s2a_path);
         try_vocoder(p.model);
 
         // Voice cloning (--voice ref.wav): native CAMPPlus style + prompt mel

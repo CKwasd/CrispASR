@@ -38,7 +38,7 @@ live transcription + TTS + language detection, auto-deployed from `hf-space/`.
 - [Feature matrix](#feature-matrix)
 - [Install & build](#install--build) — quick install (full guide in [docs/install.md](docs/install.md)); **[which prebuilt Linux tarball to download](docs/install.md#prebuilt-linux-tarballs--which-one-to-download-355)** — the `-cuda` / `-hip` / `-vulkan` builds require the matching GPU driver and do **not** fall back to CPU
 - [Quick start — ASR](#quick-start)
-- [**Text-to-Speech (TTS)**](docs/tts.md) — 51 engines: Kokoro, Qwen3-TTS, VibeVoice, dots.tts, Orpheus, Chatterbox, IndexTTS, Irodori, VoxCPM2, CosyVoice3, CSM, Dia, Zonos, Bark, Piper, MeloTTS, and more
+- [**Text-to-Speech (TTS)**](docs/tts.md) — 52 engines: Kokoro, Qwen3-TTS, VibeVoice, dots.tts, Orpheus, Chatterbox, IndexTTS, Irodori, VoxCPM2, CosyVoice3, CSM, Dia, Zonos, Bark, Piper, MeloTTS, and more
 - [Streaming & live transcription](docs/streaming.md)
 - [Server mode (HTTP API)](docs/server.md)
 - [Concurrency, parallelism & scaling](docs/concurrency.md) — how one transcription uses multiple cores, concurrent server requests (`--server-workers`), bulk offline transcription, replicas behind a load balancer
@@ -215,6 +215,7 @@ quick-start commands and engine selection guidance.
 | pocket-tts | yes | temp | 24 | yes | — |
 | tada | yes | temp | 24 | yes | — |
 | dots-tts | yes (`--voice ref.wav`) | 16-step CFG Euler | 48 | yes | — |
+| confucius4-tts | yes (`--voice ref.wav`) | 25-step CFG Euler | 22.05 | yes | — |
 
 \* CustomVoice variant only; Base uses baked speakers via `--voice <name>`.
 

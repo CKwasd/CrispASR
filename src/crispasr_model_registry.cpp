@@ -973,6 +973,19 @@ constexpr Entry k_registry[] = {
      "dots-tts-soar-vocoder-f16.gguf",
      "https://huggingface.co/cstr/dots-tts-soar-GGUF/resolve/main/dots-tts-soar-vocoder-f16.gguf",
      "~345 MB"},
+    // Confucius4-TTS (§377): NetEase Youdao zero-shot voice-cloning TTS.
+    // Three-stage: GPT-2 T2S (beam-sample, baked LlamaTokenizer vocab) →
+    // flow-matching DiT+WaveNet S2A (CAMPPlus style encoder baked under
+    // campplus.*) → BigVGAN 22.05 kHz (extras). Voice cloning via
+    // --voice ref.wav (+ CRISPASR_CONFUCIUS4_COND_DIR w2v-BERT features
+    // until that encoder is native). 14 languages, Chinese LANGUAGE_TOKEN_MAP
+    // prompts baked into the runtime.
+    {"confucius4-tts", "confucius4-tts-t2s-q4_k.gguf",
+     "https://huggingface.co/cstr/confucius4-tts-GGUF/resolve/main/confucius4-tts-t2s-q4_k.gguf",
+     "~376 MB",
+     "confucius4-tts-s2a-q4_k.gguf",
+     "https://huggingface.co/cstr/confucius4-tts-GGUF/resolve/main/confucius4-tts-s2a-q4_k.gguf",
+     "~135 MB", "Apache-2.0 (base netease-youdao/Confucius4-TTS)"},
     // Pocket TTS: Kyutai's 100M continuous-latent AR TTS (CC-BY-4.0 plus gated-use conditions).
     // Generates continuous 32-dim float vectors at 12.5 Hz via one-step LSD,
     // decoded by Mimi VAE to 24 kHz PCM. Single GGUF, no codec companion.
@@ -1348,9 +1361,18 @@ constexpr ExtraCompanion k_dots_tts_extras[] = {
     {nullptr, nullptr},
 };
 
+// Confucius4-TTS: the BigVGAN vocoder rides along; the CLI adapter discovers
+// it as a sibling (confucius4-tts-bigvgan-22k-f16.gguf) next to the T2S.
+constexpr ExtraCompanion k_confucius4_tts_extras[] = {
+    {"confucius4-tts-bigvgan-22k-f16.gguf",
+     "https://huggingface.co/cstr/confucius4-tts-GGUF/resolve/main/confucius4-tts-bigvgan-22k-f16.gguf"},
+    {nullptr, nullptr},
+};
+
 constexpr ExtraList k_extras[] = {
     {"kokoro", k_kokoro_extras},
     {"dots-tts", k_dots_tts_extras},
+    {"confucius4-tts", k_confucius4_tts_extras},
     {"vibevoice-tts", k_vibevoice_tts_extras},
     {"cosyvoice3-tts", k_cosyvoice3_tts_extras},
     {"cosyvoice3-tts-rl", k_cosyvoice3_tts_extras},

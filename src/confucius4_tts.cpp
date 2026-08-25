@@ -520,6 +520,8 @@ static ggml_tensor* gpt2_forward(confucius4_tts_context* ctx, ggml_context* ctx0
 // ---------------------------------------------------------------------------
 
 confucius4_tts_context* confucius4_tts_init_from_file(const char* path_t2s, confucius4_tts_params params) {
+    if (!path_t2s || !*path_t2s)
+        return nullptr;
     auto* ctx = new confucius4_tts_context();
     ctx->params = params;
 
