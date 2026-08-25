@@ -3,7 +3,7 @@
 
 # Feature matrix
 
-All 108 backends compiled into the `crispasr` binary, with their declared capability bits. For an interactive sortable/filterable view, open [`feature-matrix.html`](https://htmlpreview.github.io/?https://github.com/CrispStrobe/CrispASR/blob/main/docs/feature-matrix.html).
+All 107 backends compiled into the `crispasr` binary, with their declared capability bits. For an interactive sortable/filterable view, open [`feature-matrix.html`](https://htmlpreview.github.io/?https://github.com/CrispStrobe/CrispASR/blob/main/docs/feature-matrix.html).
 
 | Backend | TTS | Voice cloning | Translate | Src/Tgt language | Language detect | Auto-download | Timestamps (native) | Timestamps (CTC) | Word timestamps | Token confidence | Temperature | Beam search | Punctuation toggle | Flash attention | Diarize | GBNF grammar | VAD (internal) | Parallel processors | Beats | Chords | Piano | Pitch | Punctuation Native | S2S | Separate | Streaming | Tab |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
@@ -32,15 +32,15 @@ All 108 backends compiled into the `crispasr` binary, with their declared capabi
 | `wav2vec2` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |
 | `hubert` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |
 | `data2vec` |  |  |  |  |  | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |
-| `vibevoice` | ✓ |  |  |  |  | ✓ |  | ✓ |  |  |  |  |  | ✓ | ✓ |  |  |  |  |  |  |  | ✓ |  |  |  |  |
-| `vibevoice-bitnet` | ✓ |  |  |  |  | ✓ |  | ✓ |  |  |  |  |  | ✓ | ✓ |  |  |  |  |  |  |  | ✓ |  |  |  |  |
+| `vibevoice` | ✓ |  |  |  |  | ✓ |  | ✓ |  |  | ✓ |  |  | ✓ | ✓ |  |  |  |  |  |  |  | ✓ |  |  |  |  |
+| `vibevoice-bitnet` | ✓ |  |  |  |  | ✓ |  | ✓ |  |  | ✓ |  |  | ✓ | ✓ |  |  |  |  |  |  |  | ✓ |  |  |  |  |
 | `kugelaudio` | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `qwen3-tts` | ✓ | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  | ✓ |  |
 | `miotts` | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `piano-transcription` |  |  |  |  |  | ✓ | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  | ✓ |  |  |  |  |  |  |
 | `moss-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `moss-tts-local` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `vibevoice-1.5b` | ✓ | ✓ |  |  |  | ✓ |  | ✓ |  |  |  |  |  | ✓ | ✓ |  |  |  |  |  |  |  | ✓ |  |  |  |  |
+| `vibevoice-1.5b` | ✓ | ✓ |  |  |  | ✓ |  | ✓ |  |  | ✓ |  |  | ✓ | ✓ |  |  |  |  |  |  |  | ✓ |  |  |  |  |
 | `qwen3-tts-customvoice` | ✓ |  |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  | ✓ |  |
 | `qwen3-tts-1.7b-base` | ✓ | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  | ✓ |  |
 | `qwen3-tts-1.7b-customvoice` | ✓ |  |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  | ✓ |  |
@@ -49,10 +49,10 @@ All 108 backends compiled into the `crispasr` binary, with their declared capabi
 | `lex-au-orpheus-de` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `kartoffel-orpheus-de-natural` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `kartoffel-orpheus-de-synthetic` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `chatterbox` | ✓ | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `chatterbox-turbo` | ✓ | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `kartoffelbox-turbo` | ✓ | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `lahgtna-chatterbox` | ✓ | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| `chatterbox` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| `chatterbox-turbo` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| `kartoffelbox-turbo` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| `lahgtna-chatterbox` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `tada` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `tada-1b` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `tada-tts-1b` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
@@ -68,7 +68,6 @@ All 108 backends compiled into the `crispasr` binary, with their declared capabi
 | `voxcpm2-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `voxcpm2-vae` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  | ✓ |  |  |  |
 | `cosyvoice3-tts` | ✓ | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `cosyvoice3-tts-rl` | ✓ | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `m2m100` |  |  | ✓ | ✓ |  | ✓ |  |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `m2m100-wmt21` |  |  | ✓ | ✓ |  | ✓ |  |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `madlad` |  |  | ✓ | ✓ |  | ✓ |  |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
@@ -98,7 +97,7 @@ All 108 backends compiled into the `crispasr` binary, with their declared capabi
 | `dia` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `dia-tts` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `dots-tts` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `confucius4-tts` | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| `confucius4-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `parler-tts` | ✓ |  |  |  |  | ✓ |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `zonos` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `zonos-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
