@@ -3124,8 +3124,13 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
         //   v = (1 + cfg) * v_cond - cfg * v_uncond
         // (confuciustts/flow/flow_matching.py, solve_euler).
         if (cfg_rate > 0.0f) {
-            auto v_uncond = s2a_dit_forward(ctx, z.data(), T_mel, mel_dim, cond_zeros.data(), cond_ref_zeros.data(), t,
-                                            /*use_spk=*/false);
+            // The uncond arm runs over the SAME T_total frames (solve_euler
+            // feeds x to both halves and zeroes only mu/prompt_x/spks). This
+            // used to pass T_mel — harmless without a prompt (T_total==T_mel),
+            // but with one the blend read v_uncond OUT OF BOUNDS past the
+            // first T_mel frames and every conditioned run decayed to silence.
+            auto v_uncond = s2a_dit_forward(ctx, z.data(), T_total, mel_dim, cond_zeros.data(), cond_ref_zeros.data(),
+                                            t, /*use_spk=*/false);
             if (v_uncond.empty()) {
                 fprintf(stderr, "confucius4: DiT uncond forward failed at step %d\n", step);
                 return {};

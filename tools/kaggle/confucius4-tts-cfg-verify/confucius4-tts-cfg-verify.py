@@ -250,6 +250,7 @@ _driver.write_text(f"""
 import sys, os
 import numpy as np
 import torch, torchaudio
+torch.set_grad_enabled(False)
 sys.path.insert(0, {str(REF)!r})
 os.chdir({str(REF)!r})   # config uses relative ./checkpoints paths
 from confuciustts.cli.inference import ConfuciusTTS
