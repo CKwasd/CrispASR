@@ -571,10 +571,20 @@ static std::vector<int> fireredpunc_run(fireredpunc_context & ctx, const std::ve
     // max_abs 0.0021 and 119/119 argmax agreement. An order of magnitude past
     // the f16 numerical floor, i.e. structural, not precision.
     //
+    // ⚠ SCOPED TO THE BERT PATH ONLY. This file also serves an XLM-RoBERTa
+    // variant (`fireredpunc.tokenizer_type == "sentencepiece"`, the
+    // fullstop-punc / punctuate-all models, 250002 vocab, 6 labels), and there
+    // the trailing `</s>` is CORRECT — RoBERTa token classification is trained
+    // with `<s> … </s>`. The blueprint above is FireRedPunc's and says nothing
+    // about that model, so its shape stays exactly as shipped; flipping it too
+    // would be changing a default on no evidence. Verified: that model's output
+    // is identical with and without the gate.
+    //
     // CRISPEMBED_FIREREDPUNC_SEP=1 restores the old shape for bisection. The
     // gate keeps CrispEmbed's spelling deliberately: this file is shared, and
     // one name that works in both trees beats two that drift.
-    static const bool append_sep = core_env::on("CRISPEMBED_FIREREDPUNC_SEP");
+    static const bool force_sep = core_env::on("CRISPEMBED_FIREREDPUNC_SEP");
+    const bool append_sep = force_sep || ctx.tokenizer.is_sentencepiece;
     const int seq_len = N + (append_sep ? 2 : 1);
 
     // ggml context for compute graph
