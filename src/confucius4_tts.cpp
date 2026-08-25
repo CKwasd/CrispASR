@@ -3401,11 +3401,18 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
     }
 
     // CFG fusion: run cond+uncond as ONE DiT graph eval per ODE step
-    // (seq-concat + block-diagonal mask, s2a_dit_forward_cfg_fused).  Default
-    // OFF until the CUDA A/B validates speed + roundtrip (LEARNING 35); the
-    // parity dumps force it off because the harness expects per-pass
-    // semantics.
-    bool cfg_fuse = false;
+    // (seq-concat + block-diagonal mask, s2a_dit_forward_cfg_fused).
+    // Measured A/B on quiet boxes, roundtrip verbatim in every arm
+    // (2026-08-25): Metal q4_k s2a 181→158 s (−12.7% — the 2T matmuls
+    // amortize the k-quant dequant that dominates at T); Metal f16 s2a
+    // 130→131 s (neutral); CUDA P100 neutral (±1%, gpu-verify run 2, f16 AND
+    // q4_k); CPU 658→903 s (loses — the masked 2T attention costs more than
+    // the saved graph evals).  Default is therefore ON only on Metal (wins
+    // on q4_k, harmless on f16); CRISPASR_CONFUCIUS4_CFG_FUSE=0/1 forces
+    // either way.  The parity dumps force it off because the harness expects
+    // per-pass semantics.
+    bool cfg_fuse = ctx->backend && !ggml_backend_is_cpu(ctx->backend) &&
+                    std::strstr(ggml_backend_name(ctx->backend), "Metal") != nullptr;
     if (const char* env_fuse = std::getenv("CRISPASR_CONFUCIUS4_CFG_FUSE"))
         if (*env_fuse)
             cfg_fuse = atoi(env_fuse) != 0;

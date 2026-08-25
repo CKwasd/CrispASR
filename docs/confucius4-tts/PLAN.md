@@ -75,8 +75,30 @@ other across the seam (±2 frames/layer through the residual chain), so the
 WaveNet runs per-arm on split halves inside the same graph.  The mask and
 positions are re-set on EVERY compute (§234 gallocr aliasing).  Parity dumps
 (`CRISPASR_CONFUCIUS4_DUMP_S2A`) force fusion off — the harness expects
-per-pass semantics.  Default OFF until the CUDA A/B (gpu-verify run 2+)
-proves wall-time win + 8/8 roundtrip on both s2a f16 and q4_k.
+per-pass semantics.
+
+**Verdicts (2026-08-25, roundtrip verbatim in EVERY arm):**
+
+| box | s2a | base | fused | verdict |
+|---|---|---|---|---|
+| CUDA P100 (gpu-verify run 2) | f16 | 179.8 s | 181.6 s | neutral |
+| CUDA P100 (run 2, first q4_k GPU run) | q4_k | 176.4 s | 177.3 s | neutral |
+| Metal M1 (quiet-box pair) | q4_k | 181 s | **158 s (−12.7%)** | **fused wins** |
+| Metal M1 (quiet-box pair) | f16 | 130 s | 131 s | neutral |
+| CPU M1 | q4_k | 658 s | 903 s | fused loses |
+
+→ **default ON on Metal only** (`ggml_backend_name` contains "Metal"), env
+var still forces either way.  Mechanism: fusion removes per-eval overhead
+and doubles matmul width — on Metal q4_k that amortizes the k-quant dequant
+(which is also why f16 s2a at 130 s beats q4_k at 181 s there: prefer the
+f16 s2a on Metal, it is only 213 MB); on CUDA the masked 2T flash-attn
+(4T² scores vs 2·T² unfused; the KV_max tail-skip needs K%256==0 and does
+not engage) cancels the savings; on CPU it outright loses.  These runs are
+also the **first Metal validation of the whole backend** (base arms
+transcript-verbatim too) — the Metal half of the Metal/Vulkan open item is
+closed.  ⚠ Wall-times on the shared M1 are only comparable at load < ~3;
+two contaminated series (load 13–43) flipped the f16 verdict before the
+quiet-box pairs settled it.
 
 ### 13 bugs total — 9–13 this session
 
