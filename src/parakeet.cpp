@@ -3870,9 +3870,9 @@ extern "C" struct parakeet_result* parakeet_transcribe_chunked(struct parakeet_c
 // on long audio.
 // ---------------------------------------------------------------------------
 
-extern "C" struct parakeet_result* parakeet_transcribe_streamed(struct parakeet_context* ctx, const float* samples,
-                                                                int n_samples, int64_t t_offset_cs, int chunk_seconds,
-                                                                int overlap_seconds) {
+extern "C" struct parakeet_result* parakeet_transcribe_streamed_progress(
+    struct parakeet_context* ctx, const float* samples, int n_samples, int64_t t_offset_cs, int chunk_seconds,
+    int overlap_seconds, void (*progress_cb)(int processed, int total, void* user_data), void* progress_ud) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
     if (chunk_seconds <= 0) {
@@ -3935,25 +3935,37 @@ extern "C" struct parakeet_result* parakeet_transcribe_streamed(struct parakeet_
         // Encode this mel chunk
         int T_enc = 0;
         auto enc = parakeet_encode_mel(ctx, mel_full.data() + (size_t)mel_offset * n_mels, n_mels, chunk_T, &T_enc);
-        if (enc.empty())
-            continue;
+        // Issue #385: a window that fails to encode (or contributes no frames
+        // after the overlap skip) still has to REPORT, or a caller's progress
+        // bar stalls short of the end. So the append is nested rather than
+        // `continue`d past — the report below runs for every finished window.
+        if (!enc.empty()) {
+            // Skip overlap encoder frames for non-first chunks
+            int skip = 0;
+            if (mel_offset > 0 && T_enc > overlap_enc_frames)
+                skip = overlap_enc_frames;
 
-        // Skip overlap encoder frames for non-first chunks
-        int skip = 0;
-        if (mel_offset > 0 && T_enc > overlap_enc_frames)
-            skip = overlap_enc_frames;
+            const int keep = T_enc - skip;
+            if (keep > 0) {
+                enc_all.insert(enc_all.end(), enc.begin() + (size_t)skip * d_model,
+                               enc.begin() + (size_t)(skip + keep) * d_model);
+                T_enc_total += keep;
 
-        const int keep = T_enc - skip;
-        if (keep <= 0)
-            continue;
+                if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG"))
+                    fprintf(stderr, "parakeet[streamed]: mel chunk @%d: %d mel → %d enc (skip %d, keep %d)\n",
+                            mel_offset, chunk_T, T_enc, skip, keep);
+            }
+        }
 
-        enc_all.insert(enc_all.end(), enc.begin() + (size_t)skip * d_model,
-                       enc.begin() + (size_t)(skip + keep) * d_model);
-        T_enc_total += keep;
-
-        if (crispasr_env::get("CRISPASR_PARAKEET_DEBUG"))
-            fprintf(stderr, "parakeet[streamed]: mel chunk @%d: %d mel → %d enc (skip %d, keep %d)\n", mel_offset,
-                    chunk_T, T_enc, skip, keep);
+        // Issue #385: (samples encoded so far, total). chunk_end is monotonic
+        // in mel_offset, and the LAST window is pinned to n_samples exactly —
+        // T_mel * hop can land a few samples short of n_samples, and a caller
+        // asserting the sequence ends at `total` must not trip over that.
+        if (progress_cb) {
+            const int done =
+                (chunk_end >= T_mel) ? n_samples : (int)std::min<int64_t>(n_samples, (int64_t)chunk_end * hop);
+            progress_cb(done, n_samples, progress_ud);
+        }
     }
 
     if (enc_all.empty() || T_enc_total <= 0)
@@ -3964,6 +3976,14 @@ extern "C" struct parakeet_result* parakeet_transcribe_streamed(struct parakeet_
 
     // ---- Single TDT decode over concatenated encoder output ----
     return parakeet_decode_frames(ctx, enc_all.data(), T_enc_total, d_model, t_offset_cs);
+}
+
+// The historical signature — unchanged behaviour, no progress hook.
+extern "C" struct parakeet_result* parakeet_transcribe_streamed(struct parakeet_context* ctx, const float* samples,
+                                                                int n_samples, int64_t t_offset_cs, int chunk_seconds,
+                                                                int overlap_seconds) {
+    return parakeet_transcribe_streamed_progress(ctx, samples, n_samples, t_offset_cs, chunk_seconds, overlap_seconds,
+                                                 nullptr, nullptr);
 }
 
 // ---------------------------------------------------------------------------

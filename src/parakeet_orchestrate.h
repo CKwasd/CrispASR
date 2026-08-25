@@ -59,16 +59,23 @@ struct parakeet_orchestrate_opts {
     // never collapse to one unbounded full-length pass — see
     // parakeet_effective_single_pass_cap_s.
     bool chunked_requested = false;
-    // Issue #385: per-window progress on the LONGFORM route — the #208 session
-    // contract, which the #350 hoist left behind on the legacy inline path.
-    // Invoked on the calling thread after each finished window with (input
-    // samples processed so far, total samples); `processed` is monotonically
-    // non-decreasing and reaches `total` on the last window, including a
-    // window whose encode failed, so a caller's progress bar cannot stall
-    // short of 100 %. The single-decode routes (SINGLE_PASS / STREAMED /
-    // CHUNK_SEGMENTED) have no observable windows and do not invoke it, per
-    // the session header's documented contract; the #350 gap-fill repair runs
-    // after the last window and stays silent too.
+    // Issue #385: per-window progress — the #208 session contract, which the
+    // #350 hoist left behind on the legacy inline path. Invoked on the calling
+    // thread after each finished window with (input samples processed so far,
+    // total samples); `processed` is monotonically non-decreasing and reaches
+    // `total` exactly once, at the end, including when a window's encode
+    // failed — so a caller's progress bar cannot stall short of 100 %.
+    //
+    // Which routes report, and what a window IS on each:
+    //   LONGFORM        one encode+decode per silence-split window → per window.
+    //   CHUNK_SEGMENTED one decode over a chunk-ENCODED input → per encoder
+    //                   window, with the terminal tick withheld until after the
+    //                   decode and the #350 gap-fill (they are not the short
+    //                   part; see enc_progress_bridge in the .cpp).
+    //   STREAMED        same as CHUNK_SEGMENTED, and likewise the streamed
+    //                   fallback a SINGLE_PASS encode OOM drops into.
+    //   SINGLE_PASS     genuinely one indivisible pass — stays silent rather
+    //                   than emit a lone 100 % out of nowhere.
     std::function<void(int processed, int total)> on_progress;
 };
 

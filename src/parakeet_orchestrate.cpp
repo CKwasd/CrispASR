@@ -649,6 +649,30 @@ std::vector<parakeet_seg> parakeet_decode_frames_to_segments(parakeet_context* c
     return out;
 }
 
+// Issue #385: bridge the C progress hook of parakeet_transcribe_streamed_progress
+// to opts.on_progress, for the routes that are ONE decode over a
+// chunk-encoded input (CHUNK_SEGMENTED / STREAMED / the single-pass OOM
+// fallback). Those have observable ENCODER windows even though they have only
+// one decode, so #385 does not have to leave them silent.
+//
+// The terminal tick is suppressed here on purpose. The encoder's last window
+// means "encoding done", but the single TDT decode and the #350 gap-fill both
+// still run after it, and they are not the short part — a bar that reached
+// 100 % there would read "finished" through the longest remaining step. Each
+// call site re-emits (n_samples, n_samples) itself once the work really is
+// done, so the sequence still ends at `total` exactly as the session header
+// documents.
+namespace {
+struct enc_progress_bridge {
+    const parakeet_orchestrate_opts* opts;
+    static void thunk(int processed, int total, void* ud) {
+        auto* b = static_cast<enc_progress_bridge*>(ud);
+        if (b->opts->on_progress && processed < total)
+            b->opts->on_progress(processed, total);
+    }
+};
+} // namespace
+
 std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, const float* samples, int n_samples,
                                                        int64_t t_offset_cs, bool is_ja,
                                                        const parakeet_orchestrate_opts& opts) {
@@ -666,7 +690,10 @@ std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, co
         if (const char* e = getenv("CRISPASR_PARAKEET_STREAM_CHUNK"))
             enc_window = std::max(2, atoi(e));
         const int ov = std::max(0, (int)(opts.chunk_overlap_seconds + 0.5f));
-        parakeet_result* rc = parakeet_transcribe_streamed(ctx, samples, n_samples, t_offset_cs, enc_window, ov);
+        enc_progress_bridge bridge{&opts};
+        parakeet_result* rc =
+            parakeet_transcribe_streamed_progress(ctx, samples, n_samples, t_offset_cs, enc_window, ov,
+                                                  opts.on_progress ? &enc_progress_bridge::thunk : nullptr, &bridge);
         if (!rc)
             return out;
         out = split_result_to_segs(rc, t_offset_cs, seg_seconds);
@@ -676,6 +703,8 @@ std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, co
         // decode (measured 88 % coverage where per-slice paths reach 93-94 %).
         gap_fill_segments(ctx, samples, n_samples, t_offset_cs, out, kParakeetBoundedWindowS, kParakeetGapFillMinCs,
                           opts.no_prints);
+        if (opts.on_progress)
+            opts.on_progress(n_samples, n_samples); // #385: 100 % once the decode + repair are done
         return out;
     }
 
@@ -701,6 +730,7 @@ std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, co
     }
 
     parakeet_result* r = nullptr;
+    enc_progress_bridge bridge{&opts};
     if (strat == parakeet_strategy::SINGLE_PASS) {
         // Issue #257: single-pass full attention is O(T^2); a VRAM-limited GPU
         // can fail the encode alloc → null → empty transcript. Fall back to the
@@ -715,10 +745,14 @@ std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, co
                         "falling back to streamed encoding — pass --chunk-seconds N for segmented "
                         "output or --att-context L,R for bounded-memory single-pass\n",
                         (double)n_samples / SR);
-            r = parakeet_transcribe_streamed(ctx, samples, n_samples, t_offset_cs, stream_chunk_s, stream_overlap_s);
+            r = parakeet_transcribe_streamed_progress(
+                ctx, samples, n_samples, t_offset_cs, stream_chunk_s, stream_overlap_s,
+                opts.on_progress ? &enc_progress_bridge::thunk : nullptr, &bridge);
         }
     } else { // STREAMED
-        r = parakeet_transcribe_streamed(ctx, samples, n_samples, t_offset_cs, stream_chunk_s, stream_overlap_s);
+        r = parakeet_transcribe_streamed_progress(ctx, samples, n_samples, t_offset_cs, stream_chunk_s,
+                                                  stream_overlap_s,
+                                                  opts.on_progress ? &enc_progress_bridge::thunk : nullptr, &bridge);
     }
     if (!r)
         return out;
@@ -727,5 +761,10 @@ std::vector<parakeet_seg> parakeet_transcribe_segments(parakeet_context* ctx, co
     if (repair)
         gap_fill_segments(ctx, samples, n_samples, t_offset_cs, out, kParakeetBoundedWindowS, kParakeetGapFillMinCs,
                           opts.no_prints);
+    // #385: SINGLE_PASS has no windows and stays silent (nothing fired above, so
+    // firing only the terminal tick here would be a lone 100 % out of nowhere);
+    // the streamed routes did report, so they get their real end.
+    if (opts.on_progress && strat != parakeet_strategy::SINGLE_PASS)
+        opts.on_progress(n_samples, n_samples);
     return out;
 }

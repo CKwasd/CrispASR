@@ -75,8 +75,12 @@ CRISPASR_SESSION_API void crispasr_reset_progress(void);
 // Issue #385: between the unified-dispatch switch (0.8.24) and 0.8.29 the
 // default non-JA Parakeet path ran through a shared orchestrator with no
 // progress hook, so neither the callback nor the atomic moved until the
-// call returned. The hook now lives in the orchestrator itself (one fire
-// per long-form window), so the contract holds on every dispatch path.
+// call returned. The hook now lives in the orchestrator itself, so the
+// contract holds on every dispatch path — including the ones that run one
+// decode over a chunk-ENCODED input (an explicit chunk_seconds > 0, and the
+// JA streamed route), which report per ENCODER window and emit the final
+// (total, total) only once the decode and any repair pass have returned.
+// A genuinely indivisible single pass still fires nothing.
 typedef void (*crispasr_progress_callback)(int processed, int total, void* user_data);
 
 // Register (or clear, with cb == NULL) the session progress callback.

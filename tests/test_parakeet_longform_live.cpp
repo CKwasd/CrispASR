@@ -243,3 +243,61 @@ TEST_CASE("parakeet long-form: chunked entry point reports progress (issue #385)
     CHECK(log.polled_max > 0);
     CHECK(crispasr_get_progress() == -1);
 }
+
+// Issue #385, second half — the routes that are ONE decode over a chunk-ENCODED
+// input. #386 fixed the LONGFORM route (chunk_seconds <= 0), but an explicit
+// chunk_seconds > 0 sets chunk_seconds_explicit, so parakeet_pick_strategy
+// returns CHUNK_SEGMENTED, which fired nothing at all — the pre-0.8.24 inline
+// path DID report per chunk there, so for that call shape the regression was
+// still live. Those routes now report per ENCODER window, with the terminal
+// (total, total) withheld until after the single TDT decode and the #350
+// gap-fill repair, so 100 % still means finished.
+TEST_CASE("parakeet long-form: explicit chunk_seconds reports progress (issue #385)",
+          "[integration][parakeet-longform]") {
+    const char* model_path = parakeet_model();
+    if (!model_path)
+        SKIP("CRISPASR_MODEL_PARAKEET not set or not readable");
+    const auto pcm = repeated_fixture(6); // 66 s — several 30 s encoder windows
+    if (pcm.empty())
+        SKIP("samples/jfk.wav not found — run from the repo root");
+
+    struct prog_log {
+        std::vector<std::pair<int, int>> fires;
+        int polled_max = -1;
+    } log;
+    crispasr_reset_progress();
+
+    crispasr_session* s = crispasr_session_open(model_path, 4);
+    REQUIRE(s != nullptr);
+    crispasr_session_set_progress_callback(
+        s,
+        [](int processed, int total, void* ud) {
+            auto* l = static_cast<prog_log*>(ud);
+            l->fires.push_back({processed, total});
+            l->polled_max = std::max(l->polled_max, crispasr_get_progress());
+        },
+        &log);
+    // chunk_seconds = 20 (> 0) is the shape that took the silent route.
+    crispasr_session_result* r = crispasr_session_transcribe_chunked(s, pcm.data(), (int)pcm.size(), 20, -1);
+    REQUIRE(r != nullptr);
+    crispasr_session_result_free(r);
+    crispasr_session_close(s);
+
+    // At least one encoder window plus the terminal tick.
+    REQUIRE(log.fires.size() >= 2);
+    for (size_t i = 1; i < log.fires.size(); i++)
+        CHECK(log.fires[i].first >= log.fires[i - 1].first);
+    for (const auto& f : log.fires)
+        CHECK(f.second == (int)pcm.size());
+    // `total` is reached exactly once, at the very end — an encoder window that
+    // happened to land on the last sample must NOT have reported 100 % early,
+    // because the decode and the repair pass still had to run.
+    CHECK(log.fires.back().first == (int)pcm.size());
+    int at_total = 0;
+    for (const auto& f : log.fires)
+        if (f.first == f.second)
+            at_total++;
+    CHECK(at_total == 1);
+    CHECK(log.polled_max > 0);
+    CHECK(crispasr_get_progress() == -1);
+}

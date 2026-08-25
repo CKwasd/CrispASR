@@ -4954,6 +4954,19 @@ static void session_report_progress(crispasr_session* s, int processed, int tota
         s->progress_cb(processed, total, s->progress_ud);
 }
 
+// Issue #385: C thunk for parakeet_transcribe_streamed_progress on the LEGACY
+// inline paths (CRISPASR_SESSION_UNIFIED_DISPATCH=0, and the JA routes the
+// unified branch deliberately does not own). The terminal tick is withheld —
+// the single TDT decode runs after the last encoder window — so each caller
+// emits (n, n) itself once the decode has returned. Mirrors
+// enc_progress_bridge in parakeet_orchestrate.cpp, deliberately: the two
+// dispatch surfaces must report identically or the A/B stops meaning anything.
+static void session_enc_progress_thunk(int processed, int total, void* ud) {
+    auto* sess = static_cast<crispasr_session*>(ud);
+    if (processed < total)
+        session_report_progress(sess, processed, total);
+}
+
 // Issue #208: started(0) / idle(-1) bracket around a long-form run, RAII so
 // no exit — early return or failure — can leak a stale percentage to pollers.
 struct scoped_session_progress {
@@ -5670,13 +5683,15 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
                 enc_window = std::max(2, atoi(e));
             const int ov = s->parakeet_force_overlap_seconds >= 0 ? s->parakeet_force_overlap_seconds : 2;
             scoped_session_progress prog;
-            parakeet_result* pr = parakeet_transcribe_streamed(s->parakeet_ctx, pcm, n_samples, 0, enc_window, ov);
+            parakeet_result* pr = parakeet_transcribe_streamed_progress(s->parakeet_ctx, pcm, n_samples, 0, enc_window,
+                                                                        ov, &session_enc_progress_thunk, s);
             if (!pr) {
                 delete r;
                 return nullptr;
             }
             parakeet_result_to_session_segs(pr, s->parakeet_force_chunk_seconds, r->segments);
             parakeet_result_free(pr);
+            session_report_progress(s, n_samples, n_samples); // #385: 100 % once the decode is in
             return r;
         }
 
@@ -5704,10 +5719,24 @@ static crispasr_session_result* transcribe_single(crispasr_session* s, const flo
         }
 
         // JA long audio (streamed fallback); short audio → the exact single pass.
-        parakeet_result* pr =
-            (!use_single_pass && is_ja)
-                ? parakeet_transcribe_streamed(s->parakeet_ctx, pcm, n_samples, 0, stream_chunk_s, stream_overlap_s)
-                : parakeet_transcribe_ex(s->parakeet_ctx, pcm, n_samples, 0);
+        // Issue #385: this is where a CHUNKED JA call lands — force_chunked
+        // excludes the sliced branch above — so it is the JA half of the same
+        // silent-progress bug, and reports per encoder window like every other
+        // streamed route. The single exact pass has no windows and stays silent.
+        // The started(0)/idle(-1) bracket is scoped to the STREAMED arm only:
+        // the short-audio single pass reported nothing before this change and
+        // must keep reporting nothing, or a poller starts seeing 0 % on calls
+        // that were previously idle throughout.
+        parakeet_result* pr = nullptr;
+        if (!use_single_pass && is_ja) {
+            scoped_session_progress ja_prog;
+            pr = parakeet_transcribe_streamed_progress(s->parakeet_ctx, pcm, n_samples, 0, stream_chunk_s,
+                                                       stream_overlap_s, &session_enc_progress_thunk, s);
+            if (pr)
+                session_report_progress(s, n_samples, n_samples);
+        } else {
+            pr = parakeet_transcribe_ex(s->parakeet_ctx, pcm, n_samples, 0);
+        }
         if (!pr) {
             delete r;
             return nullptr;
