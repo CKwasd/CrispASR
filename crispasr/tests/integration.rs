@@ -794,6 +794,165 @@ fn diarize_foxnose_missing_model_errors() {
     assert!(err.contains("load failed"), "unexpected error: {err}");
 }
 
+/// #395: the turn-forwarding wrapper labels exactly like the plain one, and a
+/// method that derives no turns says so with an empty Vec rather than an error.
+#[test]
+fn diarize_with_turns_matches_plain_and_yields_no_turns_for_vad() {
+    let pcm = vec![0.01f32; 16000 * 4];
+    let mk = || {
+        vec![
+            crispasr::DiarizeSegment::new(0.0, 1.0),
+            crispasr::DiarizeSegment::new(2.0, 3.0),
+        ]
+    };
+    let opts = crispasr::DiarizeOptions::default(); // VadTurns
+
+    let mut plain = mk();
+    crispasr::diarize_segments(&mut plain, &pcm, None, false, &opts)
+        .expect("vad_turns diarize failed");
+
+    let mut with_turns = mk();
+    let turns = crispasr::diarize_segments_with_turns(&mut with_turns, &pcm, None, false, &opts)
+        .expect("vad_turns diarize_with_turns failed");
+
+    assert!(
+        turns.is_empty(),
+        "only FoxNose derives turns; VadTurns must report none"
+    );
+    for (a, b) in plain.iter().zip(with_turns.iter()) {
+        assert_eq!(a.speaker, b.speaker, "asking for turns changed the labels");
+    }
+}
+
+/// The error path must stay an error on the turns entry point too — a model
+/// load failure is not "zero turns".
+#[test]
+fn diarize_with_turns_foxnose_missing_model_errors() {
+    let pcm = vec![0.01f32; 16000];
+    let mut segs = vec![crispasr::DiarizeSegment::new(0.0, 1.0)];
+    let mut opts = crispasr::DiarizeOptions::default();
+    opts.method = crispasr::DiarizeMethod::FoxNose;
+    opts.foxnose_embedder_path = Some("/nonexistent/wespeaker.gguf".to_string());
+    let err = crispasr::diarize_segments_with_turns(&mut segs, &pcm, None, false, &opts)
+        .expect_err("foxnose with a missing embedder must fail, not crash");
+    assert!(err.contains("load failed"), "unexpected error: {err}");
+}
+
+/// Live: the case the issue is about — real turns, on the caller's own
+/// absolute timeline, finer than the caller's segment grid. Opt-in via
+/// CRISPASR_TEST_FOXNOSE_WAV + CRISPASR_TEST_FOXNOSE_EMBEDDER (16 kHz 16-bit
+/// mono WAV); skipped when either is unset.
+#[test]
+fn diarize_with_turns_foxnose_live() {
+    let (Ok(wav), Ok(embedder)) = (
+        std::env::var("CRISPASR_TEST_FOXNOSE_WAV"),
+        std::env::var("CRISPASR_TEST_FOXNOSE_EMBEDDER"),
+    ) else {
+        eprintln!("skipping: set CRISPASR_TEST_FOXNOSE_WAV + CRISPASR_TEST_FOXNOSE_EMBEDDER");
+        return;
+    };
+    let Some(pcm) = read_wav_mono_16k(&wav) else {
+        panic!("could not read {wav} as 16 kHz 16-bit PCM WAV");
+    };
+
+    // A deliberately coarse 3 s grid, offset 10 s into a longer recording —
+    // both halves of what the ABI has to get right.
+    const SLICE_T0: f64 = 10.0;
+    let total = pcm.len() as f64 / 16_000.0;
+    let mut segs: Vec<crispasr::DiarizeSegment> = (0..)
+        .map(|i| i as f64 * 3.0)
+        .take_while(|t| t + 3.0 <= total)
+        .map(|t| crispasr::DiarizeSegment::new(SLICE_T0 + t, SLICE_T0 + t + 3.0))
+        .collect();
+    assert!(segs.len() >= 2, "fixture too short for a 3 s grid");
+
+    let mut opts = crispasr::DiarizeOptions::default();
+    opts.method = crispasr::DiarizeMethod::FoxNose;
+    opts.foxnose_embedder_path = Some(embedder);
+    opts.slice_t0 = SLICE_T0;
+    opts.num_speakers = 2;
+
+    let turns = crispasr::diarize_segments_with_turns(&mut segs, &pcm, None, false, &opts)
+        .expect("foxnose diarize_with_turns failed");
+
+    assert!(!turns.is_empty(), "FoxNose must derive turns");
+    let mut prev_end = f64::NEG_INFINITY;
+    for t in &turns {
+        assert!(t.t1 > t.t0, "empty turn {t:?}");
+        assert!(t.speaker >= 0, "a turn is always labelled: {t:?}");
+        assert!(t.t0 >= prev_end - 1e-9, "turns out of order at {t:?}");
+        // The wrapper must hand back the CALLER's timeline, not the buffer's.
+        assert!(
+            t.t0 >= SLICE_T0 - 1e-9 && t.t1 <= SLICE_T0 + total + 0.02,
+            "turn {t:?} outside [{SLICE_T0}, {}]",
+            SLICE_T0 + total
+        );
+        prev_end = t.t1;
+    }
+
+    // At least one caller segment covers two speakers — the whole reason the
+    // turns had to be forwarded in the first place.
+    let straddling = segs
+        .iter()
+        .filter(|g| {
+            let mut spk: Vec<i32> = turns
+                .iter()
+                .filter(|t| t.t1.min(g.t1) - t.t0.max(g.t0) > 0.2)
+                .map(|t| t.speaker)
+                .collect();
+            spk.sort_unstable();
+            spk.dedup();
+            spk.len() > 1
+        })
+        .count();
+    assert!(
+        straddling > 0,
+        "fixture no longer exercises a segment spanning two speakers"
+    );
+}
+
+/// Minimal 16-bit PCM WAV reader for the live diarize test. Returns None
+/// unless the file is 16 kHz 16-bit (mono or stereo, downmixed).
+fn read_wav_mono_16k(path: &str) -> Option<Vec<f32>> {
+    let raw = std::fs::read(path).ok()?;
+    if raw.len() < 44 || &raw[0..4] != b"RIFF" || &raw[8..12] != b"WAVE" {
+        return None;
+    }
+    let u16at = |o: usize| u16::from_le_bytes([raw[o], raw[o + 1]]);
+    let u32at = |o: usize| u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
+
+    let (mut channels, mut bits, mut rate) = (0usize, 0usize, 0u32);
+    let mut pos = 12usize;
+    while pos + 8 <= raw.len() {
+        let id = &raw[pos..pos + 4];
+        let sz = u32at(pos + 4) as usize;
+        let body = pos + 8;
+        if id == b"fmt " && body + 16 <= raw.len() {
+            channels = u16at(body + 2) as usize;
+            rate = u32at(body + 4);
+            bits = u16at(body + 14) as usize;
+        } else if id == b"data" {
+            if bits != 16 || channels == 0 || rate != 16_000 {
+                return None;
+            }
+            let end = (body + sz).min(raw.len());
+            let frames = (end - body) / 2 / channels;
+            let mut out = Vec::with_capacity(frames);
+            for f in 0..frames {
+                let mut acc = 0i32;
+                for c in 0..channels {
+                    let o = body + (f * channels + c) * 2;
+                    acc += i16::from_le_bytes([raw[o], raw[o + 1]]) as i32;
+                }
+                out.push(acc as f32 / channels as f32 / 32768.0);
+            }
+            return Some(out);
+        }
+        pos = body + sz + (sz & 1);
+    }
+    None
+}
+
 // =========================================================================
 // Chat / LLM (crispasr_chat.h)
 // =========================================================================

@@ -9,6 +9,46 @@ WebSocket appends, emit genuine partials, flush and reset deterministically on
 commit, fix turn-cap overflow and backpressure/metrics semantics, and validate
 with unit, reference-parity, long-session, live model, and relevant GPU tests.
 
+## CLAIMED 2026-08-26 — #395 FoxNose turns were unreachable from the C ABI
+
+Additive plumbing of a value the library already computed. `apply_foxnose`
+labels each caller segment with the turn it overlaps MOST, so a segment
+straddling a speaker change was silently awarded to the majority speaker —
+and callers could not send a finer grid either, because FoxNose skips spans
+under `kMinSegmentSeconds = 0.4 s`. The C++ entry point had exposed the
+audio-derived turns since #324 (`out_turns`); the C ABI was the one layer
+that dropped them, so no Rust/Dart/Go/Python consumer could see them.
+
+Landed: `crispasr_diarize_segments_turns_abi` (a NEW symbol — the existing
+ABI is untouched, same append-only convention as `crispasr_diarize_opts_abi`)
+plus `crispasr_diarize_turn_abi`, the `crispasr-sys` `extern "C"` mirror with
+a layout test, and `crispasr::diarize_segments_with_turns` in the safe crate.
+Turns come out in centiseconds on the CALLER's absolute timeline
+(`slice_t0_cs` added back), so they compare directly with the caller's
+segments. Truncation follows the `crispasr_detect_language_pcm` house style:
+rc 2, with `*out_n_turns` holding the required capacity; the Rust wrapper
+sizes from the audio length (one slot per 0.5 s, above the 0.6 s embedding
+hop) and retries once, so callers never see it.
+
+Tests: model-free contract in `tests/test-session-abi-nulls.cpp` (validation,
+"no turn buffer == the older symbol", 0 turns from the methods that derive
+none) and `tests/test-diarize-foxnose-turns-live.cpp` for everything that
+needs REAL turns — well-formedness, the truncation protocol, the
+`slice_t0_cs` shift, and "asking for turns does not change the labels".
+Opt-in via `CRISPASR_TEST_FOXNOSE_WAV` + `CRISPASR_TEST_FOXNOSE_EMBEDDER`;
+verified locally on `samples/multispeaker.wav` + wespeaker-resnet34-lm, where
+the fixture does exercise a segment covering two speakers. Same pair of
+levels on the Rust side in `crispasr/tests/integration.rs`.
+
+**Not done, and deliberately: the other bindings.** Go, Python, Java, Ruby,
+Dart and JS still expose only `crispasr_diarize_segments_abi`. Nothing there
+is broken — the new symbol is additive — but a caller on those surfaces still
+cannot split a segment. Extending them is a mechanical follow-up (each has a
+hand-written mirror; the new turn struct is its own 24-byte POD, NOT an
+append to the opts struct). `tests/test_binding_parity.py`'s curated symbol
+list is unchanged for the same reason: adding the symbol there would fail
+until the Python binding declares it.
+
 ## CLAIMED 2026-08-19 — Issue #375 Canary streaming regression
 
 Root cause found + fixed 2026-08-19: NOT `73bb9b2f` (exonerated,

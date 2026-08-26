@@ -266,6 +266,50 @@ outside Annex III(1)(a), and what the Act requires of you as deployer — is in
 
 See [`cli.md`](cli.md#diarization) for the full diarization flag reference.
 
+## Splitting a segment that spans two speakers (#395)
+
+Diarization **labels** the segments you hand it. That means the label
+resolution can never be finer than your own segment grid: a segment that
+straddles a speaker change is awarded to whoever holds the majority of it, and
+the other speaker's words are silently absorbed. It is not a clustering
+failure — FoxNose finds the boundary, the caller's grid just cannot express it.
+
+You cannot fix this by sending a finer grid, either. FoxNose skips any span
+shorter than `kMinSegmentSeconds = 0.4 s`
+(`src/core/foxnose_pipeline.h`), so a per-word grid starves the embedder and
+the clusterer under-counts speakers. Coarse segments cluster well and label
+coarsely; fine segments cluster badly. The way out is the third option: label
+coarse, then **split on the turns the method derived from the audio**.
+
+FoxNose produces those turns anyway — they are what the labelling reads. Ask
+for them and you get the audio's own boundaries, independent of your grid:
+
+| Surface | Entry point |
+|---|---|
+| C++ | `crispasr_diarize_segments(..., std::vector<CrispasrDiarizeTurn>* out_turns)` |
+| C ABI | `crispasr_diarize_segments_turns_abi(...)` (0.8.30+) |
+| Rust | `crispasr::diarize_segments_with_turns(...) -> Result<Vec<DiarizeTurn>, String>` |
+
+All three are additive: the segments come back labelled exactly as they would
+without the turns, and every other method reports zero turns rather than an
+error. Turn timestamps are on the **same absolute timeline as your segments**
+(the ABI adds `slice_t0_cs` back on the way out), so they compare directly.
+
+With word timings, the recipe is: merge words into utterance-length spans,
+then cut each merged run wherever the turn id changes rather than only at a
+gap threshold, re-merging within those bounds so every piece still clears the
+0.4 s floor — a piece that cannot reach it joins the neighbour it overlaps
+most instead of being dropped.
+
+The C ABI is a **new symbol**, not a signature change, so existing callers are
+untouched (the same append-only convention as `crispasr_diarize_opts_abi`).
+Its turn buffer is caller-allocated: pass `out_n_turns` to learn the count,
+`out_turns` + `n_turns_cap` to receive them, and expect `2` when the buffer
+was short — the segments are still labelled, `*out_n_turns` holds the required
+capacity, and a retry costs a second full pass because the ABI keeps no state
+between calls. The Rust wrapper sizes the buffer from the audio length and
+hides all of that.
+
 ## pyannote segmentation: chunked inference and the powerset layout (#326)
 
 Two changes landed together here, one a speed fix and one a correctness fix
