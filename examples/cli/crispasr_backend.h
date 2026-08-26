@@ -139,6 +139,7 @@ enum crispasr_capability : uint32_t {
                                         // decided tablature: the constrained Viterbi/DP that
                                         // picks a playable fingering belongs to the caller.
     CAP_STREAM_DELTA = 1u << 29,        // supports streaming delta encoding
+    CAP_STREAM_UTTERANCE = 1u << 30, // utterance-level delta (save/restore)
                                         // (cohere_set_stream_delta). Avoids re-encoding
                                         // the overlapping portion of sequential rolling
                                         // windows in JSON+VAD streaming mode.
@@ -230,6 +231,9 @@ public:
     // use this to avoid re-encoding the overlapping portion of the audio.
     // Default no-op.
     virtual void set_stream_delta(int /*delta_new_samples*/) {}
+    virtual void save_utterance_cross_kv(int64_t /*utterance_start*/, int64_t /*utterance_end*/, int64_t /*window_start*/, int /*sample_rate*/) {}
+    virtual void restore_utterance_cross_kv(int /*n_new_samples*/) {}
+    virtual void clear_utterance_cross_kv() {}
 
     // ---- Language detection ----
     // are silently dropped whenever the pipeline engages — measured on
