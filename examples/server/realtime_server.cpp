@@ -1,5 +1,7 @@
 #include "realtime_server.h"
+#include "core/realtime_turn_buffer.h"
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <vector>
 #include <string>
@@ -270,50 +272,49 @@ struct rt_session {
     CrispasrBackend* backend;
     std::mutex* model_mutex;
     whisper_params rp;
-    std::vector<float> audio_buffer;
+    core_realtime::TurnBuffer turn{16000 * 30};
     std::string text_sent;
 
     rt_session(socket_t fd, CrispasrBackend* b, std::mutex* m, whisper_params p)
         : client_fd(fd), backend(b), model_mutex(m), rp(std::move(p)) {}
 
-    void process_audio() {
-        if (audio_buffer.empty())
-            return;
+    double process_audio() {
+        if (turn.empty())
+            return 0.0;
+        const auto started = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(*model_mutex);
-        std::string current_buffer_text;
-
         backend->transcribe_streaming(
-            audio_buffer.data(), audio_buffer.size(), 0, rp,
-            [&](const std::string& partial, bool is_final) { current_buffer_text = partial; });
-
-        // Simple sliding string diffing for JSON SSE
-        std::string diff;
-        if (current_buffer_text.size() > text_sent.size() &&
-            current_buffer_text.compare(0, text_sent.size(), text_sent) == 0) {
-            diff = current_buffer_text.substr(text_sent.size());
-        } else {
-            diff = current_buffer_text; // full replace
-        }
-
-        if (!diff.empty()) {
-            nlohmann::json evt;
-            evt["type"] = "conversation.item.input_audio_transcription.delta";
-            evt["delta"] = diff;
-            ws_send_text(client_fd, evt.dump());
-            text_sent = current_buffer_text;
-        }
+            turn.audio().data(), (int)turn.size(), 0, rp, [&](const std::string& partial, bool /*is_final*/) {
+                std::string diff;
+                if (partial.size() > text_sent.size() && partial.compare(0, text_sent.size(), text_sent) == 0) {
+                    diff = partial.substr(text_sent.size());
+                } else if (partial != text_sent) {
+                    diff = partial; // replacement for a revised hypothesis
+                }
+                if (!diff.empty()) {
+                    nlohmann::json evt;
+                    evt["type"] = "conversation.item.input_audio_transcription.delta";
+                    evt["delta"] = diff;
+                    ws_send_text(client_fd, evt.dump());
+                    text_sent = partial;
+                }
+            });
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     }
 
     void handle_commit() {
-        // flush
-        process_audio();
+        const size_t committed_samples = turn.size();
+        const double processing_ms = process_audio();
         nlohmann::json evt;
         evt["type"] = "conversation.item.input_audio_transcription.completed";
         evt["transcript"] = text_sent;
+        evt["audio_duration_ms"] = committed_samples * 1000 / 16000;
+        evt["processing_ms"] = processing_ms;
+        evt["realtime_factor"] = processing_ms > 0.0 ? (committed_samples / 16.0) / processing_ms : 0.0;
         ws_send_text(client_fd, evt.dump());
 
         // Reset for next utterance
-        audio_buffer.clear();
+        turn.clear();
         text_sent.clear();
     }
 };
@@ -370,6 +371,10 @@ static void rt_handle_connection(rt_session* sess) {
 
     nlohmann::json created;
     created["type"] = "session.created";
+    created["turn_detection"] = "client_commit";
+    created["server_vad"] = false;
+    created["partial_transcription"] = false;
+    created["max_turn_seconds"] = 30;
     ws_send_text(sess->client_fd, created.dump());
 
     std::vector<uint8_t> payload;
@@ -392,17 +397,12 @@ static void rt_handle_connection(rt_session* sess) {
                         auto pcm16 = base64_decode(b64);
                         int n_samples = pcm16.size() / 2;
                         const int16_t* p = (const int16_t*)pcm16.data();
-                        for (int i = 0; i < n_samples; i++) {
-                            sess->audio_buffer.push_back((float)p[i] / 32768.0f);
-                        }
-                        if (sess->audio_buffer.size() > 16000 * 30) {
-                            // Too long! Force commit if we reach 30 seconds
+                        std::vector<float> decoded((size_t)n_samples);
+                        for (int i = 0; i < n_samples; i++)
+                            decoded[(size_t)i] = (float)p[i] / 32768.0f;
+                        if (sess->turn.append(decoded.data(), decoded.size())) {
+                            // Bound memory and compute even if a client forgets to commit.
                             sess->handle_commit();
-                        } else {
-                            // Process incrementally every half second
-                            if (sess->audio_buffer.size() % 8000 < n_samples) {
-                                sess->process_audio();
-                            }
                         }
                     }
                 } else if (type == "input_audio_buffer.commit") {

@@ -16,6 +16,11 @@ FetchContent_MakeAvailable(Catch2)
 list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
 include(Catch)
 
+add_executable(test-realtime-turn-buffer test-realtime-turn-buffer.cpp)
+target_include_directories(test-realtime-turn-buffer PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-realtime-turn-buffer PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-realtime-turn-buffer PROPERTIES LABELS "unit;realtime")
+
 if (EMSCRIPTEN)
 #
 #test - crispasr - js

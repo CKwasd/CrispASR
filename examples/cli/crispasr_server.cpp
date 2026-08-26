@@ -3864,6 +3864,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             rt_started = true;
             fprintf(stderr, "  WS   ws://%s:%d/v1/realtime     — vLLM Realtime API (JSON WebSocket)\n", host.c_str(),
                     rt_port);
+            if (params.vad) {
+                fprintf(stderr, "crispasr-server: note: --vad applies to HTTP/file transcription, not /v1/realtime; "
+                                "that endpoint uses client-side input_audio_buffer.commit turn boundaries\n");
+            }
         } else {
             fprintf(stderr, "crispasr-server: warning: failed to start vLLM Realtime API on port %d\n", rt_port);
         }

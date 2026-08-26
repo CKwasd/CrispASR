@@ -1,14 +1,5 @@
 # CrispASR — Pending work
 
-## CLAIMED 2026-08-26 — Issue #383 Nemotron realtime lag and VAD semantics
-
-Worktree: `.claude/worktrees/fix-383-nemotron-realtime`.
-Audit both WebSocket surfaces and the reporter's complete browser client, fix
-any unbounded buffering/reprocessing or misleading VAD behavior in the
-`/v1/realtime` Nemotron path, document the endpoint/turn/reset contract, and
-validate with hermetic unit coverage plus a model-backed long-running live test
-(including CUDA via Kaggle if the affected path is backend-sensitive).
-
 ## CLAIMED 2026-08-19 — Issue #375 Canary streaming regression
 
 Root cause found + fixed 2026-08-19: NOT `73bb9b2f` (exonerated,

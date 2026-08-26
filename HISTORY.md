@@ -6,6 +6,20 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #383 Nemotron `/v1/realtime` progressive lag — fixed 2026-08-26
+
+The realtime JSON WebSocket re-ran ASR over the entire growing turn every 0.5
+seconds. Nemotron's cache is streaming only within one inference call, so its
+`T=8,14,18...` logs were full-prefix re-encodes and CPU work grew
+quadratically. `/v1/realtime` now follows its explicit-commit contract:
+appends only fill a bounded 30-second turn buffer, commit decodes once and
+clears it, and backend token callbacks reach delta events during that committed
+decode. The handshake states that server VAD is off/client commit owns turn
+detection; completion reports audio duration, processing time, and realtime
+factor. The raw WebSocket remains Whisper-only. Unit guards pin buffering,
+reset, and the hard cap; live same-socket tests pass with Whisper and the
+Nemotron 0.6B Q4_K model, including a second independent turn.
+
 ## #375 canary "repeated phrases" — two real bugs, neither where the bisect pointed, fixed 2026-08-19
 
 A reporter's canary quality regressed after an upgrade: phrases repeated a few
