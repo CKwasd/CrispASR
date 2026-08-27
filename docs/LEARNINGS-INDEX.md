@@ -17,7 +17,7 @@ per-backend porting detail (Per-model port notes + the family cross-reference).
 Reach for the topic groups when you are stuck on a *technique*, and the
 cross-reference when you already know which model you are touching.
 
-## Index by topic (291 lessons)
+## Index by topic (292 lessons)
 
 **Security & untrusted input** (2)
 
@@ -58,7 +58,7 @@ cross-reference when you already know which model you are touching.
 - L14854 — CI has no NVIDIA GPU — a CUDA-only graph path (mimo RVQ) is guarded by an on-Kaggle exact-parity smoke, not CI (#309)
 - L15681 — #313 Rust crates on crates.io via git dep
 
-**Multi-surface wiring — CLI / C ABI / bindings / server** (27)
+**Multi-surface wiring — CLI / C ABI / bindings / server** (28)
 
 - L385 — Four ways a measurement lied in one session — and the experiment to run when you lack the reporter's hardware
 - L436 — A guard that no toolchain runs, and a test literal that pins the MODEL instead of the feature
@@ -87,6 +87,7 @@ cross-reference when you already know which model you are touching.
 - L17944 — Parakeet #208 long-audio + enc-cache collapse
 - L18051 — session-state fixes + moonshine CPU-only SOLVED
 - L18275 — Wyoming TTS marked nothing — FIXED 8f4197ec
+- L18506 — A streaming callback over a growing buffer is buffered inference unless the public session owns every cache
 
 **Parity, the diff harness & ground truth** (41)
 
