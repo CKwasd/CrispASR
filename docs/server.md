@@ -653,9 +653,9 @@ commit-only fallback; `session.created.partial_transcription` tells the client
 which contract is active.
 
 `--vad --vad-model MODEL` enables server-side turn detection on this endpoint.
-PCM is held outside ASR until speech is detected, a 200 ms pre-roll protects the
-onset, `input_audio_buffer.speech_started` / `.speech_stopped` events expose the
-boundary, and trailing silence auto-commits the turn. Without server VAD,
+PCM is held outside ASR until speech is detected, a bounded onset buffer protects
+the first phoneme, `input_audio_buffer.speech_started` / `.speech_stopped` events
+expose the boundary, and trailing silence auto-commits the turn. Without server VAD,
 `session.created` reports `"turn_detection":"client_commit"` and clients should
 gate appends themselves, retain pre-roll/trailing padding, and commit after
 their silence threshold.
@@ -663,9 +663,11 @@ their silence threshold.
 A 30-second safety cap force-commits forgotten turns without dropping overflow:
 the remainder starts the next bounded turn. Completed events include
 `audio_received_duration_ms`, `audio_processed_duration_ms`,
-`queue_backlog_duration_ms`, `processing_ms`, and `realtime_factor`. Inference
-is synchronously backpressured, so the internal queue backlog is zero rather
-than an unbounded worker queue.
+`queue_backlog_duration_ms`, `model_queue_wait_ms`, `processing_ms`,
+`end_to_end_processing_ms`, and `realtime_factor`. Inference is synchronously
+backpressured, so the internal queue backlog is zero rather than an unbounded
+worker queue; contention for the shared model is visible separately as model
+queue wait.
 
 The raw WebSocket on `ws_port` remains Whisper-only. Nemotron clients should use
 `ws_port + 1` (`/v1/realtime`) with explicit commits.

@@ -1,5 +1,5 @@
 {
-  "id": "chr1str/crispasr-issue383-nemotron-streaming",
+  "id": "chr1str/crispasr-issue-383-nemotron-streaming-parity",
   "title": "CrispASR issue 383 Nemotron streaming parity",
   "code_file": "issue383_nemotron_stream.py",
   "language": "python",
