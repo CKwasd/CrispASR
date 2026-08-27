@@ -2550,6 +2550,7 @@ struct nemotron_stream {
     std::vector<float> audio;
     size_t frontend_checked_samples = 0;
     int processed_pre_frames = 0;
+    int encoder_frames_computed = 0;
     int decoded_frames = 0;
     std::vector<nemotron_context::layer_cache> enc_cache;
     nemotron_lstm_state decoder_state;
@@ -2614,6 +2615,7 @@ static bool nemotron_stream_decode(nemotron_stream* stream, const float* enc, in
 static void nemotron_stream_clear(nemotron_stream* stream) {
     stream->audio.clear();
     stream->processed_pre_frames = 0;
+    stream->encoder_frames_computed = 0;
     stream->frontend_checked_samples = 0;
     stream->decoded_frames = 0;
     stream->enc_cache.clear();
@@ -2906,7 +2908,7 @@ extern "C" void nemotron_stream_reset(struct nemotron_stream* stream) {
 }
 
 extern "C" int nemotron_stream_processed_frames(const struct nemotron_stream* stream) {
-    return stream ? stream->processed_pre_frames : 0;
+    return stream ? stream->encoder_frames_computed : 0;
 }
 
 extern "C" bool nemotron_stream_append(struct nemotron_stream* stream, const float* samples, int n_samples, bool flush,
@@ -2956,8 +2958,10 @@ extern "C" bool nemotron_stream_append(struct nemotron_stream* stream, const flo
     if (!nemotron_stream_decode(stream, enc_out.data(), n_new, d_model, cb, userdata))
         return false;
     stream->processed_pre_frames = target;
+    stream->encoder_frames_computed += n_new;
     if (crispasr_env::get("CRISPASR_NEMOTRON_STREAM_DEBUG"))
-        fprintf(stderr, "nemotron: stream advanced %d new encoder frames (total=%d)\n", n_new, target);
+        fprintf(stderr, "nemotron: stream advanced %d new encoder frames (computed_total=%d)\n", n_new,
+                stream->encoder_frames_computed);
     return true;
 }
 
