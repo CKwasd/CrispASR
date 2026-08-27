@@ -340,6 +340,12 @@ def main():
 
         # 3. Reuse the same WebSocket for another turn. Its duration must be
         # just this append, proving commit cleared the prior audio prefix.
+        if server_vad:
+            # A low silence threshold may split the sample at an internal pause
+            # and leave a later fragment active after the first auto-completion.
+            # Establish an explicit clean boundary for the reset assertion.
+            s.sendall(ws_frame(commit_msg, opcode=0x1))
+            read_server_frames(s, timeout=30.0)
         second_pcm = pcm[:16000 * 2]
         second_append = json.dumps({
             "type": "input_audio_buffer.append",
