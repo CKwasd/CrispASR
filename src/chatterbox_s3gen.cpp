@@ -19,6 +19,7 @@
 #include "chatterbox_campplus.h"
 #include "chatterbox_s3gen.h"
 #include "chatterbox_s3tok.h"
+#include "core/chatterbox_f0_conv.h"
 #include "core/conv.h"
 #include "core/dac_decoder.h" // core_dac::fastconv_cache (shared FASTCONV)
 #include "core/gguf_loader.h"
@@ -3030,31 +3031,13 @@ static std::vector<float> run_f0_predictor(chatterbox_s3gen_context* c,
         if (bt)
             ggml_backend_tensor_get(bt, b.data(), 0, C_out * sizeof(float));
 
-        // Conv1d with padding=1 (symmetric): out[t] = sum over k,c_in
-        // Input x is (T, C_in), weight is (C_out, C_in, K) in memory
-        // PyTorch Conv1d: out[co, t] = bias[co] + sum_ci sum_k w[co,ci,k] * x[ci, t+k-pad]
-        // Our layout: x[t * C_in + ci], w[co * C_in * K + ci * K + k]
+        // Conv1d(k=3,p=1) + ELU. x86 GCC/Clang dispatches at runtime to
+        // AVX-512F or AVX2; other hosts keep the scalar path. Each SIMD lane
+        // preserves the original k→ci accumulation order, and rows are split
+        // with the Chatterbox thread budget already stored in c->n_threads.
         std::vector<float> out(T_mel * C_out, 0.0f);
-        for (int t = 0; t < T_mel; t++) {
-            for (int co = 0; co < C_out; co++) {
-                float sum = b[co];
-                for (int k = 0; k < K; k++) {
-                    int tt = t + k - 1; // padding=1
-                    if (tt < 0 || tt >= T_mel)
-                        continue;
-                    for (int ci = 0; ci < C_in; ci++) {
-                        // w layout: (K, C_in, C_out) → w[k * C_in * C_out + ci * C_out + co]
-                        // Actually ggml stores as ne[0]=K, ne[1]=C_in, ne[2]=C_out
-                        // Memory: w[co * C_in * K + ci * K + k]
-                        sum += w_f32[co * C_in * K + ci * K + k] * x[tt * C_in + ci];
-                    }
-                }
-                // ELU activation
-                if (sum < 0)
-                    sum = std::exp(sum) - 1.0f;
-                out[t * C_out + co] = sum;
-            }
-        }
+        core_chatterbox_f0::Conv1dEluK3{x.data(), w_f32.data(), b.data(), out.data(), T_mel, C_in, C_out}.run(
+            c->n_threads);
         x = std::move(out);
     }
 

@@ -35,6 +35,13 @@ if (EMSCRIPTEN)
     return()
 endif()
 
+add_executable(test-chatterbox-f0-simd test-chatterbox-f0-simd.cpp)
+target_include_directories(test-chatterbox-f0-simd PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-chatterbox-f0-simd PRIVATE Catch2::Catch2WithMain Threads::Threads)
+catch_discover_tests(test-chatterbox-f0-simd
+    TEST_SPEC "[unit][tts][chatterbox][simd]"
+    PROPERTIES LABELS "unit;tts;chatterbox")
+
 set(TEST_TARGET test-crispasr-cli-tiny)
 add_test(NAME ${TEST_TARGET}
     COMMAND $<TARGET_FILE:crispasr-cli>
