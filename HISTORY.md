@@ -27,7 +27,13 @@ downgrades explicitly, and completion separates received/processed duration,
 inference, model-mutex wait, and backlog metrics. Model-backed tests pin
 byte-identical streamed/one-shot Nemotron output, bounded actual encoder-frame
 work, pre-commit partials, Silero auto-turns, and same-socket reset; the full
-unit suite passed 1,728/1,728.
+unit suite passed 1,728/1,728. A from-scratch Ninja/ccache CUDA build on a
+Kaggle Tesla P100 passed the persistent-stream test (113/113) and the realtime
+WebSocket live test (7/7). The same kernel ran NVIDIA's current Transformers
+blueprint independently (six lookahead tokens, 560 ms advertised latency) and
+produced the expected JFK transcript. CrispASR retains the GGUF's configured
+three-frame right context; the comparison validates the persistent-cache and
+chunk-feeding design, not identical latency presets.
 
 ## #375 canary "repeated phrases" — two real bugs, neither where the bisect pointed, fixed 2026-08-19
 
