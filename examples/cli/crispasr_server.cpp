@@ -3860,14 +3860,16 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             fprintf(stderr, "crispasr-server: warning: failed to start WebSocket streaming on port %d\n", ws_port);
         }
         const int rt_port = ws_port + 1; // vLLM Realtime API on ws_port + 1
-        if (realtime_server_start(backend.get(), model_mutex, params, rt_port) == 0) {
+        whisper_params realtime_params = params;
+        if (params.vad || !params.vad_model.empty())
+            realtime_params.vad_model = crispasr_resolve_vad_model(params);
+        if (realtime_server_start(backend.get(), model_mutex, realtime_params, rt_port) == 0) {
             rt_started = true;
             fprintf(stderr, "  WS   ws://%s:%d/v1/realtime     — vLLM Realtime API (JSON WebSocket)\n", host.c_str(),
                     rt_port);
-            if (params.vad) {
-                fprintf(stderr, "crispasr-server: note: --vad applies to HTTP/file transcription, not /v1/realtime; "
-                                "that endpoint uses client-side input_audio_buffer.commit turn boundaries\n");
-            }
+            if ((params.vad || !params.vad_model.empty()) && realtime_params.vad_model.empty())
+                fprintf(stderr, "crispasr-server: warning: realtime VAD requested but its model could not be resolved; "
+                                "/v1/realtime will require client commits\n");
         } else {
             fprintf(stderr, "crispasr-server: warning: failed to start vLLM Realtime API on port %d\n", rt_port);
         }

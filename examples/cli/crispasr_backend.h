@@ -144,6 +144,14 @@ enum crispasr_capability : uint32_t {
 // Backend interface
 // ---------------------------------------------------------------------------
 
+class CrispasrRealtimeSession {
+public:
+    using callback = std::function<void(const std::string& partial_text, bool is_final)>;
+    virtual ~CrispasrRealtimeSession() = default;
+    virtual bool append(const float* samples, int n_samples, bool flush, callback on_text) = 0;
+    virtual void reset() = 0;
+};
+
 class CrispasrBackend {
 public:
     virtual ~CrispasrBackend() = default;
@@ -406,6 +414,10 @@ public:
         }
         on_text(full, true); // final
     }
+
+    // Stateful cross-append streaming. Backends return nullptr until they can
+    // preserve their native frontend/encoder/decoder state per connection.
+    virtual std::unique_ptr<CrispasrRealtimeSession> create_realtime_session(const whisper_params&) { return nullptr; }
 
     // Warmup: run a short dummy transcribe to amortize first-call
     // overhead (graph allocation, GPU kernel compilation, gallocr shape

@@ -12,17 +12,22 @@ namespace core_realtime {
 // backends whose streaming cache only lives inside a single inference call.
 class TurnBuffer {
 public:
+    struct AppendResult {
+        std::size_t consumed = 0;
+        bool full = false;
+    };
+
     explicit TurnBuffer(std::size_t max_samples) : max_samples_(max_samples) {}
 
-    bool append(const float* samples, std::size_t count) {
+    AppendResult append(const float* samples, std::size_t count) {
         if (!samples || count == 0)
-            return false;
+            return {};
         if (max_samples_ > 0) {
             const std::size_t room = audio_.size() < max_samples_ ? max_samples_ - audio_.size() : 0;
             count = std::min(count, room);
         }
         audio_.insert(audio_.end(), samples, samples + count);
-        return max_samples_ > 0 && audio_.size() >= max_samples_;
+        return {count, max_samples_ > 0 && audio_.size() >= max_samples_};
     }
 
     const std::vector<float>& audio() const { return audio_; }

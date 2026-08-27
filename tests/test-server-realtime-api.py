@@ -116,6 +116,7 @@ def main():
     backend = "whisper"
     explicit_model = ""
     language = "en"
+    server_vad = "--server-vad" in sys.argv[1:]
     args = sys.argv[1:]
     for i, a in enumerate(args):
         if a == "--port" and i + 1 < len(args):
@@ -157,10 +158,16 @@ def main():
     cmd = [binary, "--server", "-m", model, "--backend", backend,
            "--host", "127.0.0.1", "--port", str(port), "--ws-port", "0",
            "--language", language, "--no-prints"]
+    if server_vad:
+        vad_model = os.environ.get("CRISPASR_TEST_VAD_MODEL", "webrtc")
+        cmd += ["--vad", "--vad-model", vad_model, "--vad-min-silence-duration-ms", "300"]
     if cache_dir:
         cmd += ["--cache-dir", cache_dir]
     print("Model:", model)
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    show_server_log = os.environ.get("CRISPASR_TEST_SERVER_LOG") == "1"
+    proc = subprocess.Popen(cmd,
+                            stdout=None if show_server_log else subprocess.DEVNULL,
+                            stderr=None if show_server_log else subprocess.DEVNULL)
     try:
         # Wait for /health.
         ready = False
@@ -225,10 +232,11 @@ def main():
             print("  ✗ no session.created received")
             failed += 1
 
-        if (session_contract and session_contract.get("turn_detection") == "client_commit"
-                and session_contract.get("server_vad") is False
-                and session_contract.get("partial_transcription") is False):
-            print("  ✓ session declares explicit-commit/no-server-VAD contract")
+        expected_detection = "server_vad" if server_vad else "client_commit"
+        if (session_contract and session_contract.get("turn_detection") == expected_detection
+                and session_contract.get("server_vad") is server_vad
+                and isinstance(session_contract.get("partial_transcription"), bool)):
+            print("  ✓ session declares its turn/VAD/partial contract")
             passed += 1
         else:
             print("  ✗ session did not declare its turn/VAD contract: %r" % session_contract)
@@ -245,24 +253,60 @@ def main():
             msgs += read_server_frames(s, timeout=0.4)
 
         premature = []
+        speech_started = False
         for m in msgs:
             try:
-                if json.loads(m).get("type", "").startswith("conversation.item.input_audio_transcription"):
+                event_type = json.loads(m).get("type", "")
+                if event_type.startswith("conversation.item.input_audio_transcription"):
                     premature.append(m)
+                if event_type == "input_audio_buffer.speech_started":
+                    speech_started = True
             except Exception:
                 pass
-        if not premature:
-            print("  ✓ append only buffers audio; no growing-prefix re-decodes")
+        if server_vad:
+            if speech_started:
+                print("  ✓ server VAD emitted speech_started and opened the ASR gate")
+                passed += 1
+            else:
+                print("  ✗ server VAD did not emit speech_started")
+                failed += 1
+        expects_partials = bool(session_contract and session_contract.get("partial_transcription"))
+        if expects_partials and premature:
+            print("  ✓ stateful backend emitted transcription before commit")
+            passed += 1
+        elif not expects_partials and not premature:
+            print("  ✓ fallback backend buffers without growing-prefix re-decodes")
             passed += 1
         else:
-            print("  ✗ transcription ran before commit: %r" % premature[:2])
+            print("  ✗ pre-commit behavior disagrees with session contract: %r" % premature[:2])
             failed += 1
 
         commit_msg = json.dumps({"type": "input_audio_buffer.commit"})
-        s.sendall(ws_frame(commit_msg, opcode=0x1))
-        # CPU backends can take several seconds for a committed turn; this is a
-        # correctness/live test, not the latency budget itself.
-        msgs += read_server_frames(s, timeout=30.0)
+        auto_completed = False
+        if server_vad:
+            silence = bytes(16000 * 2)  # one second PCM16 silence
+            silence_msg = json.dumps({
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(silence).decode("utf-8"),
+            })
+            s.sendall(ws_frame(silence_msg, opcode=0x1))
+            msgs += read_server_frames(s, timeout=30.0)
+            event_types = []
+            for m in msgs:
+                try: event_types.append(json.loads(m).get("type"))
+                except Exception: pass
+            auto_completed = "conversation.item.input_audio_transcription.completed" in event_types
+            if "input_audio_buffer.speech_stopped" in event_types and auto_completed:
+                print("  ✓ server VAD emitted speech_stopped and auto-committed")
+                passed += 1
+            else:
+                print("  ✗ server VAD did not stop/auto-commit: %r" % event_types[-8:])
+                failed += 1
+        if not auto_completed:
+            s.sendall(ws_frame(commit_msg, opcode=0x1))
+            # CPU backends can take several seconds for a committed turn; this is a
+            # correctness/live test, not the latency budget itself.
+            msgs += read_server_frames(s, timeout=30.0)
         texts = []
         completed = None
         for m in msgs:
@@ -285,6 +329,8 @@ def main():
 
         if (completed and completed.get("audio_duration_ms", 0) > 1000
                 and completed.get("processing_ms", 0) > 0
+                and completed.get("model_queue_wait_ms", -1) >= 0
+                and completed.get("queue_backlog_duration_ms") == 0
                 and "realtime_factor" in completed):
             print("  ✓ completion exposes audio and processing timing")
             passed += 1

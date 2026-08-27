@@ -19,6 +19,7 @@ extern "C" {
 #endif
 
 struct nemotron_context;
+struct nemotron_stream;
 
 struct nemotron_context_params {
     int n_threads;
@@ -105,6 +106,17 @@ typedef void (*nemotron_token_cb)(int tok_id, float prob, void* userdata);
 // Uses greedy RNN-T decode regardless of beam_size setting.
 void nemotron_transcribe_cb(struct nemotron_context* ctx, const float* samples, int n_samples, nemotron_token_cb cb,
                             void* userdata);
+
+// Persistent cache-aware streaming session. append() consumes new 16 kHz PCM
+// and emits tokens for encoder chunks that have become stable. flush=true
+// pads/processes the final short chunk. reset() starts a new utterance while
+// retaining the loaded model.
+struct nemotron_stream* nemotron_stream_create(struct nemotron_context* ctx);
+void nemotron_stream_free(struct nemotron_stream* stream);
+bool nemotron_stream_append(struct nemotron_stream* stream, const float* samples, int n_samples, bool flush,
+                            nemotron_token_cb cb, void* userdata);
+void nemotron_stream_reset(struct nemotron_stream* stream);
+int nemotron_stream_processed_frames(const struct nemotron_stream* stream);
 
 #ifdef __cplusplus
 }

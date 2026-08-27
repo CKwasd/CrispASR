@@ -1,5 +1,6 @@
 #include "realtime_server.h"
 #include "core/realtime_turn_buffer.h"
+#include "crispasr_vad.h"
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -273,49 +274,183 @@ struct rt_session {
     std::mutex* model_mutex;
     whisper_params rp;
     core_realtime::TurnBuffer turn{16000 * 30};
+    std::unique_ptr<CrispasrRealtimeSession> realtime;
     std::string text_sent;
+    double turn_processing_ms = 0.0;
+    double turn_queue_wait_ms = 0.0;
+    bool server_vad = false;
+    bool speech_active = false;
+    std::vector<float> vad_window;
+    size_t vad_samples_since_eval = 0;
+    size_t audio_received_samples = 0;
+    size_t vad_dropped_samples = 0;
 
     rt_session(socket_t fd, CrispasrBackend* b, std::mutex* m, whisper_params p)
-        : client_fd(fd), backend(b), model_mutex(m), rp(std::move(p)) {}
+        : client_fd(fd), backend(b), model_mutex(m), rp(std::move(p)), realtime(backend->create_realtime_session(rp)) {
+        server_vad = rp.vad && !rp.vad_model.empty();
+    }
+
+    void send_simple_event(const char* type) {
+        nlohmann::json evt;
+        evt["type"] = type;
+        ws_send_text(client_fd, evt.dump());
+    }
+
+    void emit_partial(const std::string& partial) {
+        std::string diff;
+        if (partial.size() > text_sent.size() && partial.compare(0, text_sent.size(), text_sent) == 0)
+            diff = partial.substr(text_sent.size());
+        else if (partial != text_sent)
+            diff = partial;
+        if (!diff.empty()) {
+            nlohmann::json evt;
+            evt["type"] = "conversation.item.input_audio_transcription.delta";
+            evt["delta"] = diff;
+            ws_send_text(client_fd, evt.dump());
+            text_sent = partial;
+        }
+    }
+
+    bool append_realtime(const float* samples, int n_samples, bool flush) {
+        if (!realtime)
+            return false;
+        const auto queued = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lock(*model_mutex);
+        const auto started = std::chrono::steady_clock::now();
+        turn_queue_wait_ms += std::chrono::duration<double, std::milli>(started - queued).count();
+        const bool ok = realtime->append(samples, n_samples, flush,
+                                         [&](const std::string& partial, bool) { emit_partial(partial); });
+        turn_processing_ms +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        return ok;
+    }
+
+    void append_asr(const float* samples, size_t count) {
+        size_t offset = 0;
+        while (offset < count) {
+            const auto appended = turn.append(samples + offset, count - offset);
+            audio_received_samples += appended.consumed;
+            if (realtime && appended.consumed > 0 &&
+                !append_realtime(samples + offset, (int)appended.consumed, false)) {
+                realtime.reset();
+                text_sent.clear();
+                nlohmann::json evt;
+                evt["type"] = "session.updated";
+                evt["partial_transcription"] = false;
+                evt["reason"] = "native_stream_failed_commit_fallback";
+                ws_send_text(client_fd, evt.dump());
+            }
+            offset += appended.consumed;
+            if (appended.full)
+                handle_commit();
+            else if (appended.consumed == 0)
+                break;
+        }
+    }
+
+    void append_with_vad(const float* samples, size_t count) {
+        if (!server_vad) {
+            append_asr(samples, count);
+            return;
+        }
+        vad_window.insert(vad_window.end(), samples, samples + count);
+        vad_samples_since_eval += count;
+        if (speech_active)
+            append_asr(samples, count);
+        const size_t eval_step = 1600; // 100 ms
+        if (vad_samples_since_eval < eval_step)
+            return;
+        vad_samples_since_eval = 0;
+
+        crispasr_vad_options opts;
+        opts.threshold = rp.vad_threshold;
+        opts.threshold_explicit = rp.vad_threshold_explicit;
+        opts.min_speech_duration_ms = rp.vad_min_speech_duration_ms;
+        opts.min_silence_duration_ms = rp.vad_min_silence_duration_ms;
+        opts.speech_pad_ms = rp.vad_speech_pad_ms;
+        opts.chunk_seconds = 0;
+        opts.n_threads = rp.n_threads;
+        bool load_failed = false;
+        auto slices = crispasr_compute_vad_slices(vad_window.data(), (int)vad_window.size(), 16000,
+                                                  rp.vad_model.c_str(), opts, &load_failed);
+        if (load_failed) {
+            server_vad = false;
+            send_simple_event("input_audio_buffer.vad_failed");
+            append_asr(vad_window.data(), vad_window.size());
+            vad_window.clear();
+            return;
+        }
+        if (!speech_active && !slices.empty()) {
+            speech_active = true;
+            send_simple_event("input_audio_buffer.speech_started");
+            // The inactive probe is capped at one second, so forwarding it all
+            // gives the model a robust onset/pre-roll without unbounded silence.
+            append_asr(vad_window.data(), vad_window.size());
+        } else if (speech_active) {
+            const int silence_samples = rp.vad_min_silence_duration_ms * 16;
+            const int trailing = slices.empty() ? (int)vad_window.size() : (int)vad_window.size() - slices.back().end;
+            if (trailing >= silence_samples) {
+                send_simple_event("input_audio_buffer.speech_stopped");
+                handle_commit();
+                speech_active = false;
+                vad_window.clear();
+                return;
+            }
+        }
+        const size_t keep = speech_active ? 16000 * 3 : 16000;
+        if (vad_window.size() > keep) {
+            if (!speech_active)
+                vad_dropped_samples += vad_window.size() - keep;
+            vad_window.erase(vad_window.begin(), vad_window.end() - keep);
+        }
+    }
 
     double process_audio() {
         if (turn.empty())
             return 0.0;
+        const auto queued = std::chrono::steady_clock::now();
+        std::unique_lock<std::mutex> lock(*model_mutex);
         const auto started = std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> lock(*model_mutex);
-        backend->transcribe_streaming(
-            turn.audio().data(), (int)turn.size(), 0, rp, [&](const std::string& partial, bool /*is_final*/) {
-                std::string diff;
-                if (partial.size() > text_sent.size() && partial.compare(0, text_sent.size(), text_sent) == 0) {
-                    diff = partial.substr(text_sent.size());
-                } else if (partial != text_sent) {
-                    diff = partial; // replacement for a revised hypothesis
-                }
-                if (!diff.empty()) {
-                    nlohmann::json evt;
-                    evt["type"] = "conversation.item.input_audio_transcription.delta";
-                    evt["delta"] = diff;
-                    ws_send_text(client_fd, evt.dump());
-                    text_sent = partial;
-                }
-            });
+        turn_queue_wait_ms += std::chrono::duration<double, std::milli>(started - queued).count();
+        backend->transcribe_streaming(turn.audio().data(), (int)turn.size(), 0, rp,
+                                      [&](const std::string& partial, bool /*is_final*/) { emit_partial(partial); });
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     }
 
     void handle_commit() {
         const size_t committed_samples = turn.size();
-        const double processing_ms = process_audio();
+        double processing_ms = 0.0;
+        if (realtime && append_realtime(nullptr, 0, true)) {
+            processing_ms = turn_processing_ms;
+        } else {
+            if (realtime) {
+                realtime.reset();
+                text_sent.clear();
+            }
+            processing_ms = turn_processing_ms + process_audio();
+        }
         nlohmann::json evt;
         evt["type"] = "conversation.item.input_audio_transcription.completed";
         evt["transcript"] = text_sent;
         evt["audio_duration_ms"] = committed_samples * 1000 / 16000;
+        evt["audio_received_duration_ms"] = (audio_received_samples + vad_dropped_samples) * 1000 / 16000;
+        evt["audio_processed_duration_ms"] = committed_samples * 1000 / 16000;
+        evt["queue_backlog_duration_ms"] = 0;
+        evt["model_queue_wait_ms"] = turn_queue_wait_ms;
         evt["processing_ms"] = processing_ms;
+        evt["end_to_end_processing_ms"] = processing_ms + turn_queue_wait_ms;
         evt["realtime_factor"] = processing_ms > 0.0 ? (committed_samples / 16.0) / processing_ms : 0.0;
         ws_send_text(client_fd, evt.dump());
 
         // Reset for next utterance
         turn.clear();
+        if (realtime)
+            realtime->reset();
         text_sent.clear();
+        turn_processing_ms = 0.0;
+        turn_queue_wait_ms = 0.0;
+        audio_received_samples = 0;
+        vad_dropped_samples = 0;
     }
 };
 
@@ -371,9 +506,9 @@ static void rt_handle_connection(rt_session* sess) {
 
     nlohmann::json created;
     created["type"] = "session.created";
-    created["turn_detection"] = "client_commit";
-    created["server_vad"] = false;
-    created["partial_transcription"] = false;
+    created["turn_detection"] = sess->server_vad ? "server_vad" : "client_commit";
+    created["server_vad"] = sess->server_vad;
+    created["partial_transcription"] = sess->realtime != nullptr;
     created["max_turn_seconds"] = 30;
     ws_send_text(sess->client_fd, created.dump());
 
@@ -400,12 +535,11 @@ static void rt_handle_connection(rt_session* sess) {
                         std::vector<float> decoded((size_t)n_samples);
                         for (int i = 0; i < n_samples; i++)
                             decoded[(size_t)i] = (float)p[i] / 32768.0f;
-                        if (sess->turn.append(decoded.data(), decoded.size())) {
-                            // Bound memory and compute even if a client forgets to commit.
-                            sess->handle_commit();
-                        }
+                        sess->append_with_vad(decoded.data(), decoded.size());
                     }
                 } else if (type == "input_audio_buffer.commit") {
+                    sess->vad_window.clear();
+                    sess->speech_active = false;
                     sess->handle_commit();
                 }
             } catch (...) {

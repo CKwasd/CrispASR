@@ -60,6 +60,7 @@ static bool nemotron_force_scalar() {
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -285,6 +286,20 @@ struct nemotron_context {
     std::vector<uint8_t> cached_enc_meta;
     int cached_enc_T_mel = 0;
 };
+
+struct nemotron_stream_layer_graph {
+    std::vector<uint8_t> meta;
+    ggml_context* ctx0 = nullptr;
+    ggml_cgraph* gf = nullptr;
+    nemotron_stream_layer_graph() = default;
+    nemotron_stream_layer_graph(const nemotron_stream_layer_graph&) = delete;
+    nemotron_stream_layer_graph& operator=(const nemotron_stream_layer_graph&) = delete;
+    ~nemotron_stream_layer_graph() {
+        if (ctx0)
+            ggml_free(ctx0);
+    }
+};
+using nemotron_stream_graph_cache = std::map<std::tuple<int, int, int>, std::unique_ptr<nemotron_stream_layer_graph>>;
 
 // ===========================================================================
 // Helpers
@@ -1221,7 +1236,9 @@ static bool nemotron_run_encoder(nemotron_context* ctx, const float* mel, int n_
 // ===========================================================================
 
 static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre_enc, int T_enc, int d_model,
-                                         std::vector<float>& enc_out) {
+                                         std::vector<float>& enc_out,
+                                         std::vector<nemotron_context::layer_cache>* stream_cache = nullptr,
+                                         bool reset_cache = true) {
     const auto& hp = ctx->model.hparams;
     const auto& m = ctx->model;
     const int n_layers = (int)hp.n_layers;
@@ -1238,14 +1255,17 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
     // Initialize per-layer caches.
     // k_cache stores post-FFN1 output (NeMo's cache_last_channel): the input
     // to the self-attention K/V projections.  Up to L frames per layer.
-    ctx->enc_cache.resize(n_layers);
-    for (int il = 0; il < n_layers; il++) {
-        auto& c = ctx->enc_cache[il];
-        c.k_cache.clear();
-        c.v_cache.clear();
-        c.n_cached = 0;
-        c.conv_cache.assign((size_t)(K - 1) * d, 0.0f);
-        c.conv_cached = 0;
+    auto& caches = stream_cache ? *stream_cache : ctx->enc_cache;
+    caches.resize(n_layers);
+    if (reset_cache) {
+        for (int il = 0; il < n_layers; il++) {
+            auto& c = caches[il];
+            c.k_cache.clear();
+            c.v_cache.clear();
+            c.n_cached = 0;
+            c.conv_cache.assign((size_t)(K - 1) * d, 0.0f);
+            c.conv_cached = 0;
+        }
     }
 
     int n_chunks = (T_enc + chunk_size - 1) / chunk_size;
@@ -1261,34 +1281,31 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
     // Streaming graph cache keyed by (layer, T_new, T_cache).
     // Uses nemotron_build_block_streaming: FFN1 on new only, Q from new,
     // K/V from [cache_ch + new_post_ffn1], conv with causal pad, FFN2+LN on new.
-    struct layer_graph {
-        ggml_context* ctx0 = nullptr;
-        ggml_cgraph* gf = nullptr;
-    };
-    std::map<std::tuple<int, int, int>, layer_graph> graph_cache;
+    nemotron_stream_graph_cache local_graphs;
+    auto& graph_cache = local_graphs;
 
-    auto get_or_build = [&](int il, int T_new, int T_cache, bool has_conv_cache) -> layer_graph& {
+    auto get_or_build = [&](int il, int T_new, int T_cache, bool has_conv_cache) -> nemotron_stream_layer_graph& {
         // Key includes has_conv_cache (bit-packed into T_cache sign is awkward; use a 4th field)
         auto key = std::make_tuple(il, T_new, T_cache + (has_conv_cache ? 10000 : 0));
         auto it = graph_cache.find(key);
         if (it != graph_cache.end())
-            return it->second;
+            return *it->second;
         size_t msz = ggml_tensor_overhead() * 2048 + ggml_graph_overhead_custom(2048, false);
-        auto* meta = new std::vector<uint8_t>(msz);
-        ggml_init_params ip2 = {msz, meta->data(), true};
-        layer_graph lg;
-        lg.ctx0 = ggml_init(ip2);
-        lg.gf = ggml_new_graph_custom(lg.ctx0, 2048, false);
+        auto lg = std::make_unique<nemotron_stream_layer_graph>();
+        lg->meta.resize(msz);
+        ggml_init_params ip2 = {msz, lg->meta.data(), true};
+        lg->ctx0 = ggml_init(ip2);
+        lg->gf = ggml_new_graph_custom(lg->ctx0, 2048, false);
 
         // Input: new frames (pre-FFN1 input for this layer)
-        ggml_tensor* inp_new = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, T_new);
+        ggml_tensor* inp_new = ggml_new_tensor_2d(lg->ctx0, GGML_TYPE_F32, d, T_new);
         ggml_set_name(inp_new, "block_in");
         ggml_set_input(inp_new);
 
         // Cache: post-FFN1 output from previous chunks (nullptr for first chunk)
         ggml_tensor* cache_ch = nullptr;
         if (T_cache > 0) {
-            cache_ch = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, T_cache);
+            cache_ch = ggml_new_tensor_2d(lg->ctx0, GGML_TYPE_F32, d, T_cache);
             ggml_set_name(cache_ch, "cache_ch");
             ggml_set_input(cache_ch);
         }
@@ -1296,33 +1313,34 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
         // Conv cache: last K-1 frames of pre-DW-conv signal from previous chunk
         ggml_tensor* conv_cache = nullptr;
         if (has_conv_cache) {
-            conv_cache = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, K - 1);
+            conv_cache = ggml_new_tensor_2d(lg->ctx0, GGML_TYPE_F32, d, K - 1);
             ggml_set_name(conv_cache, "conv_cache_in");
             ggml_set_input(conv_cache);
         }
 
         // Pos enc covers the full attention window
         int T_full = T_cache + T_new;
-        ggml_tensor* pos2 = ggml_new_tensor_2d(lg.ctx0, GGML_TYPE_F32, d, 2 * T_full - 1);
+        ggml_tensor* pos2 = ggml_new_tensor_2d(lg->ctx0, GGML_TYPE_F32, d, 2 * T_full - 1);
         ggml_set_name(pos2, "pos_enc");
         ggml_set_input(pos2);
 
-        ggml_tensor* out2 =
-            nemotron_build_block_streaming(lg.ctx0, inp_new, cache_ch, conv_cache, pos2, T_new, T_cache, m.enc[il], bp);
+        ggml_tensor* out2 = nemotron_build_block_streaming(lg->ctx0, inp_new, cache_ch, conv_cache, pos2, T_new,
+                                                           T_cache, m.enc[il], bp);
         ggml_set_name(out2, "block_out");
         ggml_set_output(out2);
-        ggml_build_forward_expand(lg.gf, out2);
+        ggml_build_forward_expand(lg->gf, out2);
 
         // Also expand cache outputs — they're not reachable from block_out's
         // dependency tree. Find them by scanning the ggml context's tensor list.
-        for (ggml_tensor* t = ggml_get_first_tensor(lg.ctx0); t; t = ggml_get_next_tensor(lg.ctx0, t)) {
+        for (ggml_tensor* t = ggml_get_first_tensor(lg->ctx0); t; t = ggml_get_next_tensor(lg->ctx0, t)) {
             if (t->name && (std::string(t->name) == "cache_ch_out" || std::string(t->name) == "conv_cache_out")) {
-                ggml_build_forward_expand(lg.gf, t);
+                ggml_build_forward_expand(lg->gf, t);
             }
         }
 
-        graph_cache[key] = lg;
-        return graph_cache[key];
+        auto* result = lg.get();
+        graph_cache.emplace(key, std::move(lg));
+        return *result;
     };
 
     if (!nemotron_ensure_sched(ctx))
@@ -1339,7 +1357,7 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
         std::vector<float> chunk_in(pre_enc + (size_t)t_start * d, pre_enc + (size_t)t_end * d);
 
         for (int il = 0; il < n_layers; il++) {
-            auto& cache = ctx->enc_cache[il];
+            auto& cache = caches[il];
             int n_ctx = std::min(cache.n_cached, L);
 
             bool has_conv = (cache.conv_cached > 0);
@@ -1456,11 +1474,6 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
             fprintf(stderr, "  chunk %d/%d (frames %d-%d, graphs=%zu)\n", ci + 1, n_chunks, t_start, t_end - 1,
                     graph_cache.size());
         }
-    }
-
-    // Cleanup
-    for (auto& [key, lg] : graph_cache) {
-        ggml_free(lg.ctx0);
     }
 
     if (getenv("CRISPASR_NEMOTRON_DEBUG")) {
@@ -2452,6 +2465,165 @@ extern "C" void nemotron_result_free(struct nemotron_result* r) {
 static nemotron_result* nemotron_transcribe_impl(nemotron_context* ctx, const float* samples, int n_samples,
                                                  int64_t t_offset_cs, nemotron_token_cb on_tok, void* on_tok_ud);
 
+static bool nemotron_run_preencode(nemotron_context* ctx, const float* mel, int T_mel, std::vector<float>& pre_enc,
+                                   int& T_enc, int& d_model) {
+    const auto& hp = ctx->model.hparams;
+    size_t meta_size = ggml_tensor_overhead() * 1024 + ggml_graph_overhead_custom(1024, false);
+    std::vector<uint8_t> meta(meta_size);
+    ggml_init_params ip = {meta_size, meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 1024, false);
+    ggml_tensor* mel_t = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int)hp.n_mels, T_mel);
+    ggml_set_name(mel_t, "mel");
+    ggml_set_input(mel_t);
+    int T_pre = 0;
+    ggml_tensor* pre =
+        nemotron_build_pre_encode(ctx0, mel_t, ctx->model.pre_encode, (int)hp.subsampling_channels, &T_pre);
+    ggml_set_name(pre, "pre_enc");
+    ggml_set_output(pre);
+    ggml_build_forward_expand(gf, pre);
+    if (!nemotron_ensure_sched(ctx)) {
+        ggml_free(ctx0);
+        return false;
+    }
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "nemotron: sched alloc pre-encode graph failed\n");
+        ggml_free(ctx0);
+        return false;
+    }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mel"), mel, 0, (size_t)hp.n_mels * T_mel * sizeof(float));
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "nemotron: pre-encode compute failed\n");
+        ggml_free(ctx0);
+        return false;
+    }
+    ggml_tensor* pre_out = ggml_graph_get_tensor(gf, "pre_enc");
+    T_enc = (int)pre_out->ne[1];
+    d_model = (int)pre_out->ne[0];
+    pre_enc.resize((size_t)T_enc * d_model);
+    ggml_backend_tensor_get(pre_out, pre_enc.data(), 0, pre_enc.size() * sizeof(float));
+    ggml_free(ctx0);
+    return true;
+}
+
+static void nemotron_apply_prompt(nemotron_context* ctx, std::vector<float>& enc_out, int T_enc, int d_model) {
+    if (!ctx->model.prompt_kernel.l0_w)
+        return;
+    const auto& pk = ctx->model.prompt_kernel;
+    const int n_prompts = (int)ctx->model.hparams.num_prompts;
+    const int pk_in = d_model + n_prompts;
+    const int pk_mid = (int)ctx->model.hparams.prompt_kernel_mid;
+    auto l0_w = tensor_to_f32(pk.l0_w);
+    auto l0_b = tensor_to_f32(pk.l0_b);
+    auto l2_w = tensor_to_f32(pk.l2_w);
+    auto l2_b = tensor_to_f32(pk.l2_b);
+    std::vector<float> lang(n_prompts, 0.0f);
+    if (ctx->prompt_id >= 0 && ctx->prompt_id < n_prompts)
+        lang[ctx->prompt_id] = 1.0f;
+    std::vector<float> prompted((size_t)T_enc * d_model);
+    std::vector<float> cat(pk_in), mid(pk_mid);
+    for (int t = 0; t < T_enc; t++) {
+        memcpy(cat.data(), enc_out.data() + (size_t)t * d_model, d_model * sizeof(float));
+        memcpy(cat.data() + d_model, lang.data(), n_prompts * sizeof(float));
+        for (int i = 0; i < pk_mid; i++) {
+            float s = l0_b[i];
+            const float* row = l0_w.data() + (size_t)i * pk_in;
+            for (int k = 0; k < pk_in; k++)
+                s += row[k] * cat[k];
+            mid[i] = s > 0.0f ? s : 0.0f;
+        }
+        float* out = prompted.data() + (size_t)t * d_model;
+        for (int i = 0; i < d_model; i++) {
+            float s = l2_b[i];
+            const float* row = l2_w.data() + (size_t)i * pk_mid;
+            for (int k = 0; k < pk_mid; k++)
+                s += row[k] * mid[k];
+            out[i] = s;
+        }
+    }
+    enc_out = std::move(prompted);
+}
+
+struct nemotron_stream {
+    nemotron_context* ctx = nullptr;
+    std::vector<float> audio;
+    size_t frontend_checked_samples = 0;
+    int processed_pre_frames = 0;
+    int decoded_frames = 0;
+    std::vector<nemotron_context::layer_cache> enc_cache;
+    nemotron_lstm_state decoder_state;
+    std::vector<float> pred_out;
+    std::unique_ptr<core_rnnt_ggml::Decoder> ggml_decoder;
+    bool decoder_initialized = false;
+    bool use_ggml_decoder = false;
+};
+
+static bool nemotron_stream_decode(nemotron_stream* stream, const float* enc, int T_enc, int d_model,
+                                   nemotron_token_cb cb, void* userdata) {
+    auto* ctx = stream->ctx;
+    nemotron_init_pred_weights(ctx);
+    nemotron_init_joint_weights(ctx);
+    const auto& W = ctx->pred_w;
+    const auto& J = ctx->joint_w;
+    const int blank_id = (int)ctx->model.hparams.blank_id;
+    if (!stream->decoder_initialized) {
+        stream->decoder_state.init(W.H);
+        stream->ggml_decoder = std::make_unique<core_rnnt_ggml::Decoder>();
+        stream->use_ggml_decoder = nemotron_init_ggml_decoder(ctx, *stream->ggml_decoder);
+        if (stream->use_ggml_decoder)
+            nemotron_predictor_step_ggml(ctx, *stream->ggml_decoder, blank_id, stream->decoder_state, stream->pred_out);
+        else
+            predictor_step(W, blank_id, stream->decoder_state, stream->pred_out);
+        stream->decoder_initialized = true;
+    }
+    for (int t = 0; t < T_enc; t++) {
+        std::vector<float> proj_e;
+        joint_proj_enc(J, enc + (size_t)t * d_model, proj_e);
+        for (int symbols = 0; symbols < 10; symbols++) {
+            std::vector<float> logits;
+            if (stream->use_ggml_decoder)
+                nemotron_joint_step_ggml(ctx, *stream->ggml_decoder, proj_e.data(), stream->pred_out.data(), logits);
+            else
+                joint_step(J, proj_e.data(), stream->pred_out.data(), logits);
+            float maxl = *std::max_element(logits.begin(), logits.end());
+            float sum = 0.0f;
+            for (float& value : logits) {
+                value = expf(value - maxl);
+                sum += value;
+            }
+            int tok = 0;
+            for (int v = 1; v < J.vocab_total; v++)
+                if (logits[v] > logits[tok])
+                    tok = v;
+            if (tok == blank_id)
+                break;
+            const float probability = logits[tok] / sum;
+            if (cb)
+                cb(tok, probability, userdata);
+            if (stream->use_ggml_decoder)
+                nemotron_predictor_step_ggml(ctx, *stream->ggml_decoder, tok, stream->decoder_state, stream->pred_out);
+            else
+                predictor_step(W, tok, stream->decoder_state, stream->pred_out);
+        }
+        stream->decoded_frames++;
+    }
+    return true;
+}
+
+static void nemotron_stream_clear(nemotron_stream* stream) {
+    stream->audio.clear();
+    stream->processed_pre_frames = 0;
+    stream->frontend_checked_samples = 0;
+    stream->decoded_frames = 0;
+    stream->enc_cache.clear();
+    stream->decoder_state = {};
+    stream->pred_out.clear();
+    stream->ggml_decoder.reset();
+    stream->decoder_initialized = false;
+    stream->use_ggml_decoder = false;
+}
+
 extern "C" char* nemotron_transcribe(struct nemotron_context* ctx, const float* samples, int n_samples) {
     nemotron_result* r = nemotron_transcribe_impl(ctx, samples, n_samples, 0, nullptr, nullptr);
     if (!r)
@@ -2714,6 +2886,79 @@ extern "C" void nemotron_transcribe_cb(struct nemotron_context* ctx, const float
         return;
     nemotron_result* r = nemotron_transcribe_impl(ctx, samples, n_samples, 0, cb, userdata);
     nemotron_result_free(r);
+}
+
+extern "C" struct nemotron_stream* nemotron_stream_create(struct nemotron_context* ctx) {
+    if (!ctx)
+        return nullptr;
+    auto* stream = new nemotron_stream;
+    stream->ctx = ctx;
+    return stream;
+}
+
+extern "C" void nemotron_stream_free(struct nemotron_stream* stream) {
+    delete stream;
+}
+
+extern "C" void nemotron_stream_reset(struct nemotron_stream* stream) {
+    if (stream)
+        nemotron_stream_clear(stream);
+}
+
+extern "C" int nemotron_stream_processed_frames(const struct nemotron_stream* stream) {
+    return stream ? stream->processed_pre_frames : 0;
+}
+
+extern "C" bool nemotron_stream_append(struct nemotron_stream* stream, const float* samples, int n_samples, bool flush,
+                                       nemotron_token_cb cb, void* userdata) {
+    if (!stream || !stream->ctx || n_samples < 0 || (n_samples > 0 && !samples))
+        return false;
+    if (n_samples > 0)
+        stream->audio.insert(stream->audio.end(), samples, samples + n_samples);
+    if (stream->audio.empty())
+        return true;
+
+    auto* ctx = stream->ctx;
+    const auto& hp = ctx->model.hparams;
+    const int chunk_size = hp.att_context_right[ctx->att_context_preset] + 1;
+    // A layer graph is rebuilt for each append because scheduler allocations
+    // cannot safely outlive sched_reset (#215e). Amortize that fixed cost on
+    // CPU while retaining the model's native single-chunk cadence on GPU.
+    const int chunks_per_step = core_cpu_backend::is_cpu(ctx->backend) ? 4 : 1;
+    const size_t raw_chunk_samples = (size_t)hp.hop_length * 8 * chunk_size * chunks_per_step;
+    if (!flush && stream->audio.size() - stream->frontend_checked_samples < raw_chunk_samples)
+        return true;
+    stream->frontend_checked_samples = stream->audio.size();
+    int T_mel = 0;
+    auto mel = nemotron_compute_mel_impl(ctx, stream->audio.data(), (int)stream->audio.size(), T_mel);
+    if (mel.empty() || T_mel <= 0)
+        return false;
+    std::vector<float> pre_enc;
+    int T_pre = 0, d_model = 0;
+    if (!nemotron_run_preencode(ctx, mel.data(), T_mel, pre_enc, T_pre, d_model))
+        return false;
+
+    // Centered STFT tail frames change when more PCM arrives. Hold one encoder
+    // chunk until the next append; a commit flushes the final short chunk.
+    int target = flush ? T_pre : std::max(0, T_pre - chunk_size);
+    if (!flush)
+        target = (target / chunk_size) * chunk_size;
+    if (target <= stream->processed_pre_frames)
+        return true;
+
+    const int n_new = target - stream->processed_pre_frames;
+    std::vector<float> enc_out;
+    const float* new_pre = pre_enc.data() + (size_t)stream->processed_pre_frames * d_model;
+    const bool first = stream->processed_pre_frames == 0;
+    if (!nemotron_run_encoder_chunked(ctx, new_pre, n_new, d_model, enc_out, &stream->enc_cache, first))
+        return false;
+    nemotron_apply_prompt(ctx, enc_out, n_new, d_model);
+    if (!nemotron_stream_decode(stream, enc_out.data(), n_new, d_model, cb, userdata))
+        return false;
+    stream->processed_pre_frames = target;
+    if (crispasr_env::get("CRISPASR_NEMOTRON_STREAM_DEBUG"))
+        fprintf(stderr, "nemotron: stream advanced %d new encoder frames (total=%d)\n", n_new, target);
+    return true;
 }
 
 extern "C" void nemotron_set_context_preset(struct nemotron_context* ctx, int preset) {
