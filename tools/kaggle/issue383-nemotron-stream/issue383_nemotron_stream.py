@@ -76,7 +76,10 @@ from transformers.audio_utils import load_audio  # noqa: E402
 
 model_id = "nvidia/nemotron-3.5-asr-streaming-0.6b"
 processor = AutoProcessor.from_pretrained(model_id)
-upstream_model = AutoModelForRNNT.from_pretrained(model_id, device_map="auto")
+# Kaggle's current PyTorch CUDA wheel starts at sm_70 while its assigned P100
+# is sm_60. CrispASR above is tested on CUDA; run this independent architectural
+# reference on CPU so framework wheel support cannot invalidate the comparison.
+upstream_model = AutoModelForRNNT.from_pretrained(model_id, device_map="cpu")
 processor.set_num_lookahead_tokens(6)
 audio = load_audio(str(jfk), sampling_rate=processor.feature_extractor.sampling_rate)
 first = processor(
