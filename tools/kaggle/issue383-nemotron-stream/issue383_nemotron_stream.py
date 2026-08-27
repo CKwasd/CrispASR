@@ -9,7 +9,7 @@ from pathlib import Path
 
 WORK = Path("/kaggle/working")
 REPO = WORK / "CrispASR"
-BUILD = WORK / "build"
+BUILD = REPO / "build"
 RESULTS = WORK / "issue383-results.json"
 REF = "fix/383-nemotron-realtime"
 
@@ -62,7 +62,7 @@ print(live.stdout, flush=True)
 ws = subprocess.run(
     [sys.executable, "-u", str(REPO / "tests/test-server-realtime-api.py"),
      "--backend", "nemotron", "--model", model, "--language", "en"],
-    cwd=REPO, env={**env, "CRISPASR_BINARY": str(BUILD / "bin/crispasr")},
+    cwd=REPO, env=env,
     text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True,
 )
 print(ws.stdout, flush=True)
