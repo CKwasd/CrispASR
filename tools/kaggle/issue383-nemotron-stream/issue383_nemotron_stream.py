@@ -77,7 +77,7 @@ from transformers.audio_utils import load_audio  # noqa: E402
 model_id = "nvidia/nemotron-3.5-asr-streaming-0.6b"
 processor = AutoProcessor.from_pretrained(model_id)
 upstream_model = AutoModelForRNNT.from_pretrained(model_id, device_map="auto")
-processor.set_num_lookahead_tokens(3)
+processor.set_num_lookahead_tokens(6)
 audio = load_audio(str(jfk), sampling_rate=processor.feature_extractor.sampling_rate)
 first = processor(
     audio[: processor.num_samples_first_audio_chunk],
@@ -107,7 +107,7 @@ generation_inputs.pop("input_features", None)
 generated = upstream_model.generate(
     **generation_inputs, input_features=features(), return_dict_in_generate=True,
 )
-upstream_text = processor.decode(generated.sequences, skip_special_tokens=False)
+upstream_text = processor.decode(generated.sequences, skip_special_tokens=True)
 print("UPSTREAM_STREAM_TRANSCRIPT:", upstream_text, flush=True)
 
 result = {
