@@ -1,5 +1,14 @@
 # CrispASR — Pending work
 
+## CLAIMED 2026-08-27 — Issue #383 true Nemotron realtime streaming
+
+Worktree: `.claude/worktrees/fix-383-nemotron-realtime`.
+Replace the commit-only safety fallback with an upstream-parity, persistent
+Nemotron streaming session: preserve frontend/encoder/RNNT state across
+WebSocket appends, emit genuine partials, flush and reset deterministically on
+commit, fix turn-cap overflow and backpressure/metrics semantics, and validate
+with unit, reference-parity, long-session, live model, and relevant GPU tests.
+
 ## CLAIMED 2026-08-19 — Issue #375 Canary streaming regression
 
 Root cause found + fixed 2026-08-19: NOT `73bb9b2f` (exonerated,
