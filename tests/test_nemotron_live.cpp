@@ -23,6 +23,31 @@ static std::string get_env(const char* name, const char* fallback = "") {
     return v ? v : fallback;
 }
 
+struct scoped_env {
+    std::string name;
+    std::string old_value;
+    bool had_value;
+    scoped_env(const char* key, const char* value) : name(key), had_value(std::getenv(key) != nullptr) {
+        if (had_value)
+            old_value = std::getenv(key);
+#ifdef _WIN32
+        _putenv_s(key, value);
+#else
+        setenv(key, value, 1);
+#endif
+    }
+    ~scoped_env() {
+#ifdef _WIN32
+        _putenv_s(name.c_str(), had_value ? old_value.c_str() : "");
+#else
+        if (had_value)
+            setenv(name.c_str(), old_value.c_str(), 1);
+        else
+            unsetenv(name.c_str());
+#endif
+    }
+};
+
 // Chunk-skipping 16-bit PCM WAV loader.
 static std::vector<float> load_wav_16k_mono(const std::string& path) {
     std::vector<float> pcm;
@@ -150,11 +175,7 @@ TEST_CASE("nemotron: persistent stream matches one-shot chunked decode", "[nemot
     nemotron_context* ctx = nemotron_init_from_file(model.c_str(), cp);
     REQUIRE(ctx != nullptr);
 
-#ifdef _WIN32
-    _putenv_s("CRISPASR_NEMOTRON_STREAMING", "1");
-#else
-    setenv("CRISPASR_NEMOTRON_STREAMING", "1", 1);
-#endif
+    scoped_env streaming_env("CRISPASR_NEMOTRON_STREAMING", "1");
     char* expected_raw = nemotron_transcribe(ctx, pcm.data(), (int)pcm.size());
     REQUIRE(expected_raw != nullptr);
     std::string expected(expected_raw);
