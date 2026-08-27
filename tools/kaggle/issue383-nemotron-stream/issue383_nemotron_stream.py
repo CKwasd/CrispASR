@@ -102,8 +102,10 @@ def features():
         start = mel_idx * hop - n_fft // 2
 
 
+generation_inputs = dict(first)
+generation_inputs.pop("input_features", None)
 generated = upstream_model.generate(
-    **first, input_features=features(), return_dict_in_generate=True,
+    **generation_inputs, input_features=features(), return_dict_in_generate=True,
 )
 upstream_text = processor.decode(generated.sequences, skip_special_tokens=False)
 print("UPSTREAM_STREAM_TRANSCRIPT:", upstream_text, flush=True)
