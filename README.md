@@ -34,10 +34,12 @@ live transcription + TTS + language detection, auto-deployed from `hf-space/`.
 
 ## Table of contents
 
+- [**Start here**](#start-here) — new to CrispASR? Two commands to your first working audio, no repo clone needed
 - [Supported backends](#supported-backends) — [ASR](#asr-backends) + [TTS](#text-to-speech-models) + [translation](#translation) + [post-processing](#post-processing-models) + [music & audio analysis](#music--audio-analysis)
 - [Feature matrix](#feature-matrix)
 - [Install & build](#install--build) — quick install (full guide in [docs/install.md](docs/install.md)); **[which prebuilt Linux tarball to download](docs/install.md#prebuilt-linux-tarballs--which-one-to-download-355)** — the `-cuda` / `-hip` / `-vulkan` builds require the matching GPU driver and do **not** fall back to CPU
 - [Quick start — ASR](#quick-start)
+- [Troubleshooting](docs/troubleshooting.md) — it printed the banner and stopped, reading the exit code, `--no-gpu` bisect, which Windows zip
 - [**Text-to-Speech (TTS)**](docs/tts.md) — 52 engines: Kokoro, Qwen3-TTS, VibeVoice, dots.tts, Orpheus, Chatterbox, IndexTTS, Irodori, VoxCPM2, CosyVoice3, CSM, Dia, Zonos, Bark, Piper, MeloTTS, and more
 - [Streaming & live transcription](docs/streaming.md)
 - [Server mode (HTTP API)](docs/server.md)
@@ -54,6 +56,77 @@ live transcription + TTS + language detection, auto-deployed from `hf-space/`.
 - [GPU backend selection](#gpu-backend-selection)
 - [Debugging & profiling](#debugging--profiling)
 - [Credits](#credits)
+
+---
+
+## Start here
+
+Everything below this section is a catalogue — 100+ backends, browse it when you
+need one. If you just want CrispASR *working*, this is the whole path. No repo
+clone, no Python, no model hunting.
+
+### 1. Get the binary
+
+Download one file from [**Releases**](https://github.com/CrispStrobe/CrispASR/releases/latest)
+and unzip it:
+
+| Platform | Download | Notes |
+|---|---|---|
+| **Windows** | `crispasr-windows-x86_64-cpu.zip` | Needs AVX2 (2013+ Intel / 2015+ AMD). Older CPU → `…-cpu-legacy.zip` |
+| **Windows + NVIDIA** | `crispasr-windows-x86_64-cuda.zip` | Self-contained; a CUDA Toolkit install is **not** required |
+| **macOS** | `crispasr-macos.tar.gz` | Metal GPU support built in |
+| **Linux** | `crispasr-linux-x86_64.tar.gz` | `…-cuda.tar.gz` / `…-vulkan.tar.gz` for GPU |
+
+Prefer to build it yourself? See [Install & build](#install--build). GPU builds
+require the matching driver and do **not** fall back to CPU.
+
+Check it runs — this should print a version banner and exit:
+
+```bash
+crispasr --version          # Windows: .\crispasr.exe --version
+```
+
+### 2. Make it speak
+
+`-m auto` downloads the model on first use (~135 MB here) and reuses it
+afterwards — nothing to find or install. It lands in `~/.cache/crispasr/`
+(`%USERPROFILE%\.cache\crispasr` on Windows).
+
+```bash
+crispasr --backend kokoro -m auto --tts "The quick brown fox jumps over the lazy dog." --tts-output hello.wav
+# crispasr: TTS output written to 'hello.wav' (78000 samples @ 24000 Hz, 3.25 sec)
+```
+
+Play `hello.wav`. That is the TTS half working.
+
+### 3. Transcribe it back
+
+```bash
+crispasr --backend parakeet -m auto -f hello.wav -l en
+# crispasr: transcribed 3.2s audio in 0.32s (10.1x realtime)
+# The quick brown fox jumps over the lazy dog.
+```
+
+(~467 MB on first run. `-l en` skips language auto-detection, which would
+otherwise fetch a small extra model.) Both halves now work — swap in your own
+`.wav` and you are running.
+
+### Where to go next
+
+| You want to… | Go to |
+|---|---|
+| Clone a voice from a recording | [docs/tts.md](docs/tts.md) — and read [the consent rules](docs/eu-ai-act.md) first; cloning requires `--i-have-rights` |
+| Pick a better ASR model | [Which backend should I pick?](#which-backend-should-i-pick) |
+| Transcribe with word timestamps, SRT/VTT | [docs/cli.md](docs/cli.md) |
+| Live mic / streaming | [docs/streaming.md](docs/streaming.md) |
+| Run it as an HTTP server | [docs/server.md](docs/server.md) |
+| See every backend this binary has | `crispasr --list-backends` |
+
+### If nothing happened
+
+If a command printed its banner and then simply stopped — no error, no output
+file — that is a crash, not a refusal, and the exit code identifies it in one
+step. See **[docs/troubleshooting.md](docs/troubleshooting.md)**.
 
 ---
 
@@ -553,6 +626,11 @@ green at cos≥0.999 across 8 multilingual smoke samples.
 
 ## Install & build
 
+**Don't want to build?** Prebuilt binaries for Windows, macOS and Linux are on
+the [releases page](https://github.com/CrispStrobe/CrispASR/releases/latest) —
+see [Start here](#start-here) for which file to take. The rest of this section
+is for building from source.
+
 ```bash
 git clone --recursive https://github.com/CrispStrobe/CrispASR
 cd CrispASR
@@ -583,11 +661,17 @@ all GPU backends (CUDA / Metal / Vulkan / MUSA / SYCL), Windows
 convenience scripts, ffmpeg ingestion, optional BLAS, glibc notes,
 and the `scripts/dev-build.sh` wrapper.
 
+If a build runs but the binary exits with no output, see
+[`docs/troubleshooting.md`](docs/troubleshooting.md).
+
 ---
 
 ## Quick start
 
-ASR examples below; for TTS see the [Text-to-Speech](#text-to-speech-models) section.
+Deeper ASR examples below. If this is your first run, use
+[Start here](#start-here) instead. For TTS, the runnable guide is
+[docs/tts.md](docs/tts.md) ([Text-to-Speech](#text-to-speech-models) below is
+the model catalogue).
 
 ### Whisper (historical path, byte-identical to upstream whisper.cpp)
 

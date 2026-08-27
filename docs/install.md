@@ -56,6 +56,10 @@ prints its banner and exits with no output and no error (issue #380). Since
 that report the CLI checks at startup and prints an explicit error instead
 (`CRISPASR_IGNORE_CPU_ISA=1` overrides).
 
+> Hitting that "banner, then nothing" symptom on a machine that *does* have
+> AVX2? It is still a crash, and the exit code says which kind — see
+> [troubleshooting.md](troubleshooting.md#it-printed-the-banner-then-nothing-happened).
+
 For pre-AVX2 CPUs use **`crispasr-windows-x86_64-cpu-legacy.zip`** — a generic
 x86-64/SSE2-floor build (`CRISPASR_PORTABLE_CPU=ON`) that runs on anything
 from Westmere up, just slower per core. Check with `wmic cpu get name` and
