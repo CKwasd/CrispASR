@@ -71,8 +71,7 @@ kh.step("cpp.cuda.live.done")
 # Run NVIDIA's model-card generator shape verbatim: first centered chunk,
 # subsequent non-centered overlapping raw windows, persistent encoder/padding/
 # RNNT caches owned by model.generate().
-from threading import Thread  # noqa: E402
-from transformers import AutoModelForRNNT, AutoProcessor, TextIteratorStreamer  # noqa: E402
+from transformers import AutoModelForRNNT, AutoProcessor  # noqa: E402
 from transformers.audio_utils import load_audio  # noqa: E402
 
 model_id = "nvidia/nemotron-3.5-asr-streaming-0.6b"
@@ -103,11 +102,10 @@ def features():
         start = mel_idx * hop - n_fft // 2
 
 
-streamer = TextIteratorStreamer(processor.tokenizer, skip_special_tokens=False)
-thread = Thread(target=upstream_model.generate, kwargs={**first, "input_features": features(), "streamer": streamer})
-thread.start()
-upstream_text = "".join(streamer)
-thread.join()
+generated = upstream_model.generate(
+    **first, input_features=features(), return_dict_in_generate=True,
+)
+upstream_text = processor.decode(generated.sequences, skip_special_tokens=False)
 print("UPSTREAM_STREAM_TRANSCRIPT:", upstream_text, flush=True)
 
 result = {
