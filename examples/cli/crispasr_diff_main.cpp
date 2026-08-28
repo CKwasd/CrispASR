@@ -142,8 +142,28 @@ static char* portable_mkdtemp(char* tpl) {
     tpl[strlen(unique)] = '\0';
     return tpl;
 }
+// setenv/unsetenv are POSIX; MSVC has only _putenv_s. Two of the ~10 call
+// sites in this file wrapped that by hand in #ifdef _WIN32 / #else, and the
+// rest did not — so crispasr-diff did not compile on MSVC at all
+// (error C3861: 'setenv': identifier not found). Nothing noticed, because
+// ci.yml's Windows job builds only crispasr-cli plus three named tests;
+// build.yml's msbuild ALL_BUILD is the only thing that compiles this file on
+// Windows, and it has been red since 2026-08-18.
+//
+// Shim it the same way mkdtemp and rmdir already are, so every call site
+// works unchanged. _putenv_s always overwrites, which matches every call
+// here (they all pass overwrite=1).
+static int portable_setenv(const char* name, const char* value, int overwrite) {
+    (void)overwrite;
+    return _putenv_s(name, value);
+}
+static int portable_unsetenv(const char* name) {
+    return _putenv_s(name, "");
+}
 #define mkdtemp portable_mkdtemp
 #define rmdir _rmdir
+#define setenv portable_setenv
+#define unsetenv portable_unsetenv
 #else
 #include <unistd.h>
 #endif
