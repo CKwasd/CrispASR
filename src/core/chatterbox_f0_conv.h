@@ -3,6 +3,7 @@
 #include "core/parallel_for.h"
 
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <vector>
@@ -84,7 +85,15 @@ inline void run_scalar_rows(const Conv1dEluK3& conv, int begin, int end) {
     }
 }
 
+// PRECONDITION: width divides conv.output_channels. `packed` is sized for
+// exactly output_channels entries, but the block layout below addresses
+// ceil(output_channels / width) WHOLE blocks — so a partial trailing block
+// would both read weights past output_channels and write past `packed`. The
+// only caller, Conv1dEluK3::run, enforces the divisibility before choosing a
+// width; this asserts it here too, because the guard and the code that
+// depends on it are 100 lines apart.
 inline std::vector<float> pack_weights(const Conv1dEluK3& conv, int width) {
+    assert(width > 0 && conv.output_channels % width == 0);
     std::vector<float> packed(static_cast<std::size_t>(conv.output_channels) * conv.input_channels * 3);
     for (int output = 0; output < conv.output_channels; output += width) {
         const int block = output / width;
@@ -204,13 +213,21 @@ inline void Conv1dEluK3::run_scalar(int n_threads) const {
                                   [this](int begin, int end) { detail::run_scalar_rows(*this, begin, end); });
 }
 
+// `isa` is a CEILING, not an exact request: each kernel needs
+// output_channels to be a whole number of its vector width, so a width that
+// does not divide falls through to the next narrower one. Without the
+// cascade, asking for avx512f with output_channels % 16 != 0 skipped AVX2
+// entirely and landed on scalar — e.g. 520 channels (a multiple of 8, not of
+// 16) ran ~8x slower than it had to. The F0 predictor only ever passes 512,
+// so this is about reuse of this header, not about today's caller.
 inline void Conv1dEluK3::run(int n_threads, Isa isa) const {
 #if CRISPASR_CHATTERBOX_F0_X86_TARGET_DISPATCH
-    if (isa == Isa::avx512f && isa_available(isa) && output_channels % detail::avx512_width == 0) {
+    if (isa == Isa::avx512f && isa_available(Isa::avx512f) && output_channels % detail::avx512_width == 0) {
         detail::run_simd(*this, detail::avx512_width, n_threads, detail::run_avx512_rows);
         return;
     }
-    if (isa == Isa::avx2 && isa_available(isa) && output_channels % detail::avx2_width == 0) {
+    if ((isa == Isa::avx2 || isa == Isa::avx512f) && isa_available(Isa::avx2) &&
+        output_channels % detail::avx2_width == 0) {
         detail::run_simd(*this, detail::avx2_width, n_threads, detail::run_avx2_rows);
         return;
     }
