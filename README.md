@@ -124,6 +124,10 @@ otherwise fetch a small extra model.) Both halves now work — swap in your own
 
 ### If nothing happened
 
+Add `-v` to any command for verbose progress, and `--dry-run-resolve` to print
+which model files it would open (and whether they're on disk) without loading
+anything.
+
 If a command printed its banner and then simply stopped — no error, no output
 file — that is a crash, not a refusal, and the exit code identifies it in one
 step. See **[docs/troubleshooting.md](docs/troubleshooting.md)**.
