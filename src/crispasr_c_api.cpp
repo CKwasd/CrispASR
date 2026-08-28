@@ -7402,11 +7402,30 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_vad(crispasr_sess
 // Returns 0 on success, 1 when Pyannote was requested but the model
 // failed to load, -1 on invalid arguments. `speaker = -1` in a seg
 // means the method had no information to pick a label for that segment.
+//
+// #395: crispasr_diarize_segments_turns_abi below is the same call plus the
+// audio-derived speaker turns, for callers that need to resolve a speaker
+// change INSIDE one of their own segments.
 // ---------------------------------------------------------------------------
 struct crispasr_diarize_seg_abi {
     int64_t t0_cs;
     int64_t t1_cs;
     int32_t speaker; // out: -1 if unassigned
+    int32_t _pad;
+};
+
+// #395: a speaker turn the METHOD derived from the audio, independent of the
+// caller's segment grid. Only FoxNose produces these; the other methods label
+// caller segments directly and emit none.
+//
+// Same centisecond units AND the same absolute timeline as
+// crispasr_diarize_seg_abi: the library works buffer-relative, and this ABI
+// adds `opts->slice_t0_cs` back on the way out, so a turn can be compared with
+// a caller segment without a frame conversion.
+struct crispasr_diarize_turn_abi {
+    int64_t t0_cs;
+    int64_t t1_cs;
+    int32_t speaker; // dense, zero-based; never -1
     int32_t _pad;
 };
 
@@ -7443,6 +7462,8 @@ struct crispasr_diarize_opts_abi {
 static constexpr bool k_abi_is_64bit = sizeof(void*) == 8;
 static_assert(!k_abi_is_64bit || sizeof(crispasr_diarize_seg_abi) == 24,
               "diarize seg ABI layout changed — update every binding mirror");
+static_assert(!k_abi_is_64bit || sizeof(crispasr_diarize_turn_abi) == 24,
+              "diarize turn ABI layout changed — update every binding mirror");
 static_assert(!k_abi_is_64bit || sizeof(crispasr_diarize_opts_abi) == 48,
               "diarize opts ABI layout changed — update every binding mirror");
 static_assert(!k_abi_is_64bit || offsetof(crispasr_diarize_opts_abi, pyannote_model_path) == 16,
@@ -7452,12 +7473,28 @@ static_assert(!k_abi_is_64bit || offsetof(crispasr_diarize_opts_abi, foxnose_emb
 static_assert(!k_abi_is_64bit || offsetof(crispasr_diarize_opts_abi, min_speakers) == 32,
               "diarize opts ABI layout drifted");
 
-CA_EXPORT int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm, int32_t n_samples,
-                                            int32_t is_stereo, crispasr_diarize_seg_abi* segs, int32_t n_segs,
-                                            const crispasr_diarize_opts_abi* opts) {
+// #395: the turn-forwarding superset of crispasr_diarize_segments_abi. Both
+// entry points share this body; the older one passes no turn buffer and is
+// byte-for-byte unchanged in behaviour.
+//
+// `out_turns` / `n_turns_cap` / `out_n_turns` are all optional:
+//   - out_n_turns non-NULL always receives the TOTAL number of turns the
+//     method derived, whether or not they fit (so a caller can size and
+//     retry — at the cost of a second full pass, since the ABI is stateless).
+//   - out_turns non-NULL receives up to n_turns_cap of them.
+// Returns 2 when a turn buffer was supplied and could not hold them all; the
+// segments are still fully labelled in that case, and the first n_turns_cap
+// turns are still written. With out_turns == NULL nothing can be truncated,
+// so the count query alone returns 0.
+static int diarize_segments_abi_impl(const float* left_pcm, const float* right_pcm, int32_t n_samples,
+                                     int32_t is_stereo, crispasr_diarize_seg_abi* segs, int32_t n_segs,
+                                     const crispasr_diarize_opts_abi* opts, crispasr_diarize_turn_abi* out_turns,
+                                     int32_t n_turns_cap, int32_t* out_n_turns) {
     if (!left_pcm || !segs || n_segs <= 0 || !opts)
         return -1;
     if (opts->method < 0 || opts->method > 4)
+        return -1;
+    if (n_turns_cap < 0)
         return -1;
 
     CrispasrDiarizeOptions lib_opts;
@@ -7478,14 +7515,69 @@ CA_EXPORT int crispasr_diarize_segments_abi(const float* left_pcm, const float* 
         lib_segs.push_back({segs[i].t0_cs, segs[i].t1_cs, segs[i].speaker});
 
     const float* r = (is_stereo && right_pcm) ? right_pcm : left_pcm;
-    const bool ok = crispasr_diarize_segments(left_pcm, r, n_samples, is_stereo != 0, lib_segs, lib_opts);
+    // Only collect turns when someone asked, so the legacy entry point keeps
+    // its allocation profile exactly.
+    std::vector<CrispasrDiarizeTurn> lib_turns;
+    const bool want_turns = (out_turns != nullptr) || (out_n_turns != nullptr);
+    const bool ok = crispasr_diarize_segments(left_pcm, r, n_samples, is_stereo != 0, lib_segs, lib_opts,
+                                              want_turns ? &lib_turns : nullptr);
     if (!ok)
         return 1;
 
     for (int i = 0; i < n_segs; i++) {
         segs[i].speaker = lib_segs[i].speaker;
     }
+
+    const int64_t n_turns = (int64_t)lib_turns.size();
+    if (out_n_turns)
+        *out_n_turns = (int32_t)std::min<int64_t>(n_turns, INT32_MAX);
+    if (out_turns) {
+        const int64_t n_copy = std::min<int64_t>(n_turns, n_turns_cap);
+        for (int64_t i = 0; i < n_copy; i++) {
+            const CrispasrDiarizeTurn& t = lib_turns[(size_t)i];
+            // Library turns are buffer-relative seconds; segments are absolute
+            // centiseconds. Hand back the frame the caller already speaks.
+            out_turns[i].t0_cs = opts->slice_t0_cs + (int64_t)std::llround(t.start_s * 100.0);
+            out_turns[i].t1_cs = opts->slice_t0_cs + (int64_t)std::llround(t.end_s * 100.0);
+            out_turns[i].speaker = t.speaker;
+            out_turns[i]._pad = 0;
+        }
+        if (n_turns > n_turns_cap)
+            return 2; // segments are labelled; the turn buffer was short
+    }
     return 0;
+}
+
+CA_EXPORT int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm, int32_t n_samples,
+                                            int32_t is_stereo, crispasr_diarize_seg_abi* segs, int32_t n_segs,
+                                            const crispasr_diarize_opts_abi* opts) {
+    return diarize_segments_abi_impl(left_pcm, right_pcm, n_samples, is_stereo, segs, n_segs, opts, nullptr, 0,
+                                     nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// #395: diarize AND hand back the audio-derived speaker turns.
+//
+// Identical to crispasr_diarize_segments_abi in every respect, plus the three
+// trailing turn parameters. A caller that passes NULL / 0 / NULL for them gets
+// exactly the older function.
+//
+// Why this exists: labelling alone can never resolve finer than the segment
+// grid the caller sent in — a segment straddling a speaker change is silently
+// awarded to whoever holds the majority of it. FoxNose derives its own turns
+// from the audio and already exposes them on the C++ API; callers with word
+// timestamps use them to SPLIT such a segment before labelling.
+//
+// Only FoxNose (method 4) derives turns. The other methods label the caller's
+// segments directly and report 0 turns — not an error.
+// ---------------------------------------------------------------------------
+CA_EXPORT int crispasr_diarize_segments_turns_abi(const float* left_pcm, const float* right_pcm, int32_t n_samples,
+                                                  int32_t is_stereo, crispasr_diarize_seg_abi* segs, int32_t n_segs,
+                                                  const crispasr_diarize_opts_abi* opts,
+                                                  crispasr_diarize_turn_abi* out_turns, int32_t n_turns_cap,
+                                                  int32_t* out_n_turns) {
+    return diarize_segments_abi_impl(left_pcm, right_pcm, n_samples, is_stereo, segs, n_segs, opts, out_turns,
+                                     n_turns_cap, out_n_turns);
 }
 
 // ---------------------------------------------------------------------------

@@ -207,7 +207,7 @@ Install: `pip install crispasr` (or build locally from `python/`).
 
 ```rust
 use crispasr::{
-    Session, DiarizeMethod, DiarizeOptions, DiarizeSegment,
+    Session, DiarizeMethod, DiarizeOptions, DiarizeSegment, DiarizeTurn,
     LidMethod, detect_language_pcm, align_words,
     cache_ensure_file, registry_default_bundle,
     // Diarize pipeline primitives (#107):
@@ -235,6 +235,17 @@ for s in &segs {
 }
 let labels = agglomerative_cluster(&flat, (flat.len() / emb.dim() as usize) as i32,
                                    emb.dim(), 0.5, 8)?;
+
+// #395: labels alone can only ever be as fine as the grid you send in. Ask for
+// the turns FoxNose derived from the AUDIO to split a segment that spans two
+// speakers. Segments are labelled exactly as diarize_segments() labels them;
+// the other methods return an empty Vec, which is not an error.
+let mut grid: Vec<DiarizeSegment> = /* your coarse, well-clustering segments */ vec![];
+let turns: Vec<DiarizeTurn> =
+    crispasr::diarize_segments_with_turns(&mut grid, &pcm, None, false, &opts)?;
+for t in &turns {
+    println!("{:.2}–{:.2} speaker {}", t.t0, t.t1, t.speaker); // caller's timeline
+}
 ```
 
 Crates: `crispasr-sys/` (raw FFI) + `crispasr/` (high-level) at the repo

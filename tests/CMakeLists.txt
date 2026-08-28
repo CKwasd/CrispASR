@@ -724,6 +724,29 @@ catch_discover_tests(test-diarize-pyannote-live
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test-diarize-foxnose-turns-live — the #395 turn-forwarding ABI ───────────
+#
+# Everything about crispasr_diarize_segments_turns_abi that needs REAL turns,
+# and therefore a real speaker embedder: well-formedness, the truncation
+# protocol, the absolute-timeline conversion, and "asking for turns does not
+# change the labels". The model-free half of the contract is in
+# test-session-abi-nulls.cpp. Opt-in via CRISPASR_TEST_FOXNOSE_WAV +
+# CRISPASR_TEST_FOXNOSE_EMBEDDER; skips cleanly without them.
+add_executable(test-diarize-foxnose-turns-live
+    test-diarize-foxnose-turns-live.cpp
+)
+target_link_libraries(test-diarize-foxnose-turns-live PRIVATE
+    Catch2::Catch2WithMain
+    crispasr-lib
+)
+catch_discover_tests(test-diarize-foxnose-turns-live
+    TEST_SPEC "[live]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # Agglomerative cosine clustering used by --diarize-embedder (#107 P3b).
 # Pure arithmetic on synthetic embeddings; no model, no audio.
 add_executable(test-speaker-cluster
