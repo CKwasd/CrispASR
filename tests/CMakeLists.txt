@@ -42,6 +42,20 @@ catch_discover_tests(test-chatterbox-f0-simd
     TEST_SPEC "[unit][tts][chatterbox][simd]"
     PROPERTIES LABELS "unit;tts;chatterbox")
 
+add_executable(test-chatterbox-hift-simdconv test-chatterbox-hift-simdconv.cpp)
+target_include_directories(test-chatterbox-hift-simdconv PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-chatterbox-hift-simdconv PRIVATE Catch2::Catch2WithMain Threads::Threads)
+catch_discover_tests(test-chatterbox-hift-simdconv
+    TEST_SPEC "[unit][tts][chatterbox][hift][simdconv]"
+    PROPERTIES LABELS "unit;tts;chatterbox")
+
+add_executable(test-cosyvoice3-hift-simdconv test-cosyvoice3-hift-simdconv.cpp)
+target_include_directories(test-cosyvoice3-hift-simdconv PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-cosyvoice3-hift-simdconv PRIVATE Catch2::Catch2WithMain Threads::Threads)
+catch_discover_tests(test-cosyvoice3-hift-simdconv
+    TEST_SPEC "[unit][tts][cosyvoice3][simdconv]"
+    PROPERTIES LABELS "unit;tts;cosyvoice3")
+
 set(TEST_TARGET test-crispasr-cli-tiny)
 add_test(NAME ${TEST_TARGET}
     COMMAND $<TARGET_FILE:crispasr-cli>

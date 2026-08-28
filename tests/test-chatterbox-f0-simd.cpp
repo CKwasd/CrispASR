@@ -63,24 +63,14 @@ void require_matches_scalar(int T, int C_in, int C_out, int n_threads, core_chat
     REQUIRE(std::memcmp(reference.data(), actual.data(), reference.size() * sizeof(float)) == 0);
 }
 
-const char* isa_name(core_chatterbox_f0::Isa isa) {
-    switch (isa) {
-    case core_chatterbox_f0::Isa::avx2:
-        return "avx2";
-    case core_chatterbox_f0::Isa::avx512f:
-        return "avx512f";
-    default:
-        return "scalar";
-    }
-}
-
 } // namespace
 
 // The F0 layers are all C_out = 512 (chatterbox_s3gen.cpp: `const int C = 512`),
 // with C_in 80 on the first layer and 512 after it. Both shapes are covered.
 TEST_CASE("Chatterbox F0 SIMD Conv1d is bit-identical to scalar", "[unit][tts][chatterbox][simd]") {
-    const std::array<core_chatterbox_f0::Isa, 3> candidates{{
+    const std::array<core_chatterbox_f0::Isa, 4> candidates{{
         core_chatterbox_f0::Isa::scalar,
+        core_chatterbox_f0::Isa::neon,
         core_chatterbox_f0::Isa::avx2,
         core_chatterbox_f0::Isa::avx512f,
     }};
@@ -103,17 +93,24 @@ TEST_CASE("Chatterbox F0 SIMD Conv1d is bit-identical to scalar", "[unit][tts][c
 // the host advertises an ISA that dispatch then refused to use.
 TEST_CASE("Chatterbox F0 SIMD reports which ISAs it actually exercised", "[unit][tts][chatterbox][simd]") {
     std::string exercised;
-    for (const auto isa : {core_chatterbox_f0::Isa::avx2, core_chatterbox_f0::Isa::avx512f}) {
+    const std::array<core_chatterbox_f0::Isa, 3> simd_isas{{
+        core_chatterbox_f0::Isa::neon,
+        core_chatterbox_f0::Isa::avx2,
+        core_chatterbox_f0::Isa::avx512f,
+    }};
+    for (const auto isa : simd_isas) {
         if (!core_chatterbox_f0::isa_available(isa))
             continue;
         exercised += exercised.empty() ? "" : ",";
         exercised += isa_name(isa);
     }
-    std::printf("[chatterbox-f0-simd] host: avx2=%d avx512f=%d ; best_isa=%s ; SIMD exercised: %s\n",
+    std::printf("[chatterbox-f0-simd] host: neon=%d avx2=%d avx512f=%d ; "
+                "best_isa=%s ; SIMD exercised: %s\n",
+                static_cast<int>(core_chatterbox_f0::isa_available(core_chatterbox_f0::Isa::neon)),
                 static_cast<int>(core_chatterbox_f0::isa_available(core_chatterbox_f0::Isa::avx2)),
                 static_cast<int>(core_chatterbox_f0::isa_available(core_chatterbox_f0::Isa::avx512f)),
                 isa_name(core_chatterbox_f0::best_isa()),
-                exercised.empty() ? "none (non-x86 or pre-AVX2 host)" : exercised.c_str());
+                exercised.empty() ? "none" : exercised.c_str());
 
     // best_isa() must pick the widest ISA the host actually has, or dispatch
     // has silently regressed to a slower path while every output still matches.
@@ -121,6 +118,8 @@ TEST_CASE("Chatterbox F0 SIMD reports which ISAs it actually exercised", "[unit]
         REQUIRE(core_chatterbox_f0::best_isa() == core_chatterbox_f0::Isa::avx512f);
     else if (core_chatterbox_f0::isa_available(core_chatterbox_f0::Isa::avx2))
         REQUIRE(core_chatterbox_f0::best_isa() == core_chatterbox_f0::Isa::avx2);
+    else if (core_chatterbox_f0::isa_available(core_chatterbox_f0::Isa::neon))
+        REQUIRE(core_chatterbox_f0::best_isa() == core_chatterbox_f0::Isa::neon);
     else
         REQUIRE(core_chatterbox_f0::best_isa() == core_chatterbox_f0::Isa::scalar);
 }
