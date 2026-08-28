@@ -11,7 +11,16 @@ namespace CrispASR
     /// </summary>
     internal static class NativeMethods
     {
-        private const string Lib = "crispasr";
+        // One name, shared with NativeLibraryResolver — the resolver only
+        // intercepts loads of exactly this name, so the two must not drift.
+        private const string Lib = NativeLibraryResolver.LibraryName;
+
+        // An explicit type initializer clears `beforefieldinit`, so the CLR is
+        // required to run this before the first static member of the class is
+        // touched — i.e. before any P/Invoke below can attempt a load. That is
+        // what makes the resolver's search order authoritative rather than a
+        // race against default probing.
+        static NativeMethods() => NativeLibraryResolver.Install();
 
         // ---- Session lifecycle ----
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
@@ -647,6 +656,31 @@ namespace CrispASR
         internal static extern int crispasr_cache_dir_abi(
             [MarshalAs(UnmanagedType.LPUTF8Str)] string? cacheDirOverride,
             byte[] outBuf, int outCap);
+
+        // ---- Audio decode (issue #291: the binding had no way to read a file) ----
+        // Decode any supported format to mono float32 PCM. *out_pcm is
+        // malloc-owned by the native side — release it with crispasr_audio_free.
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_audio_load(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+            out IntPtr outPcm, out int outSamples, out int outSampleRate);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int crispasr_audio_load_at_rate(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int targetRate,
+            out IntPtr outPcm, out int outSamples, out int outSampleRate);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void crispasr_audio_free(IntPtr pcm);
+
+        // Returns malloc'd WAV bytes; released with crispasr_c2pa_free (the
+        // shared free for the C2PA/provenance byte-buffer family, per crispasr.h).
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern IntPtr crispasr_pcm_to_wav(
+            float[] pcm, int nSamples, int sampleRate, out UIntPtr outLen);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void crispasr_c2pa_free(IntPtr p);
 
         // ---- Helpers ----
         internal static string NullTerminated(byte[] buf)

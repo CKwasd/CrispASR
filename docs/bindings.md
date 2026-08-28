@@ -71,7 +71,7 @@ exposes them as struct/class members on its segment type.
 | C-ABI accessor | Member (Python/Rust/Go/Dart/Java/C#/Ruby) | Notes |
 |---|---|---|
 | `result_segment_text(r, i)` | `text` / `text` / `Text` / `text` / `text` / `Text` / `:text` | The segment transcript. |
-| `result_segment_t0/t1(r, i)` | `start`,`end` / `start`,`end` / `T0`,`T1` / `start`,`end` / `t0`,`t1` / `T0`,`T1` / `:t0`,`:t1` | Centiseconds on the C ABI; Python/Rust/Dart divide to seconds. |
+| `result_segment_t0/t1(r, i)` | `start`,`end` / `start`,`end` / `T0`,`T1` / `start`,`end` / `t0`,`t1` / `T0`,`T1` / `:t0`,`:t1` | Centiseconds on the C ABI. **Python/Rust/Dart/Ruby/C# divide to seconds; Go and Java hand the raw centiseconds through** (both document the unit on the field). C# joined the seconds side after issue #291 — it had been reporting centiseconds through `Segment`/`Word`/`AlignedWord` while every other time value in that binding (`VadSpan`, the music types) was seconds (issue #291). A backend with no timing for a unit reports `-1` there, and the seconds bindings pass that sentinel through unscaled rather than reporting `-0.01`. |
 | `result_segment_no_speech_prob(r, i)` | `no_speech_prob` / … / `NoSpeechProb` / `noSpeechProb` / … / `:no_speech_prob` | Whisper only; `-1.0` sentinel = no data. |
 | `result_segment_speaker(r, i)` | `speaker` / `speaker` / `Speaker` / `speaker` / `speaker` / `Speaker` / `:speaker` | **New in v0.8.24.** Native per-segment speaker label in the `"(Speaker N) "` form, `""` when the backend does not diarize natively. |
 | `result_n_words` + `result_word_*` | `words` (list of word objects) | Per-word text/timings/confidence, plus `alts` where the backend emits them. |

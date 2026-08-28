@@ -382,9 +382,30 @@ Rules when you touch one of these structs:
    calls to the wrong method. The index-parity tests pin this.
 
 **C# is CI-tested** (`.github/workflows/bindings-csharp.yml`) — it compiles the
-binding against the ABI and runs `CrispASR.Tests`. Do not let it drift; it was
-unbuilt for a long time and shipped a units bug (#291) precisely because nothing
-compiled the wrapper against the header.
+binding against the ABI and runs `CrispASR.Tests` on **ubuntu and windows**, each
+against a real moonshine GGUF and `samples/jfk.wav`, with
+`CRISPASR_CS_REQUIRE_LIVE=1` so a skipped live test is a failure. Do not let it
+drift; it was unbuilt for a long time and shipped a units bug (#291) precisely
+because nothing compiled the wrapper against the header.
+
+Three C#-specific rules the second round of #291 established:
+- **The managed assembly is `CrispASR.Net.dll`, never `CrispASR.dll`** — the
+  native library is `crispasr.dll` and Windows file names are case-insensitive,
+  so the two would be one file. `NativeLibraryResolverTests` pins this on every
+  platform, including the Linux ones where the collision cannot occur.
+- **Every time value the binding exposes is SECONDS** (`Segment`, `Word`,
+  `AlignedWord`, `VadSpan`, `StreamingUpdate`, the music types). Convert at the
+  boundary via `Session.Seconds()`, which also preserves the C ABI's `-1`
+  "no timing" sentinel instead of scaling it to `-0.01`.
+- **A live test may not skip silently in CI.** Route every guard through
+  `Live` (`bindings/csharp/CrispASR.Tests/Live.cs`); a bare
+  `if (!CanLoadLibrary()) return;` makes the suite green on a machine with no
+  native library at all, which is how "all xunit tests pass" came to mean
+  nothing.
+
+`bindings/csharp/README.md` is the consumer-facing guide: which release archive
+to download, where to put the native library, and the `CRISPASR_LIBRARY_PATH`
+escape hatch.
 
 ### Docs
 - `README.md` — model-table row (TTS or ASR section).
