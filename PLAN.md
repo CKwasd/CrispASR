@@ -1,5 +1,17 @@
 # CrispASR — Pending work
 
+## CLAIMED 2026-08-28 — #397 Windows first-run recovery and release proof
+
+Worktree: `.claude/worktrees/fix-397-windows-release-proof`.
+Correct the missed diagnosis in #397 (the reporter's v0.8.29 Windows CUDA
+`ggml-cpu.dll` executes AVX-512 at the exact dumped `+0x98e9` offset, already
+root-caused in #374), make the beginner PowerShell path genuinely copy-pasteable,
+and stop describing every SIGILL as user CPU error. Add post-package gates that
+prove an AVX2 artifact contains no ZMM instructions and embeds the release tag's
+SHA, plus a Windows archive E2E that runs the exact packaged CLI through Kokoro
+TTS and a Parakeet round-trip. Audit the in-flight v0.8.30 repair run and its
+asset provenance before declaring the release stable.
+
 ## CLAIMED 2026-08-26 — #395 FoxNose turns were unreachable from the C ABI
 
 Additive plumbing of a value the library already computed. `apply_foxnose`
