@@ -25,6 +25,7 @@
 #include <random>
 #include <set>
 #include <vector>
+#include "portable_env.h"
 
 using namespace core_spectral;
 

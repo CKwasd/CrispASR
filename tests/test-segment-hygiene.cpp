@@ -15,6 +15,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "portable_env.h"
 
 #ifndef CRISPASR_SOURCE_DIR
 #error "CRISPASR_SOURCE_DIR must be defined by the build"
