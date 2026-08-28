@@ -289,8 +289,9 @@ for them and you get the audio's own boundaries, independent of your grid:
 | C++ | `crispasr_diarize_segments(..., std::vector<CrispasrDiarizeTurn>* out_turns)` |
 | C ABI | `crispasr_diarize_segments_turns_abi(...)` (0.8.30+) |
 | Rust | `crispasr::diarize_segments_with_turns(...) -> Result<Vec<DiarizeTurn>, String>` |
+| Go | `whisper.DiarizeSegmentsWithTurns(...) ([]DiarizeTurn, error)` |
 
-All three are additive: the segments come back labelled exactly as they would
+All four are additive: the segments come back labelled exactly as they would
 without the turns, and every other method reports zero turns rather than an
 error. Turn timestamps are on the **same absolute timeline as your segments**
 (the ABI adds `slice_t0_cs` back on the way out), so they compare directly.
@@ -307,8 +308,12 @@ Its turn buffer is caller-allocated: pass `out_n_turns` to learn the count,
 `out_turns` + `n_turns_cap` to receive them, and expect `2` when the buffer
 was short — the segments are still labelled, `*out_n_turns` holds the required
 capacity, and a retry costs a second full pass because the ABI keeps no state
-between calls. The Rust wrapper sizes the buffer from the audio length and
-hides all of that.
+between calls. The Rust and Go wrappers size the buffer from the audio length
+(one slot per 0.5 s, above FoxNose's 0.6 s embedding hop) and retry once on
+`2`, so their callers never see any of that.
+
+Java, JavaScript and Ruby wrap `crispasr_diarize_segments_abi` but not yet the
+turns symbol; nothing is broken there, they simply cannot reach the turns.
 
 ## pyannote segmentation: chunked inference and the powerset layout (#326)
 
