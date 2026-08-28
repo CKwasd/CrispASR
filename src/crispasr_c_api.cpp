@@ -1552,6 +1552,8 @@ struct crispasr_session {
     // already at their native rate.  Defaults to 16000 for back-compat.
     int pcm_sample_rate = 16000;
 
+    int tts_pad_silence_ms = 0;
+
     // Last synthesize error — populated by synthesize_raw_impl when it
     // returns nullptr so callers can surface a meaningful reason instead
     // of the generic "no audio produced". Cleared on every synthesize call.
@@ -8624,7 +8626,12 @@ CA_EXPORT int crispasr_session_tada_set_makeref_models(crispasr_session* s, cons
 // #316: drive the acoustic model with these phonemes, skipping the G2P.
 // Empty string clears it. Returns 0, -1 on a bad session, or -2 when the active
 // backend has no phonemes-in entry point (kokoro and piper do) — a soft no-op
-// like the other setters, so a caller can probe without special-casing.
+CA_EXPORT void crispasr_session_set_tts_pad_silence_ms(crispasr_session* s, int ms) {
+    if (s) {
+        s->tts_pad_silence_ms = ms;
+    }
+}
+
 CA_EXPORT int crispasr_session_set_tts_phonemes(crispasr_session* s, const char* phonemes) {
     if (!s)
         return -1;
@@ -9379,6 +9386,27 @@ static void crispasr_session_warn_unmarked_clone(crispasr_session* s) {
             ts, s->voice_is_clone ? "yes" : "no", crispasr_voice::to_string(identity));
 }
 
+static void crispasr_session_apply_tts_padding(crispasr_session* s, float** pcm_ptr, int* out_n_samples) {
+    if (!s || s->tts_pad_silence_ms <= 0 || !pcm_ptr || !*pcm_ptr || !out_n_samples || *out_n_samples <= 0)
+        return;
+    int sr = crispasr_session_output_sample_rate(s);
+    if (sr <= 0)
+        return;
+    size_t pad_samples = (size_t)((double)s->tts_pad_silence_ms / 1000.0 * sr);
+    if (pad_samples == 0)
+        return;
+    size_t orig_samples = *out_n_samples;
+    size_t new_samples = orig_samples + pad_samples;
+    float* new_pcm = (float*)malloc(new_samples * sizeof(float));
+    if (new_pcm) {
+        memset(new_pcm, 0, pad_samples * sizeof(float));
+        memcpy(new_pcm + pad_samples, *pcm_ptr, orig_samples * sizeof(float));
+        free(*pcm_ptr);
+        *pcm_ptr = new_pcm;
+        *out_n_samples = (int)new_samples;
+    }
+}
+
 // Synthesize WITHOUT the watermark — an explicit provenance opt-out for callers
 // that must DSP (speed change, mixing, concatenation) before embedding the mark
 // themselves via crispasr_watermark_embed(). Because it yields unmarked PCM it is
@@ -9400,7 +9428,9 @@ CA_EXPORT float* crispasr_session_synthesize_raw(crispasr_session* s, const char
             *out_n_samples = 0;
         return nullptr;
     }
-    return crispasr_session_synthesize_raw_impl(s, text, out_n_samples);
+    float* pcm = crispasr_session_synthesize_raw_impl(s, text, out_n_samples);
+    crispasr_session_apply_tts_padding(s, &pcm, out_n_samples);
+    return pcm;
 }
 
 // Synthesize + auto-watermark. The default API — all TTS output is watermarked
@@ -9412,6 +9442,7 @@ CA_EXPORT float* crispasr_session_synthesize_raw(crispasr_session* s, const char
 CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* text, int* out_n_samples) {
     crispasr_session_warn_unmarked_clone(s);
     float* pcm = crispasr_session_synthesize_raw_impl(s, text, out_n_samples);
+    crispasr_session_apply_tts_padding(s, &pcm, out_n_samples);
     if (pcm && out_n_samples && *out_n_samples > 0) {
         crispasr_watermark_embed(pcm, *out_n_samples, -1.0f);
     }
@@ -9558,13 +9589,17 @@ CA_EXPORT int crispasr_session_synthesize_streaming(crispasr_session* s, const c
     if (chunks.empty())
         return 0;
 
+    int original_pad_ms = s->tts_pad_silence_ms;
     for (size_t i = 0; i < chunks.size(); i++) {
         int n = 0;
+        if (i > 0)
+            s->tts_pad_silence_ms = 0;
         float* pcm = crispasr_session_synthesize(s, chunks[i].c_str(), &n);
         const int is_final = (i + 1 == chunks.size()) ? 1 : 0;
         cb(pcm && n > 0 ? pcm : nullptr, pcm ? n : 0, is_final, user_data);
         free(pcm);
     }
+    s->tts_pad_silence_ms = original_pad_ms;
     return 0;
 }
 

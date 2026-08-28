@@ -582,6 +582,10 @@ extern "C" {
         s: *mut CrispasrSession,
         phonemes: *const c_char,
     ) -> c_int;
+    pub fn crispasr_session_set_tts_pad_silence_ms(
+        s: *mut CrispasrSession,
+        ms: c_int,
+    );
     // qwen3-tts variant detection (returns 0/1; 0 also covers "not qwen3-tts").
     pub fn crispasr_session_is_custom_voice(s: *mut CrispasrSession) -> c_int;
     pub fn crispasr_session_is_voice_design(s: *mut CrispasrSession) -> c_int;

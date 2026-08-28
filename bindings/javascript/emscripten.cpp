@@ -45,6 +45,7 @@ const char* crispasr_session_get_speaker_name(CrispasrSession* s, int i);
 int crispasr_session_set_instruct(CrispasrSession* s, const char* instruct);
 // #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2).
 int crispasr_session_set_tts_phonemes(struct crispasr_session* s, const char* phonemes);
+void crispasr_session_set_tts_pad_silence_ms(struct crispasr_session* s, int ms);
 int crispasr_session_is_custom_voice(CrispasrSession* s);
 int crispasr_session_is_voice_design(CrispasrSession* s);
 float* crispasr_session_synthesize(CrispasrSession* s, const char* text, int* out_n_samples);
@@ -640,6 +641,13 @@ EMSCRIPTEN_BINDINGS(whisper) {
                              if (!g_tts_session)
                                  return -1;
                              return crispasr_session_set_tts_phonemes(g_tts_session, phonemes.c_str());
+                         }));
+
+    // Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs.
+    emscripten::function("ttsSetPadSilenceMs", emscripten::optional_override([](int ms) {
+                             if (!g_tts_session)
+                                 return;
+                             crispasr_session_set_tts_pad_silence_ms(g_tts_session, ms);
                          }));
 
     // qwen3-tts variant detection (returns false also when the active

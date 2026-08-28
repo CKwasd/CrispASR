@@ -2524,6 +2524,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         // gated by CRISPASR_TADA_WAV_CLONE). Passed through to the backend as
         // tts_ref_text; a companion <name>.txt in --voice-dir is the fallback.
         std::string ref_text = body.value("ref_text", "");
+        // pad N ms of silence at the start of the output
+        int tts_pad_silence_ms = body.value("pad_silence_ms", 0);
         // spoken_disclaimer defaults to true; set to false to skip the
         // audible AI-disclosure prefix (watermark + C2PA remain). The opt-out
         // is only honored when attested — see the marking gate below.
@@ -2701,6 +2703,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         }
         if (!ref_text.empty())
             rp.tts_ref_text = ref_text;
+        rp.tts_pad_silence_ms = tts_pad_silence_ms;
         if (!instructions.empty())
             rp.tts_instruct = instructions;
         if (!tts_phonemes.empty()) {

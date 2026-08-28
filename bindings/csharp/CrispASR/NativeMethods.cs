@@ -89,6 +89,10 @@ namespace CrispASR
             IntPtr s, [MarshalAs(UnmanagedType.LPUTF8Str)] string phonemes);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void crispasr_session_set_tts_pad_silence_ms(
+            IntPtr s, int ms);
+
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int crispasr_session_is_custom_voice(IntPtr s);
 
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]

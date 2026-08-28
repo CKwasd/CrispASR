@@ -1843,6 +1843,12 @@ Build the library for the target with `-DCRISPASR_C2PA_FETCH=ON`:
      (all modern browsers, 2023+). Only needed for `c2paSign(bytes, "audio/mpeg")`
      and other non-WAV containers in the browser.
 
+**VLC Playback Bug (Silence Padding).** Because the C2PA JUMBF metadata chunk is extremely large (often 2-3 KB), some audio players (notably **VLC**) stall their playback thread for ~1.5 seconds while parsing it from the end of the file before playing the stream. For short TTS clips, this causes the first 1-2 seconds of the generated speech to be silently dropped during playback.
+To work around this while keeping the C2PA metadata intact, you can explicitly pad silence frames at the beginning of the audio. By the time the player unblocks, the silence has played out and the speech begins unharmed.
+- **CLI:** `--tts-pad-silence-ms 1500`
+- **C ABI:** `crispasr_session_set_tts_pad_silence_ms(session, 1500)`
+- **HTTP Server:** Add `"pad_silence_ms": 1500` to the JSON request body.
+
 ### Voice cloning consent gate
 
 Voice cloning (`.wav` reference files) requires explicit consent:

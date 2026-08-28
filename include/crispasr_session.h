@@ -429,8 +429,13 @@ CRISPASR_SESSION_API int crispasr_session_set_instruct(crispasr_session* s, cons
 // seam between text processing and the acoustic model. Use it to reproduce
 // another implementation's pronunciation exactly, or to separate "the G2P is
 // wrong" from "the model is wrong". Empty clears. Returns -2 (soft no-op) when
-// the active backend exposes no phonemes-in call; kokoro and piper do.
+// phonemes-in call; kokoro and piper do.
 CRISPASR_SESSION_API int crispasr_session_set_tts_phonemes(crispasr_session* s, const char* phonemes);
+
+// Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs
+// where it drops the first ~1.5s of audio while parsing a large C2PA chunk.
+CRISPASR_SESSION_API void crispasr_session_set_tts_pad_silence_ms(crispasr_session* s, int ms);
+
 CRISPASR_SESSION_API int crispasr_session_is_custom_voice(crispasr_session* s);
 CRISPASR_SESSION_API int crispasr_session_is_voice_design(crispasr_session* s);
 // UNMARKED synthesis — hard-refused unless crispasr_session_accept_marking_responsibility() was called first.

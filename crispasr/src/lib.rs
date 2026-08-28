@@ -1683,6 +1683,12 @@ impl Session {
         Ok(())
     }
 
+    /// Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs
+    /// where it drops the first ~1.5s of audio while parsing a large C2PA chunk.
+    pub fn set_tts_pad_silence_ms(&self, ms: i32) {
+        unsafe { crispasr_sys::crispasr_session_set_tts_pad_silence_ms(self.handle, ms as std::os::raw::c_int) };
+    }
+
     /// Select + load a punctuation-restoration model (`auto`/`firered`/`fullstop`/
     /// `punctuate-all`/`pcs`/path; `"none"`/`""` unloads). Auto-downloads on first use.
     pub fn set_punc_model(&self, punc_model: &str) -> Result<(), String> {

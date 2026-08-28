@@ -177,6 +177,12 @@ namespace CrispASR
             if (rc != 0) throw new InvalidOperationException($"set_tts_phonemes failed (rc={rc})");
         }
 
+        /// <summary>Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs where it drops the first ~1.5s of audio while parsing a large C2PA chunk.</summary>
+        public void SetTtsPadSilenceMs(int ms)
+        {
+            NativeMethods.crispasr_session_set_tts_pad_silence_ms(Handle, ms);
+        }
+
         /// <summary>Whether the loaded model is a qwen3-tts CustomVoice variant.</summary>
         public bool IsCustomVoice => NativeMethods.crispasr_session_is_custom_voice(Handle) != 0;
 

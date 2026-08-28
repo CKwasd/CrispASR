@@ -83,6 +83,7 @@ int              crispasr_session_n_speakers(CrispasrSession* s);
 const char*      crispasr_session_get_speaker_name(CrispasrSession* s, int i);
 int              crispasr_session_set_instruct(CrispasrSession* s, const char* instruct);
 int              crispasr_session_set_tts_phonemes(CrispasrSession* s, const char* phonemes);
+void             crispasr_session_set_tts_pad_silence_ms(CrispasrSession* s, int ms);
 int              crispasr_session_is_custom_voice(CrispasrSession* s);
 int              crispasr_session_is_voice_design(CrispasrSession* s);
 float*           crispasr_session_synthesize(CrispasrSession* s, const char* text, int* out_n_samples);
@@ -1070,6 +1071,13 @@ func (s *CrispasrSession) SetTTSPhonemes(phonemes string) error {
 	default:
 		return fmt.Errorf("SetTTSPhonemes failed (rc=%d)", int(rc))
 	}
+}
+
+// SetTTSPadSilenceMs pads N ms of silence at the beginning of TTS output.
+// Useful to bypass VLC playback bugs where it drops the first ~1.5s of audio
+// while parsing a large C2PA chunk.
+func (s *CrispasrSession) SetTTSPadSilenceMs(ms int) {
+	C.crispasr_session_set_tts_pad_silence_ms(s.handle, C.int(ms))
 }
 
 // IsCustomVoice reports whether the loaded model is a qwen3-tts
