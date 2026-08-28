@@ -9,6 +9,7 @@
 
 #include "crispasr_backend.h"
 #include "crispasr_cache.h"
+#include <cassert>
 #include "crispasr_gap_fill.h"
 #include "crispasr_split_pipeline.h"
 #include "tada_encoder.h"
@@ -46,6 +47,7 @@
 #include "crispasr_stream_finalize.h"
 #include "crispasr_stream_partial_decode.h"
 #include "crispasr_stream_punc.h"
+#include "crispasr_stream_postprocess.h"
 #include "whisper_params.h"
 #include "fireredpunc.h"
 #include "truecaser.h"
@@ -348,6 +350,14 @@ static bool stream_punc_partials_enabled(const whisper_params& params) {
 
 static bool stream_punc_finals_enabled(const whisper_params& params) {
     return crispasr_stream_punc_finals_enabled(params.stream_punc);
+}
+
+static bool stream_postprocess_partials_enabled(const whisper_params& params) {
+    return crispasr_stream_postprocess_partials_enabled(params.stream_postprocess);
+}
+
+static bool stream_postprocess_finals_enabled(const whisper_params& params) {
+    return crispasr_stream_postprocess_finals_enabled(params.stream_postprocess);
 }
 
 // Apply PCS (punctuation + capitalization + segmentation) to all segments.
@@ -3224,8 +3234,10 @@ int crispasr_run_backend(const whisper_params& params_in) {
 
     // #80e: optional warmup — transcribe a short silence buffer to
     // amortize first-call overhead (graph alloc, GPU kernel compile).
-    // Enabled via --warmup or CRISPASR_WARMUP=1.
-    if (params.warmup || getenv("CRISPASR_WARMUP")) {
+    // Enabled via --warmup, CRISPASR_WARMUP=1, or automatically in
+    // JSON+VAD streaming mode (--stream-json) to eliminate startup
+    // latency spikes from GPU kernel compilation.
+    if (params.stream_json || params.warmup || getenv("CRISPASR_WARMUP")) {
         auto t_warmup_start = std::chrono::steady_clock::now();
         backend->warmup();
         if (params.verbose || !params.no_prints) {
@@ -3978,6 +3990,9 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // oldest samples from the front to maintain the cap.
         std::vector<float> pcm_window;
         pcm_window.reserve(length_samples);
+        size_t pcm_head = 0; // ponytail: ring head to avoid O(N) erase on every step
+        auto pcm_window_size = [&]() -> size_t { return pcm_window.size() - pcm_head; };
+        auto pcm_window_data = [&]() -> const float* { return pcm_window.data() + pcm_head; };
         std::vector<int16_t> read_buf(step_samples);
         std::string prev_text;
         // Issue #84 round 2 (CKwasd retest): the JSON streaming state
@@ -4029,8 +4044,13 @@ int crispasr_run_backend(const whisper_params& params_in) {
         std::vector<float> utterance_pcm;
         std::string prefix_committed;
         std::string last_partial_text; // dedupe key + prefix-mode tail
+        int64_t utterance_pcm_size_at_save = 0;
         int64_t last_partial_decode_sample = -1;
         int64_t cumulative_samples = 0;
+        // ponytail: VAD throttle cache — outside while loop so throttled steps can shift previous slices
+        std::vector<crispasr_audio_slice> cached_vad_slices;
+        int64_t cached_vad_window_start = 0;
+        bool cached_vad_valid = false;
         const int64_t utterance_max_samples = (int64_t)params.stream_utterance_max_sec * SR;
         const int64_t partial_decode_interval_samples =
             crispasr_stream_partial_decode_interval_samples(params.stream_partial_decode_ms, params.stream_step_ms, SR);
@@ -4057,22 +4077,26 @@ int crispasr_run_backend(const whisper_params& params_in) {
             }
             any_samples_read = true;
 
-            // Convert s16le to float
+            // Convert s16le to float (ring head avoids O(N) erase)
             const size_t n_new = n_read;
-            const size_t prev_size = pcm_window.size();
-            pcm_window.resize(prev_size + n_new);
+            // compact head when it grows too large (avoid unbounded vector growth)
+            if (pcm_head > (size_t)length_samples && pcm_head > pcm_window.size() / 2) {
+                pcm_window.erase(pcm_window.begin(), pcm_window.begin() + pcm_head);
+                pcm_head = 0;
+            }
+            const size_t write_pos = pcm_window.size();
+            pcm_window.resize(write_pos + n_new);
             for (size_t i = 0; i < n_new; i++)
-                pcm_window[prev_size + i] = read_buf[i] / 32768.0f;
+                pcm_window[write_pos + i] = read_buf[i] / 32768.0f;
 
-            // Issue #84: enforce the rolling cap by dropping the
-            // oldest samples once we exceed `--stream-length`. This
-            // is the only place the buffer can shrink — there is no
-            // separate "keep" tail because the whole tail up to
-            // `length_samples` is now the context window. The legacy
-            // `--stream-keep` flag is accepted for compatibility but
-            // is no longer wired in (see help text + docs/streaming.md).
-            if ((int)pcm_window.size() > length_samples) {
-                pcm_window.erase(pcm_window.begin(), pcm_window.end() - length_samples);
+            if ((int)pcm_window_size() > length_samples) {
+                const size_t drop = pcm_window_size() - (size_t)length_samples;
+                pcm_head += drop;
+                // occasional compact to keep capacity bounded
+                if (pcm_head > (size_t)length_samples) {
+                    pcm_window.erase(pcm_window.begin(), pcm_window.begin() + pcm_head);
+                    pcm_head = 0;
+                }
             }
             cumulative_samples += (int64_t)n_new;
             (void)keep_samples; // legacy, intentionally unused
@@ -4091,118 +4115,139 @@ int crispasr_run_backend(const whisper_params& params_in) {
             std::vector<std::pair<crispasr_audio_slice, std::string>> step_slice_text;
             bool decoded_segments_this_step = false;
             if (!stream_vad_path.empty()) {
-                const auto slices = crispasr_compute_vad_slices(pcm_window.data(), (int)pcm_window.size(), SR,
-                                                                stream_vad_path.c_str(), stream_vad_opts);
-                // Snapshot for the straddling-slice subrange decode below.
-                // `cumulative_samples` has already been advanced by
-                // `n_new` for this step, so the rolling window currently
-                // covers [window_start_sample_now, cumulative_samples).
-                // finalized_until_sample is updated inside the JSON state
-                // machine *after* this loop runs, so it reflects the
-                // upper bound of all utterances finalized before this step.
-                const int64_t window_start_sample_now = cumulative_samples - (int64_t)pcm_window.size();
-                const bool final_silence_due =
+                // ponytail: small-window bypass — delta has no gain when overlap <=50% vs guard overhead
+                const bool use_delta = length_samples >= 4000 && length_samples >= step_samples * 3;
+                if (backend->capabilities() & CAP_STREAM_DELTA) {
+                    if (use_delta) backend->set_stream_delta((int)n_new);
+                    else backend->set_stream_delta(0);
+                }
+                // Hard guard: continue_decode + VAD merge would crash -1073741819 (cross-KV invalid
+                // after window shift). No backend supports it today (crispasr_backend.h:239
+                // supports_continue_with_vad()==false); fail fast if a future backend claims support.
+                assert(!backend->supports_continue_with_vad() && "continue_decode+VAD merge unsupported: cross-KV invalid after window shift");
+                const int64_t window_start_sample_now = cumulative_samples - (int64_t)pcm_window_size();
+                std::vector<crispasr_audio_slice> slices;
+                const bool final_silence_due_early =
                     params.stream_json && params.stream_final_silence_ms > 0 && have_open_utterance &&
                     last_speech_end_sample > 0 &&
                     (cumulative_samples - last_speech_end_sample) * 1000 / SR >= params.stream_final_silence_ms;
-                const bool allow_partial_decode = crispasr_stream_partial_decode_allow(
-                    params.stream_json, last_partial_decode_sample, final_silence_due, cumulative_samples,
+                const bool allow_partial_decode_early = crispasr_stream_partial_decode_allow(
+                    params.stream_json, last_partial_decode_sample, final_silence_due_early, cumulative_samples,
                     partial_decode_interval_samples);
-                bool partial_decode_attempted_this_step = false;
-                constexpr int kStraddleMinSamples = 32000; // 2 s @ 16 kHz; backend-safe tail decode floor.
-                for (const auto& sl : slices) {
-                    if (params.stream_json) {
-                        const int64_t s_start_abs = window_start_sample_now + (int64_t)sl.start;
-                        const int64_t s_end_abs = window_start_sample_now + (int64_t)sl.end;
-                        if (s_end_abs <= finalized_until_sample)
-                            continue;
-                        // Apply punc/strip on a copy so the per-slice text
-                        // is in its final form before we hand it to the
-                        // utterance state machine. JSON mode can filter or
-                        // trim finalized rolling-window slices before decode;
-                        // plain-text mode below still decodes full slices.
-                        std::vector<crispasr_segment> sl_for_text;
-
-                        // Round 3 (CKwasd #1 corner): if the VAD slice
-                        // straddles a previously-finalized boundary
-                        // (s_start < finalized_until_sample < s_end), the
-                        // full-slice decode covers audio that belongs to
-                        // the prior utterance — emitting it as a partial
-                        // for the new utterance_id leaks prior text into
-                        // the live stream. Decode just the post-finalized
-                        // subrange so partial.text describes only the new
-                        // utterance's interval.
-                        // Some backends (moonshine's stacked conv1d
-                        // encoder, for example) abort on inputs shorter
-                        // than a few hundred ms — `OW > 0` from
-                        // `ggml_im2col`. Gate the subrange decode on a
-                        // generous min so we don't crash; fall back to
-                        // suppressing the partial in that case so we
-                        // don't leak the prior utterance's text either.
-                        // 32000 samples = 2 s @ 16 kHz, comfortably
-                        // above every supported backend's encoder
-                        // minimum.
-                        if (!allow_partial_decode) {
-                            // Keep VAD slice timing in the JSON state machine
-                            // but skip the expensive ASR partial decode for
-                            // this step.
-                        } else if (s_start_abs < finalized_until_sample) {
-                            const int sub_start = (int)(finalized_until_sample - window_start_sample_now);
-                            const int sub_end = (int)sl.end;
-                            const int sub_len = sub_end - sub_start;
-                            if (sub_start >= 0 && sub_len >= kStraddleMinSamples && sub_end <= (int)pcm_window.size()) {
-                                whisper_params decode_params = params;
-                                decode_params.vad = false;
-                                decode_params.vad_model.clear();
-                                partial_decode_attempted_this_step = true;
-                                const int64_t abs_offset_cs = (window_start_sample_now + (int64_t)sub_start) * 100 / SR;
-                                sl_for_text = backend->transcribe(pcm_window.data() + sub_start, sub_len, abs_offset_cs,
-                                                                  decode_params);
-                            }
-                            // else: sl_for_text stays empty → empty
-                            // partial text for this slice, which
-                            // `flush_pending_partial` will skip. The
-                            // straddling slice's prior-utterance audio
-                            // never reaches the wrapper; the genuine
-                            // new audio will be picked up on a later
-                            // step once the subrange exceeds the min.
-                        } else {
-                            partial_decode_attempted_this_step = true;
-                            const int64_t abs_t0_cs = window_start_sample_now * 100 / SR + sl.t0_cs;
-                            sl_for_text =
-                                backend->transcribe(pcm_window.data() + sl.start, sl.end - sl.start, abs_t0_cs, params);
-                        }
-                        if (!sl_for_text.empty())
-                            decoded_segments_this_step = true;
-                        if (stream_punc_partials_enabled(params))
-                            apply_punc_model(punc_ctx.get(), sl_for_text);
-                        apply_truecase_model(tc_ctx.get(), sl_for_text);
-                        apply_truecase_crf_model(tc_crf_ctx.get(), sl_for_text);
-                        apply_truecase_lstm_model(tc_lstm_ctx.get(), sl_for_text);
-                        apply_pcs_model(pcs_ctx.get(), sl_for_text);
-                        if (!params.punctuation) {
-                            for (auto& seg : sl_for_text)
-                                crispasr_strip_punctuation(seg);
-                        }
-                        std::string sl_text;
-                        for (const auto& s : sl_for_text)
-                            sl_text += s.text;
-                        step_slice_text.emplace_back(sl, std::move(sl_text));
-                    } else {
-                        const int64_t abs_t0_cs = window_start_sample_now * 100 / SR + sl.t0_cs;
-                        auto slice_segs =
-                            backend->transcribe(pcm_window.data() + sl.start, sl.end - sl.start, abs_t0_cs, params);
-                        if (!slice_segs.empty())
-                            decoded_segments_this_step = true;
-                        segs.insert(segs.end(), std::make_move_iterator(slice_segs.begin()),
-                                    std::make_move_iterator(slice_segs.end()));
+                // ponytail: throttling adds 500ms boundary delay — disable for small windows already on fallback path
+                const bool vad_throttle_on = length_samples >= 4000;
+                const bool need_fresh_vad = (vad_throttle_on ? allow_partial_decode_early : true) || !params.stream_json || !cached_vad_valid;
+                if (need_fresh_vad) {
+                    slices = crispasr_compute_vad_slices(pcm_window_data(), (int)pcm_window_size(), SR,
+                                                                stream_vad_path.c_str(), stream_vad_opts);
+                    cached_vad_slices = slices;
+                    cached_vad_window_start = window_start_sample_now;
+                    cached_vad_valid = true;
+                } else {
+                    // shift cached slices by window advance; drop those that fell out
+                    // ponytail: must also shift t0/t1_cs (window-relative) or mid assignment drifts — fix throttled VAD bug
+                    const int64_t shift = window_start_sample_now - cached_vad_window_start;
+                    const int64_t shift_cs = shift * 100 / SR;
+                    slices.reserve(cached_vad_slices.size());
+                    for (auto sl : cached_vad_slices) {
+                        sl.start -= (int)shift; sl.end -= (int)shift;
+                        sl.t0_cs -= shift_cs; sl.t1_cs -= shift_cs;
+                        if (sl.end <= 0 || sl.start >= (int)pcm_window_size()) continue;
+                        sl.start = std::max(0, sl.start); sl.end = std::min((int)pcm_window_size(), sl.end);
+                        if (sl.t1_cs <= 0) continue;
+                        sl.t0_cs = std::max<int64_t>(0, sl.t0_cs);
+                        if (sl.end > sl.start) slices.push_back(sl);
                     }
                 }
-                if (partial_decode_attempted_this_step)
-                    last_partial_decode_sample = cumulative_samples;
+                const bool final_silence_due = final_silence_due_early;
+                const bool allow_partial_decode = allow_partial_decode_early;
+                bool partial_decode_attempted_this_step = false;
+                constexpr int kStraddleMinSamples = 32000;
+                if (params.stream_json) {
+                    // ponytail: single full-window transcribe so delta survives; midpoint assigns segments to slices
+                    if (!allow_partial_decode) {
+                        for (auto &sl : slices) {
+                            if (window_start_sample_now + sl.end <= finalized_until_sample) continue;
+                            step_slice_text.emplace_back(sl, std::string());
+                        }
+                    } else if (!slices.empty()) {
+                        const int64_t window_cs = window_start_sample_now * 100 / SR;
+                        auto full_segs = backend->transcribe(pcm_window_data(), (int)pcm_window_size(), window_cs, params);
+                        if (!full_segs.empty()) decoded_segments_this_step = true;
+                        if (stream_punc_partials_enabled(params)) apply_punc_model(punc_ctx.get(), full_segs);
+                        if (stream_postprocess_partials_enabled(params)) {
+                            apply_truecase_model(tc_ctx.get(), full_segs);
+                            apply_truecase_crf_model(tc_crf_ctx.get(), full_segs);
+                            apply_truecase_lstm_model(tc_lstm_ctx.get(), full_segs);
+                            apply_pcs_model(pcs_ctx.get(), full_segs);
+                        }
+                        if (!params.punctuation) for (auto &s : full_segs) crispasr_strip_punctuation(s);
+                        // filter finalized region for assignment
+                        std::vector<std::string> slice_text(slices.size());
+                        for (auto &seg : full_segs) {
+                            if (seg.t1 <= finalized_until_sample * 100 / SR) continue;
+                            const int64_t mid = (seg.t0 + seg.t1) / 2;
+                            int best = -1;
+                            for (size_t i = 0; i < slices.size(); i++) {
+                                const int64_t s0 = window_start_sample_now * 100 / SR + slices[i].t0_cs;
+                                const int64_t s1 = window_start_sample_now * 100 / SR + slices[i].t1_cs;
+                                if (mid >= s0 && mid < s1) { best = (int)i; break; }
+                            }
+                            if (best < 0) {
+                                // fallback: nearest slice by midpoint distance
+                                int64_t best_d = INT64_MAX;
+                                for (size_t i = 0; i < slices.size(); i++) {
+                                    const int64_t s0 = window_start_sample_now * 100 / SR + slices[i].t0_cs;
+                                    const int64_t s1 = window_start_sample_now * 100 / SR + slices[i].t1_cs;
+                                    const int64_t mid_s = (s0 + s1) / 2;
+                                    int64_t d = llabs(mid - mid_s);
+                                    if (d < best_d) { best_d = d; best = (int)i; }
+                                }
+                            }
+                            if (best >= 0) {
+                                // straddling guard: skip if slice fully finalized or subrange too short
+                                const int64_t s_start_abs = window_start_sample_now + slices[best].start;
+                                const int64_t s_end_abs = window_start_sample_now + slices[best].end;
+                                if (s_end_abs <= finalized_until_sample) continue;
+                                if (s_start_abs < finalized_until_sample) {
+                                    const int sub_len = (int)(s_end_abs - finalized_until_sample);
+                                    if (sub_len < kStraddleMinSamples) continue;
+                                }
+                                slice_text[best] += seg.text;
+                            }
+                        }
+                        for (size_t i = 0; i < slices.size(); i++) {
+                            if (window_start_sample_now + slices[i].end <= finalized_until_sample) continue;
+                            if (slices[i].start < finalized_until_sample - window_start_sample_now) {
+                                const int sub_len = (int)(slices[i].end - (finalized_until_sample - window_start_sample_now));
+                                if (sub_len < kStraddleMinSamples) continue;
+                            }
+                            step_slice_text.emplace_back(slices[i], std::move(slice_text[i]));
+                        }
+                        partial_decode_attempted_this_step = true;
+                    }
+                } else {
+                    // non-JSON VAD: single full-window transcribe, aggregate
+                    const int64_t window_cs = window_start_sample_now * 100 / SR;
+                    auto full_segs = backend->transcribe(pcm_window_data(), (int)pcm_window_size(), window_cs, params);
+                    if (!full_segs.empty()) decoded_segments_this_step = true;
+                    segs.insert(segs.end(), std::make_move_iterator(full_segs.begin()), std::make_move_iterator(full_segs.end()));
+                }
+                if (partial_decode_attempted_this_step) last_partial_decode_sample = cumulative_samples;
+                // ponytail: utterance-level delta — save utterance portion of cross-KV for later finalize reuse
+                if (params.stream_json && have_open_utterance && decoded_segments_this_step && (backend->capabilities() & CAP_STREAM_UTTERANCE)) {
+                    const int64_t ue = last_speech_end_sample > 0 ? last_speech_end_sample : utterance_start_sample + 1;
+                    backend->save_utterance_cross_kv(utterance_start_sample, ue, window_start_sample_now, SR, utterance_id);
+                    utterance_pcm_size_at_save = (int64_t)utterance_pcm.size();
+                }
             } else {
-                const int64_t no_vad_window_start_cs = (cumulative_samples - (int64_t)pcm_window.size()) * 100 / SR;
-                segs = backend->transcribe(pcm_window.data(), (int)pcm_window.size(), no_vad_window_start_cs, params);
+                // No-VAD path: transcribe the full window.
+                // Also set streaming delta hint for backends that support it.
+                if (backend->capabilities() & CAP_STREAM_DELTA) {
+                    backend->set_stream_delta((int)n_new);
+                }
+                const int64_t no_vad_window_start_cs = (cumulative_samples - (int64_t)pcm_window_size()) * 100 / SR;
+                segs = backend->transcribe(pcm_window_data(), (int)pcm_window_size(), no_vad_window_start_cs, params);
                 if (!segs.empty())
                     decoded_segments_this_step = true;
             }
@@ -4227,7 +4272,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 std::string all_text;
                 for (const auto& s : segs)
                     all_text += s.text;
-                crispasr_audio_slice fake_sl{0, (int)pcm_window.size(), 0, 0};
+                crispasr_audio_slice fake_sl{0, (int)pcm_window_size(), 0, 0};
                 step_slice_text.emplace_back(fake_sl, std::move(all_text));
             }
 
@@ -4246,11 +4291,11 @@ int crispasr_run_backend(const whisper_params& params_in) {
             // and (c) re-decode the buffered PCM at finalize time so
             // `final.text` covers the full utterance. The cheaper
             // `--stream-final-mode prefix` path keeps round-1's cost
-            // by accumulating a longest-common-prefix across partials
-            // instead of re-decoding.
+            // by accumulating a longest-common-prefix across consecutive
+            // partials instead of re-decoding.
             if (params.stream_json) {
                 const int64_t now_sample = cumulative_samples;
-                const int64_t window_start_sample = cumulative_samples - (int64_t)pcm_window.size();
+                const int64_t window_start_sample = cumulative_samples - (int64_t)pcm_window_size();
                 // Track whether this step produced a `partial` or `final`
                 // event so the silence heartbeat at the bottom only fires
                 // when nothing else did. With the round-3 issue-1 skip,
@@ -4299,14 +4344,20 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             whisper_params decode_params = params;
                             decode_params.vad = false;
                             decode_params.vad_model.clear();
+                            if ((backend->capabilities() & CAP_STREAM_UTTERANCE)) {
+                                const int n_new_since_save = (int)utterance_pcm.size() - (int)utterance_pcm_size_at_save;
+                                backend->restore_utterance_cross_kv(n_new_since_save, utterance_id);
+                            }
                             auto utt_segs =
                                 backend->transcribe(utterance_pcm.data(), (int)utterance_pcm.size(), 0, decode_params);
                             if (stream_punc_finals_enabled(params))
                                 apply_punc_model(punc_ctx.get(), utt_segs);
-                            apply_truecase_model(tc_ctx.get(), utt_segs);
-                            apply_truecase_crf_model(tc_crf_ctx.get(), utt_segs);
-                            apply_truecase_lstm_model(tc_lstm_ctx.get(), utt_segs);
-                            apply_pcs_model(pcs_ctx.get(), utt_segs);
+                            if (stream_postprocess_finals_enabled(params)) {
+                                apply_truecase_model(tc_ctx.get(), utt_segs);
+                                apply_truecase_crf_model(tc_crf_ctx.get(), utt_segs);
+                                apply_truecase_lstm_model(tc_lstm_ctx.get(), utt_segs);
+                                apply_pcs_model(pcs_ctx.get(), utt_segs);
+                            }
                             if (!params.punctuation) {
                                 for (auto& seg : utt_segs)
                                     crispasr_strip_punctuation(seg);
@@ -4345,6 +4396,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     utterance_pcm.clear();
                     prefix_committed.clear();
                     last_partial_text.clear();
+                    if (backend->capabilities() & CAP_STREAM_UTTERANCE) { backend->clear_utterance_cross_kv(); utterance_pcm_size_at_save = 0; }
                 };
 
                 auto open_utterance_at = [&](int window_offset, int64_t stream_start) {
@@ -4354,11 +4406,15 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     last_speech_end_sample = stream_start;
                     if (window_offset < 0)
                         window_offset = 0;
-                    if (window_offset > (int)pcm_window.size())
-                        window_offset = (int)pcm_window.size();
-                    utterance_pcm.assign(pcm_window.begin() + window_offset, pcm_window.end());
+                    if (window_offset > (int)pcm_window_size())
+                        window_offset = (int)pcm_window_size();
+                    {
+                        const float* base = pcm_window_data();
+                        utterance_pcm.assign(base + window_offset, base + pcm_window_size());
+                    }
                     prefix_committed.clear();
                     last_partial_text.clear();
+                    if (backend->capabilities() & CAP_STREAM_UTTERANCE) { backend->clear_utterance_cross_kv(); utterance_pcm_size_at_save = 0; }
                 };
 
                 auto on_partial_text = [&](const std::string& new_text) {
@@ -4487,7 +4543,9 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 // otherwise the open path already copied the relevant
                 // tail of pcm_window, which includes the new samples).
                 if (have_open_utterance && was_open_at_step_start && !utterance_just_opened) {
-                    utterance_pcm.insert(utterance_pcm.end(), pcm_window.end() - n_new, pcm_window.end());
+                    const float* base = pcm_window_data();
+                    const size_t wsz = pcm_window_size();
+                    utterance_pcm.insert(utterance_pcm.end(), base + wsz - n_new, base + wsz);
                 }
 
                 // Cap the per-utterance buffer so monologues don't OOM.
@@ -4605,14 +4663,21 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     whisper_params decode_params = params;
                     decode_params.vad = false;
                     decode_params.vad_model.clear();
+                    // EOF also benefits from utterance-level delta
+                    if ((backend->capabilities() & CAP_STREAM_UTTERANCE) && utterance_pcm_size_at_save > 0) {
+                        const int n_new2 = (int)utterance_pcm.size() - (int)utterance_pcm_size_at_save;
+                        backend->restore_utterance_cross_kv(n_new2, utterance_id);
+                    }
                     auto utt_segs =
                         backend->transcribe(utterance_pcm.data(), (int)utterance_pcm.size(), 0, decode_params);
                     if (stream_punc_finals_enabled(params))
                         apply_punc_model(punc_ctx.get(), utt_segs);
-                    apply_truecase_model(tc_ctx.get(), utt_segs);
-                    apply_truecase_crf_model(tc_crf_ctx.get(), utt_segs);
-                    apply_truecase_lstm_model(tc_lstm_ctx.get(), utt_segs);
-                    apply_pcs_model(pcs_ctx.get(), utt_segs);
+                    if (stream_postprocess_finals_enabled(params)) {
+                        apply_truecase_model(tc_ctx.get(), utt_segs);
+                        apply_truecase_crf_model(tc_crf_ctx.get(), utt_segs);
+                        apply_truecase_lstm_model(tc_lstm_ctx.get(), utt_segs);
+                        apply_pcs_model(pcs_ctx.get(), utt_segs);
+                    }
                     if (!params.punctuation) {
                         for (auto& seg : utt_segs)
                             crispasr_strip_punctuation(seg);
