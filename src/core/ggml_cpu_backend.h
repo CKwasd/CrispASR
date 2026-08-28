@@ -61,6 +61,36 @@ inline void set_n_threads(ggml_backend_t b, int n) {
 inline ggml_backend_buffer_type_t buffer_type() {
     return ggml_backend_cpu_buffer_type();
 }
+
+// Was the CPU backend BUILT with `name` (an ISA flag as ggml spells it:
+// "AVX", "AVX2", "AVX512", "FMA", "F16C", "BMI2", "NEON", ...)?
+//
+// #380 needs this to compare the shipped build's ISA against the host's, and
+// #403's release exposed why it belongs here: `ggml_cpu_has_*()` are symbols in
+// libggml-cpu, so calling them directly fails to LINK under GGML_BACKEND_DL —
+// which is exactly the configuration the CUDA packages are built in (#355).
+inline bool has_feature(const char* name) {
+    if (!name) {
+        return false;
+    }
+    struct entry {
+        const char* name;
+        int (*fn)(void);
+    };
+    static const entry k[] = {
+        {"AVX", ggml_cpu_has_avx},       {"AVX2", ggml_cpu_has_avx2},
+        {"AVX512", ggml_cpu_has_avx512}, {"FMA", ggml_cpu_has_fma},
+        {"F16C", ggml_cpu_has_f16c},     {"BMI2", ggml_cpu_has_bmi2},
+        {"NEON", ggml_cpu_has_neon},     {"SSE3", ggml_cpu_has_sse3},
+        {"SSSE3", ggml_cpu_has_ssse3},
+    };
+    for (const entry& e : k) {
+        if (std::strcmp(e.name, name) == 0) {
+            return e.fn() != 0;
+        }
+    }
+    return false;
+}
 inline ggml_backend_reg_t reg() {
     return ggml_backend_cpu_reg();
 }
@@ -173,6 +203,31 @@ inline ggml_backend_buffer_type_t buffer_type() {
 inline ggml_backend_reg_t reg() {
     ggml_backend_dev_t dev = cpu_device();
     return dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+}
+
+// Under DL the ISA predicates are unlinkable, but the registry publishes the
+// same information: ggml_backend_cpu_get_proc_address exposes
+// "ggml_backend_get_features", whose NULL-terminated array carries exactly the
+// names ggml compiled in ("AVX2", "FMA", "AVX512", ...). Absent name => absent
+// feature, which is also the right answer when the CPU module failed to load.
+inline bool has_feature(const char* name) {
+    if (!name) {
+        return false;
+    }
+    ggml_backend_reg_t r = reg();
+    if (!r) {
+        return false;
+    }
+    auto fn = (ggml_backend_get_features_t)ggml_backend_reg_get_proc_address(r, "ggml_backend_get_features");
+    if (!fn) {
+        return false;
+    }
+    for (ggml_backend_feature* f = fn(r); f && f->name; ++f) {
+        if (std::strcmp(f->name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ⚠ No-op under DL, and this is a real functional difference rather than an

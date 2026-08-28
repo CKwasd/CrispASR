@@ -11,6 +11,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The configuration the shipped CUDA packages are built in — and, until
+  # v0.8.30, the one configuration NOTHING compiled before release day.
+  #
+  # GGML_BACKEND_DL makes every ggml backend a dlopen'd module, including
+  # ggml-cpu, so `ggml_cpu_has_*` / `ggml_backend_is_cpu` stop being linkable
+  # and must go through src/core/ggml_cpu_backend.h. Two files added after
+  # v0.8.29 called them directly; nothing noticed until
+  # `build-linux-x86_64-cuda` failed to link during the v0.8.30 release run,
+  # after the tag was already public. x86-64 specifically: the ISA predicates
+  # live behind `#if CRISPASR_ISA_X86`, so an arm64 build compiles the whole
+  # block out and links clean either way.
+  linux-backend-dl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake g++
+
+      - name: Configure (GGML_BACKEND_DL, as the CUDA packages are built)
+        run: |
+          cmake -S . -B build-dl -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF \
+            -DCRISPASR_BUILD_TESTS=OFF -DCRISPASR_BUILD_SERVER=OFF
+
+      - name: Build (the link is the test)
+        run: cmake --build build-dl --target crispasr-cli -j $(nproc)
+
+      - name: Smoke test - the CPU backend still loads as a module
+        run: ./build-dl/bin/crispasr --list-backends
+
   # ===========================================================================
   # Linux x86_64 (CPU)
   # ===========================================================================
