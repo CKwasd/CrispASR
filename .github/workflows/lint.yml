@@ -151,8 +151,29 @@ on:
       - 'crispasr/Cargo.toml'
       - 'crispasr-sys/Cargo.toml'
 
+  # Nightly full lint of main, independent of the paths filter above.
+  #
+  # Every push to main shares the ref `refs/heads/main`, so with a ref-keyed
+  # concurrency group each push CANCELS the previous run. Measured 2026-08-28:
+  # 12 of the last 40 main runs were cancelled (30%), including five Lint runs
+  # in a row while two branches landed in quick succession — and a cancelled
+  # run is indistinguishable from one that never ran. Cancelling is still the
+  # right default for a burst of pushes (this workflow's cppcheck job alone is
+  # ~40 min), so rather than stop cancelling we guarantee a floor: main gets a
+  # complete lint at least once a day.
+  #
+  # It also covers the hole the workflow_dispatch comment above describes — a
+  # push whose HEAD commit misses the paths filter can never be linted by that
+  # push. The nightly has no paths filter, so it lints whatever main holds.
+  schedule:
+    - cron: '17 3 * * *'
+
+# Scoped by EVENT as well as ref: without that the nightly shares
+# `Lint-refs/heads/main` with ordinary pushes, so the next push would cancel
+# it and the floor above would not exist. Push runs still cancel each other,
+# which is where the savings are.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
