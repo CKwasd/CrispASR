@@ -2095,7 +2095,7 @@ extern "C" funasr_context* funasr_init_from_file(const char* path, funasr_contex
         core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     if (!funasr_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
-        delete ctx;
+        funasr_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 

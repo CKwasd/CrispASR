@@ -952,7 +952,7 @@ extern "C" struct voxtral4b_context* voxtral4b_init_from_file(const char* path,
         core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     if (!voxtral4b_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
-        delete ctx;
+        voxtral4b_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 

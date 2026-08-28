@@ -362,7 +362,7 @@ extern "C" struct kyutai_stt_context* kyutai_stt_init_from_file(const char* path
         gguf_context* gctx = core_gguf::open_metadata(path_model);
         if (!gctx) {
             fprintf(stderr, "kyutai_stt: failed to open '%s'\n", path_model);
-            delete sctx;
+            kyutai_stt_free(sctx); // frees the backends this ctx already owns
             return nullptr;
         }
         // LM hparams
@@ -436,7 +436,7 @@ extern "C" struct kyutai_stt_context* kyutai_stt_init_from_file(const char* path
     core_gguf::WeightLoad wl;
     if (!core_gguf::load_weights(path_model, sctx->backend, "kyutai_stt", wl)) {
         fprintf(stderr, "kyutai_stt: failed to load weights from '%s'\n", path_model);
-        delete sctx;
+        kyutai_stt_free(sctx); // frees the backends this ctx already owns
         return nullptr;
     }
     m.ctx = wl.ctx;

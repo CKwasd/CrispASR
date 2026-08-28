@@ -1427,7 +1427,7 @@ extern "C" moss_tts_context* moss_tts_init_from_file(const char* path, moss_tts_
         core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     if (!moss_tts_load_model(ctx->model, ctx->vocab, path, ctx->backend)) {
-        delete ctx;
+        moss_tts_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 

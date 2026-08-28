@@ -1503,7 +1503,7 @@ extern "C" qwen3_asr_context* qwen3_asr_init_from_file(const char* path, qwen3_a
     }
 
     if (!qwen3_asr_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
-        delete ctx;
+        qwen3_asr_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 

@@ -702,7 +702,7 @@ extern "C" struct granite_speech_context* granite_speech_init_from_file(const ch
         core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     if (!granite_speech_load_model(ctx->model, path, ctx->backend, ctx->backend_cpu)) {
-        delete ctx;
+        granite_speech_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 

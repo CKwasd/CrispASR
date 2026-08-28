@@ -2402,7 +2402,7 @@ extern "C" struct nemotron_context* nemotron_init_from_file(const char* path_mod
     // Load model
     if (!nemotron_load_model(ctx->model, ctx->vocab, ctx->lang_to_prompt, path_model, ctx->backend)) {
         fprintf(stderr, "nemotron: failed to load model from '%s'\n", path_model);
-        delete ctx;
+        nemotron_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 

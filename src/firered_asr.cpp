@@ -393,7 +393,7 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
         gguf_context* gctx = core_gguf::open_metadata(path_model);
         if (!gctx) {
             fprintf(stderr, "firered_asr: failed to open '%s'\n", path_model);
-            delete ctx;
+            firered_asr_free(ctx); // frees the backends this ctx already owns
             return nullptr;
         }
         hp.d_model = core_gguf::kv_u32(gctx, "firered.d_model", hp.d_model);
@@ -457,7 +457,7 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
                 : core_gguf::load_weights(path_model, ctx->backend_cpu, "firered_asr", wl);
     if (!loaded) {
         fprintf(stderr, "firered_asr: failed to load weights from '%s'\n", path_model);
-        delete ctx;
+        firered_asr_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
     m.ctx = wl.ctx;

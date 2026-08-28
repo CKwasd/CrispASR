@@ -851,7 +851,7 @@ extern "C" voxtral_context* voxtral_init_from_file(const char* path, voxtral_con
     }
 
     if (!voxtral_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
-        delete ctx;
+        voxtral_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 
