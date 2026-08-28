@@ -451,6 +451,18 @@ struct stage_scope {
 
 // Load audio from a multipart file upload, transcribe it, return result.
 // Acquires model_mutex internally.
+
+// Change 150 (polyschnack): per-server progress for the webapp. One job per
+// container today, so a single atomic is honest; with --server-workers
+// concurrency this needs per-request scoping (future work).
+static std::atomic<int>    g_server_progress{-1};   // 0..100, -1 = idle
+static std::atomic<bool>   g_server_busy{false};
+struct progress_scope {
+    explicit progress_scope() { g_server_progress = 0; g_server_busy = true; }
+    ~progress_scope() { g_server_busy = false; g_server_progress = -1; }
+    progress_scope(const progress_scope&) = delete;
+    progress_scope& operator=(const progress_scope&) = delete;
+};
 static transcription_result do_transcribe(const httplib::MultipartFormData& audio_file, CrispasrBackend* backend,
                                           std::mutex& model_mutex, whisper_params rp, bool need_timestamps,
                                           fireredpunc_context* punc_ctx = nullptr, pcs_context* pcs_ctx = nullptr,
@@ -459,6 +471,7 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
                                           truecaser_lstm_context* tc_lstm_ctx = nullptr) {
     transcription_result result;
     result.language = rp.language;
+    progress_scope _progress;  // Change 150: /progress liefert 0..100
 
     if (rp.verbose)
         fprintf(stderr, "crispasr-server: processing '%s' (%zu bytes)\n", log_sanitize(audio_file.filename).c_str(),
@@ -731,6 +744,7 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
 
         for (size_t i = 0; i < slices.size(); ++i) {
             const auto& sl = slices[i];
+            g_server_progress = (int)((i + 1) * 100 / slices.size());  // Change 150
             auto tc0 = std::chrono::steady_clock::now();
             auto segs = backend->transcribe(pcmf32.data() + sl.start, sl.end - sl.start, sl.t0_cs, rp);
             if (rp.return_logits)
@@ -2279,6 +2293,18 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             res.status = 503;
             res.set_content("{\"status\": \"loading\"}", "application/json");
         }
+    });
+
+    // -----------------------------------------------------------------------
+    // GET /progress — Change 150 (polyschnack): 0..100 des aktuellen Jobs.
+    // busy=false → idle; progress=-1 → kein Fortschritt bekannt.
+    // -----------------------------------------------------------------------
+    svr.Get("/progress", [&](const Request&, Response& res) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "{\"busy\": %s, \"progress\": %d}",
+                 g_server_busy.load() ? "true" : "false",
+                 g_server_progress.load());
+        res.set_content(buf, "application/json");
     });
 
     // -----------------------------------------------------------------------
