@@ -199,7 +199,7 @@ echo ""
 echo "--- Test 6: --vad-import not silently ignored ---"
 MODEL="${CRISPASR_MODEL_WHISPER:-}"
 if [ -z "$MODEL" ]; then
-    for m in ggml-base.bin models/ggml-base.en.bin /Volumes/backups/ai/CrispASR/ggml-base.bin; do
+    for m in ggml-base.bin models/ggml-base.en.bin "${CRISPASR_MODELS_DIR:-$HOME/.cache/crispasr}/ggml-base.bin"; do
         [ -f "$m" ] && MODEL="$m" && break
     done
 fi

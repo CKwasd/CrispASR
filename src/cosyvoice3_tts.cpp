@@ -5325,7 +5325,16 @@ bool cv3_bake_runtime_voice_bundle(const char* wav_path, const char* ref_text, s
     if (manifest_path.empty() || gguf_path.empty())
         return false;
 
-    const std::string upstream_base = "/Volumes/backups/code/cosyvoice3-stash/CosyVoice-upstream";
+    // Path to a CosyVoice upstream checkout, for the Python cross-check only.
+    // No hardcoded default: this was a maintainer path, so the cross-check
+    // could only ever run on one machine and silently failed everywhere else.
+    const char* upstream_env = crispasr_env::get("CRISPASR_COSYVOICE3_UPSTREAM_DIR");
+    if (!upstream_env || !*upstream_env) {
+        fprintf(stderr, "cosyvoice3: set CRISPASR_COSYVOICE3_UPSTREAM_DIR to a CosyVoice checkout "
+                        "to run the Python cross-check\n");
+        return false;
+    }
+    const std::string upstream_base = upstream_env;
     std::ostringstream manifest;
     manifest << "[{\"name\":\"runtime\",\"wav\":\"" << cv3_json_escape(wav_path ? wav_path : "")
              << "\",\"prompt_text\":\"" << cv3_json_escape(ref_text ? ref_text : "") << "\"}]";

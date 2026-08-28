@@ -161,9 +161,8 @@ TEST_CASE("companion: empty cache_dir means companion not found", "[unit][compan
 
     // Probe for a name that CANNOT be on this machine, not the real companion.
     // probe_cached_file searches more than the directory it is handed — the
-    // CRISPASR_MODELS_DIR env var, the platform default cache, and two
-    // hardcoded absolute paths (/mnt/storage/gguf-models,
-    // /Volumes/backups/ai/crispasr-models). So asking for the genuine
+    // CRISPASR_MODELS_DIR env var, the platform default cache and other
+    // well-known model locations. So asking for the genuine
     // companion asserts "this developer has never downloaded mimo-asr", which
     // is not the contract under test and fails on any populated machine (it
     // passes in CI only because a runner's cache is empty). The contract is

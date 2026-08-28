@@ -266,7 +266,7 @@ TEST_CASE("orpheus is decided per checkpoint, not per backend", "[unit][complian
 }
 
 TEST_CASE("matching is case-insensitive and path-tolerant", "[unit][compliance]") {
-    REQUIRE(identity_for_model("orpheus", "/mnt/storage/KARTOFFEL-ORPHEUS-DE-NATURAL-q8_0.gguf") ==
+    REQUIRE(identity_for_model("orpheus", "/models/KARTOFFEL-ORPHEUS-DE-NATURAL-q8_0.gguf") ==
             SpeakerIdentity::RealPerson);
     REQUIRE(identity_for_model("piper", "/a/b/c/PIPER-de_DE-thorsten-high-f16.gguf") == SpeakerIdentity::RealPerson);
 }

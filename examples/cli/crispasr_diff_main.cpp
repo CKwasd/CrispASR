@@ -7825,7 +7825,8 @@ int main(int argc, char** argv) {
 
         // conv_stem_out: dump via env, compare against ref
         {
-            std::string conv_dump = "/mnt/volume1/tmp-overflow/moss_diarize_conv_stem.bin";
+            // Scratch file next to the reference, not a hardcoded machine path.
+            std::string conv_dump = dirname_of(ref_path) + "/.moss-diarize-conv-stem.bin";
             setenv("CRISPASR_MOSS_DIARIZE_CONV_DUMP", conv_dump.c_str(), 1);
         }
 
@@ -7860,7 +7861,8 @@ int main(int argc, char** argv) {
 
         // conv_stem_out: read dumped file and compare
         {
-            std::string conv_dump = "/mnt/volume1/tmp-overflow/moss_diarize_conv_stem.bin";
+            // Scratch file next to the reference, not a hardcoded machine path.
+            std::string conv_dump = dirname_of(ref_path) + "/.moss-diarize-conv-stem.bin";
             FILE* f = fopen(conv_dump.c_str(), "rb");
             if (f) {
                 fseek(f, 0, SEEK_END);

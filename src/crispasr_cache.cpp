@@ -580,10 +580,15 @@ bool fetch(const std::string& url, const std::string& dest, bool quiet) {
 //
 //   1. The dispatcher's chosen cache dir.
 //   2. $CRISPASR_MODELS_DIR (set by users with a dedicated model SSD).
-//   3. /Volumes/backups/ai/crispasr-models  (macOS dev convention).
-//   4. ~/.cache/crispasr-models           (legacy alt cache).
-//   5. ~/.cache/huggingface/hub           (raw HF download cache —
+//   3. ~/.cache/crispasr-models           (legacy alt cache).
+//   4. ~/.cache/huggingface/hub           (raw HF download cache —
 //      filename match is rough, but worth a glance).
+//
+// Deliberately NO absolute machine-specific defaults: this list used to
+// carry two maintainer paths, which shipped one developer's directory
+// layout to every user, made a unit test depend on whether that volume
+// happened to be mounted, and probed directories no user has. Anyone with
+// a dedicated model volume points $CRISPASR_MODELS_DIR at it.
 //
 // The list is platform-agnostic; non-existent dirs are skipped silently.
 static std::vector<std::string> well_known_search_dirs(const std::string& cache_dir_override) {
@@ -593,8 +598,6 @@ static std::vector<std::string> well_known_search_dirs(const std::string& cache_
     if (const char* env = std::getenv("CRISPASR_MODELS_DIR"); env && *env) {
         append_unique(dirs, env);
     }
-    append_unique(dirs, "/mnt/storage/gguf-models");
-    append_unique(dirs, "/Volumes/backups/ai/crispasr-models");
     append_unique(dirs, platform_default_dir());
 
     const char* home = std::getenv("HOME");
