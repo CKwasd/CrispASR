@@ -78,11 +78,9 @@ inline bool has_feature(const char* name) {
         int (*fn)(void);
     };
     static const entry k[] = {
-        {"AVX", ggml_cpu_has_avx},       {"AVX2", ggml_cpu_has_avx2},
-        {"AVX512", ggml_cpu_has_avx512}, {"FMA", ggml_cpu_has_fma},
-        {"F16C", ggml_cpu_has_f16c},     {"BMI2", ggml_cpu_has_bmi2},
-        {"NEON", ggml_cpu_has_neon},     {"SSE3", ggml_cpu_has_sse3},
-        {"SSSE3", ggml_cpu_has_ssse3},
+        {"AVX", ggml_cpu_has_avx},   {"AVX2", ggml_cpu_has_avx2}, {"AVX512", ggml_cpu_has_avx512},
+        {"FMA", ggml_cpu_has_fma},   {"F16C", ggml_cpu_has_f16c}, {"BMI2", ggml_cpu_has_bmi2},
+        {"NEON", ggml_cpu_has_neon}, {"SSE3", ggml_cpu_has_sse3}, {"SSSE3", ggml_cpu_has_ssse3},
     };
     for (const entry& e : k) {
         if (std::strcmp(e.name, name) == 0) {
