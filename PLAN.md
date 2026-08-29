@@ -39,7 +39,7 @@ VAD-throttle first (uncontroversial), delta encode behind
 `CRISPASR_COHERE_DELTA=1` with the full-encode default retained, acceptance
 = transcript equality vs the full-encode path over long audio, not wall
 clock.
-## CLAIMED 2026-08-29 — #400 Windows CUDA 13 package
+## DONE 2026-08-29 — #400 Windows CUDA 13 package (proofs green)
 
 Worktree: `.claude/worktrees/feat-win-cuda13`, branch `feat/win-cuda13`.
 Linux got a CUDA-13-native tarball in #152; #400 asks for the Windows
@@ -53,7 +53,16 @@ moved them to `bin\x64\` — recursive glob) with the full #342 split treatment
 CUDA major** instead of globally — the DLL names carry the major, so 12 and
 13 publish disjoint assets.
 
-Proof (the #403 regime — never ship an unexecuted recipe):
+Proof, all green (the #403 regime — never ship an unexecuted recipe):
+release dry-run of the actual job green (run 33264977086 with `crt`+`nvvm`;
+`only=build-windows-cuda13`, empty tag), Win CUDA13 Verify green (run
+33268415640: package + cublas64_13.dll import assert + packaged exe
+transcribing jfk.wav on the driverless runner — "ask not what your country
+can do for you"). Two red runs first taught the CUDA 13 Windows installer
+split: `crt` (crt/host_config.h) and `nvvm` (cicc.exe) are separate
+sub-packages now; and cudart links STATICALLY (CMake default), so the
+import-table proof is cublas64_13.dll, never cudart.
+Original proof plan:
 `.github/workflows/win-cuda13-verify.yml` rebuilds the exact release recipe
 on `windows-2022`, asserts the three `*64_13.dll` land and that
 `ggml-cuda.dll` imports `cudart64_13.dll` (dumpbin), then runs the packaged
