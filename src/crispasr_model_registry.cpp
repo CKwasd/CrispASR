@@ -927,6 +927,18 @@ constexpr Entry k_registry[] = {
      "chatterbox-turbo-s3gen-q8_0.gguf",
      "https://huggingface.co/cstr/chatterbox-turbo-GGUF/resolve/main/chatterbox-turbo-s3gen-q8_0.gguf",
      "~627 MB"},
+    // Chatterbox-Nano (#382): upstream's GPT2_small T3 (12L/768) on the
+    // SAME meanflow S3Gen as Turbo — s3gen_meanflow/ve/conds in
+    // ResembleAI/chatterbox-nano are byte-identical (same LFS oids) to
+    // chatterbox-turbo, so the companion points at the Turbo repo.
+    // Runtime path is the existing `chatterbox_turbo` GPT-2 branch; the
+    // GGUF carries n_kv_heads=12 explicitly (C++ default is 16).
+    {"chatterbox-nano", "chatterbox-nano-t3-q8_0.gguf",
+     "https://huggingface.co/cstr/chatterbox-nano-GGUF/resolve/main/chatterbox-nano-t3-q8_0.gguf",
+     "~345 MB",
+     "chatterbox-turbo-s3gen-q8_0.gguf",
+     "https://huggingface.co/cstr/chatterbox-turbo-GGUF/resolve/main/chatterbox-turbo-s3gen-q8_0.gguf",
+     "~627 MB"},
     // Kartoffelbox-Turbo: SebastianBodza's German fine-tune of
     // chatterbox-turbo. Same GPT-2 T3 arch as Turbo; reuses the
     // chatterbox-turbo S3Gen verbatim (companion points at the Turbo

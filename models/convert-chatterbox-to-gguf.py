@@ -149,6 +149,9 @@ KARTOFFELBOX_T3_HPARAMS = dict(
     arch="chatterbox_turbo",
     n_layers=24,
     n_heads=16,
+    # GPT-2 is MHA, so n_kv_heads == n_heads. Written explicitly because
+    # the C++ default is 16 — correct for Turbo only by coincidence (#382).
+    n_kv_heads=16,
     hidden_size=1024,
     intermediate_size=4096,
     head_dim=64,
@@ -161,6 +164,23 @@ KARTOFFELBOX_T3_HPARAMS = dict(
     start_speech_token=6561,
     stop_speech_token=6562,
     speaker_embed_size=256,
+)
+
+# Chatterbox Nano (#382): the same GPT-2 T3 pipeline as Turbo, backed by
+# upstream's GPT2_small config instead of GPT2_medium. Upstream inference
+# (tts_turbo.py from_local, nano=True) builds T3Config in code, so the
+# token ids / prompt length come from T3Config defaults — NOT from
+# t3_nano_v1.yaml, whose stop_text_token=50256 and cfg_weight=0.3 are
+# training-time artifacts that generate() never reads. s3gen_meanflow,
+# ve.safetensors and conds.pt are byte-identical to chatterbox-turbo
+# (same HF LFS oids), so only the T3 needs converting.
+NANO_T3_HPARAMS = dict(
+    KARTOFFELBOX_T3_HPARAMS,
+    n_layers=12,
+    n_heads=12,
+    n_kv_heads=12,
+    hidden_size=768,
+    intermediate_size=3072,
 )
 
 
@@ -624,14 +644,18 @@ def write_turbo_t3_gguf(
     model_dir: Path,
     output_path: Path,
     conds_path: Path | None,
+    t3_filename: str = "t3_turbo_v1.safetensors",
+    hparams: dict | None = None,
 ):
-    """Convert Chatterbox-Turbo base T3 (GPT-2 from safetensors) + conds + VE."""
-    print(f"\n=== Writing Turbo T3 GGUF: {output_path} ===")
+    """Convert Chatterbox-Turbo/Nano T3 (GPT-2 from safetensors) + conds + VE."""
+    print(f"\n=== Writing Turbo-family T3 GGUF: {output_path} ===")
+    if hparams is None:
+        hparams = KARTOFFELBOX_T3_HPARAMS
 
     writer = GGUFWriter(str(output_path), "chatterbox")
 
     # ── Hyperparameters ──
-    for k, v in KARTOFFELBOX_T3_HPARAMS.items():
+    for k, v in hparams.items():
         key = f"chatterbox.t3.{k}"
         if isinstance(v, int):
             writer.add_uint32(key, v)
@@ -750,7 +774,7 @@ def write_turbo_t3_gguf(
         print(f"  Precomputed conds loaded")
 
     # ── T3 weights from safetensors (GPT-2 Conv1D — need transpose) ──
-    t3_path = model_dir / "t3_turbo_v1.safetensors"
+    t3_path = model_dir / t3_filename
     if not t3_path.exists():
         sys.exit(f"Missing {t3_path}")
     t3_tensors = load_safetensors(t3_path)
@@ -997,8 +1021,9 @@ def main():
                         help="HF repo ID or local directory with safetensors")
     parser.add_argument("--output-dir", required=True,
                         help="Output directory for GGUF files")
-    parser.add_argument("--variant", default=None, choices=["kartoffelbox", "turbo"],
-                        help="Model variant (turbo = Chatterbox-Turbo base, kartoffelbox = Kartoffelbox fine-tune)")
+    parser.add_argument("--variant", default=None, choices=["kartoffelbox", "turbo", "nano"],
+                        help="Model variant (turbo = Chatterbox-Turbo base, nano = Chatterbox-Nano, "
+                             "kartoffelbox = Kartoffelbox fine-tune)")
     parser.add_argument("--t3-only", action="store_true",
                         help="Only convert T3 model")
     parser.add_argument("--s3gen-only", action="store_true",
@@ -1030,6 +1055,22 @@ def main():
             conds_path if conds_path.exists() else None,
         )
         print("\nDone!")
+        return
+
+    if args.variant == "nano":
+        # Chatterbox Nano (#382): only the T3 differs from Turbo. The
+        # s3gen_meanflow / ve / conds files in ResembleAI/chatterbox-nano
+        # are byte-identical to ResembleAI/chatterbox-turbo, so the
+        # existing chatterbox-turbo S3Gen GGUF is reused as companion.
+        conds_path = model_dir / "conds.pt"
+        write_turbo_t3_gguf(
+            model_dir,
+            out_dir / "chatterbox-nano-t3-f16.gguf",
+            conds_path if conds_path.exists() else None,
+            t3_filename="t3_nano_v1.safetensors",
+            hparams=NANO_T3_HPARAMS,
+        )
+        print("\nDone! (S3Gen not converted — Nano reuses the Turbo S3Gen verbatim.)")
         return
 
     if args.variant == "turbo":

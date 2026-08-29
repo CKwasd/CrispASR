@@ -1,6 +1,6 @@
 # Text-to-Speech (TTS)
 
-CrispASR ships **thirty-five open-weights TTS engine families** (54 registered
+CrispASR ships **thirty-five open-weights TTS engine families** (55 registered
 TTS backends once variants are counted — see `docs/feature-matrix.md`) behind
 the same `crispasr` binary, each with a distinct voice / quality / footprint
 trade-off:
@@ -1057,6 +1057,10 @@ and the GPT-2-T3 path (turbo/kartoffelbox-turbo):
 ```bash
 # Distilled English (350 M, 2-step meanflow S3Gen — faster than base):
 ./build/bin/crispasr --backend chatterbox-turbo -m auto --tts "..." --tts-output out.wav
+
+# Nano (#382): GPT2-small T3 (12L/768, ~345 MB Q8) on the SAME Turbo S3Gen —
+# the registry auto-downloads the Turbo S3Gen as companion:
+./build/bin/crispasr --backend chatterbox-nano -m auto --tts "..." --tts-output out.wav
 
 # German fine-tune of Turbo (SebastianBodza/Kartoffelbox_Turbo):
 ./build/bin/crispasr --backend kartoffelbox-turbo -m auto -l de \
