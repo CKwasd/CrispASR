@@ -99,8 +99,12 @@ The LFM2 backbone uses two distinct cache types:
 
 | Strategy | Used by | Pros | Cons |
 |----------|---------|------|------|
-| `ggml_backend_sched` | 73 backends | GPU offload, automatic tensor placement | More complex setup |
-| `ggml_gallocr` | 11 backends | Simple, exact allocation | CPU-only, manual tensor_set/get |
+| `ggml_backend_sched` | 61 runtime files exclusively (+17 mixed) | GPU offload, automatic tensor placement | More complex setup |
+| `ggml_gallocr` | 16 runtime files exclusively (+17 mixed) | Simple, exact allocation | CPU-only, manual tensor_set/get |
+
+Counts are per `src/*.cpp` runtime file (some runtimes use both — e.g. a
+sched'd main graph plus a gallocr'd codec/vocoder subgraph). Re-derive with
+`grep -l ggml_backend_sched_new src/*.cpp` / `grep -l ggml_gallocr_new src/*.cpp`.
 | Fixed buffer (`no_alloc=false`) | Legacy / simple paths | Simplest code | Wasteful, page-fault overhead |
 
 ## Performance Benchmarks (LFM2-Audio, 4-core CPU)

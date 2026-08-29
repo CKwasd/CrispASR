@@ -112,7 +112,9 @@ CPU fallback on a machine with no NVIDIA driver.
 
 ## Prerequisites
 
-- C++17 compiler (GCC 10+, Clang 12+, MSVC 19.30+)
+- C++17 compiler with C++20 support (GCC 10+, Clang 12+, MSVC 19.30+; the
+  global standard is C++17, but the `cohere` backend target compiles as
+  C++20 via `target_compile_features(cohere PUBLIC cxx_std_20)`)
 - CMake 3.14+
 - `curl` or `wget` on `$PATH` if you want to use `-m auto` auto-download
 
