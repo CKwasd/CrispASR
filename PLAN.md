@@ -39,6 +39,33 @@ VAD-throttle first (uncontroversial), delta encode behind
 `CRISPASR_COHERE_DELTA=1` with the full-encode default retained, acceptance
 = transcript equality vs the full-encode path over long audio, not wall
 clock.
+## CLAIMED 2026-08-29 — #400 Windows CUDA 13 package
+
+Worktree: `.claude/worktrees/feat-win-cuda13`, branch `feat/win-cuda13`.
+Linux got a CUDA-13-native tarball in #152; #400 asks for the Windows
+counterpart. Added `build-windows-cuda13` to release.yml — mirror of
+`build-windows-cuda` against CUDA 13.0.0, arch floor sm_75 (CUDA 13 dropped
+Maxwell/Pascal/Volta) kept in lockstep with `build-linux-x86_64-cuda13`,
+bundling `cudart64_13.dll`/`cublas64_13.dll`/`cublasLt64_13.dll` (CUDA 13
+moved them to `bin\x64\` — recursive glob) with the full #342 split treatment
+(`-non-cuda` zip, bare DLLs, sha256 manifest).
+`tools/check-cuda-split-packaging.py` now enforces toolkit lockstep **per
+CUDA major** instead of globally — the DLL names carry the major, so 12 and
+13 publish disjoint assets.
+
+Proof (the #403 regime — never ship an unexecuted recipe):
+`.github/workflows/win-cuda13-verify.yml` rebuilds the exact release recipe
+on `windows-2022`, asserts the three `*64_13.dll` land and that
+`ggml-cuda.dll` imports `cudart64_13.dll` (dumpbin), then runs the packaged
+`crispasr.exe` on `samples/jfk.wav` from the package dir on the GPU-less
+runner — proving the zip's driverless CPU fallback end-to-end. Triggers on
+any push touching itself or release.yml. Kaggle was considered and rejected
+as the proof vehicle: Linux-only, randomly assigns P100 (Pascal — dropped by
+CUDA 13 entirely), and its r560 driver would need forward-compat shims.
+GPU-executing-kernels proof rides on the already-shipped Linux cuda13 leg,
+which shares all device code.
+
+## CLAIMED 2026-08-28 — #397 Windows first-run recovery and release proof
 
 Worktree: `.claude/worktrees/fix-397-windows-release-proof`.
 Correct the missed diagnosis in #397 (the reporter's v0.8.29 Windows CUDA

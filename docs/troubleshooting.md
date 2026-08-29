@@ -198,25 +198,37 @@ diagnosing a crash: it means the problem is in loading the file, not locating it
 |---|---|
 | `crispasr-windows-x86_64-cpu.zip` | Default. Needs AVX2 + FMA (2013+ Intel / 2015+ AMD). |
 | `crispasr-windows-x86_64-cpu-legacy.zip` | Older CPU, or the AVX2 build died with `0xC000001D`. |
-| `crispasr-windows-x86_64-cuda.zip` | NVIDIA GPU. Self-contained. |
-| `crispasr-windows-x86_64-cuda-non-cuda.zip` | NVIDIA GPU, and you already have the three runtime DLLs. |
+| `crispasr-windows-x86_64-cuda.zip` | NVIDIA GPU. Self-contained, CUDA 12 runtime. Any GPU from Pascal (GTX 10xx) up. |
+| `crispasr-windows-x86_64-cuda13.zip` | NVIDIA GPU, Turing (GTX 16xx/RTX 20xx) or newer. Self-contained, CUDA 13 runtime (#400). |
+| `crispasr-windows-x86_64-cuda-non-cuda.zip` | As `-cuda.zip`, and you already have the three CUDA 12 runtime DLLs. |
+| `crispasr-windows-x86_64-cuda13-non-cuda.zip` | As `-cuda13.zip`, and you already have the three CUDA 13 runtime DLLs. |
 | `crispasr-windows-x86_64-vulkan.zip` | Cross-vendor GPU (AMD/Intel/NVIDIA). |
 
-The CUDA packages bundle **CUDA 12** runtime DLLs — `cudart64_12.dll`,
-`cublas64_12.dll`, `cublasLt64_12.dll`. They are published once per release and
-shared by both CUDA zips; see
+Each CUDA package bundles the runtime DLLs of its own major — the `-cuda` zips
+ship `cudart64_12.dll` / `cublas64_12.dll` / `cublasLt64_12.dll`, the `-cuda13`
+zips ship the `*64_13.dll` trio. Each trio is published once per release and
+shared by that major's zips; see
 [install.md § Windows CUDA: split downloads](install.md#windows-cuda-split-downloads-342)
-and check the `-runtime-sha256.txt` manifest before reusing DLLs from an older
-download.
+and check the matching `-runtime-sha256.txt` manifest before reusing DLLs from
+an older download.
 
-Two consequences worth knowing:
+Consequences worth knowing:
 
-- A separate CUDA Toolkit install is **not** required — the self-contained zip
-  ships what it needs. Having CUDA 13.x installed system-wide neither helps nor
-  is used by these binaries.
-- If you took the `-non-cuda` zip, the three DLLs must sit next to
-  `crispasr.exe`. A CUDA 13 toolkit does not provide them (its runtime is
-  `cudart64_13.dll`), so `-non-cuda` + "only CUDA 13 installed" will not work.
+- A separate CUDA Toolkit install is **not** required — a self-contained zip
+  ships what it needs, and either zip runs fine regardless of which (or no)
+  CUDA toolkit is installed system-wide. All that matters is the NVIDIA
+  **driver**: the `-cuda13` zip needs a CUDA-13-capable driver (r580+), the
+  `-cuda` zip runs on anything r525+.
+- The two runtimes are **not** interchangeable: `*64_12.dll` files do not
+  satisfy the `-cuda13` build and vice versa — the DLL names carry the major
+  precisely so a mismatch fails loudly instead of misloading.
+- Picking between them: `-cuda13` covers Turing (sm_75) through Blackwell —
+  CUDA 13 dropped Maxwell/Pascal/Volta entirely, so GTX 10xx / P100 / V100
+  users must take the CUDA 12 `-cuda.zip`. On hardware both support, either
+  works; prefer `-cuda13` on a current driver stack.
+- If you took a `-non-cuda` zip, the three matching DLLs must sit next to
+  `crispasr.exe` — take them from the release assets or from the `bin`
+  directory of an installed toolkit of the same major.
 
 On some Windows laptops the Vulkan device `0` is the Intel iGPU and the NVIDIA
 GPU is `1`; if Vulkan looks unexpectedly slow, rerun with `-dev 1`.

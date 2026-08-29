@@ -80,23 +80,35 @@ So each release ships both forms:
 
 | asset | contains |
 |---|---|
-| `crispasr-windows-x86_64-cuda.zip` | CLI, self-contained |
-| `crispasr-windows-x86_64-cuda-non-cuda.zip` | CLI, **without** the three DLLs |
-| `libcrispasr-windows-x86_64-cuda.tar.gz` | shared libs + headers, self-contained |
-| `libcrispasr-windows-x86_64-cuda-non-cuda.tar.gz` | shared libs + headers, **without** the three DLLs |
-| `cudart64_*.dll`, `cublas64_*.dll`, `cublasLt64_*.dll` | the three DLLs, on their own |
-| `crispasr-windows-x86_64-cuda-runtime-sha256.txt` | SHA-256 of each of the three |
+| `crispasr-windows-x86_64-cuda.zip` | CLI (CUDA 12), self-contained |
+| `crispasr-windows-x86_64-cuda-non-cuda.zip` | CLI (CUDA 12), **without** the three DLLs |
+| `crispasr-windows-x86_64-cuda13.zip` | CLI (CUDA 13, sm_75+, #400), self-contained |
+| `crispasr-windows-x86_64-cuda13-non-cuda.zip` | CLI (CUDA 13), **without** the three DLLs |
+| `libcrispasr-windows-x86_64-cuda.tar.gz` | shared libs + headers (CUDA 12), self-contained |
+| `libcrispasr-windows-x86_64-cuda-non-cuda.tar.gz` | shared libs + headers (CUDA 12), **without** the three DLLs |
+| `cudart64_*.dll`, `cublas64_*.dll`, `cublasLt64_*.dll` | the three DLLs of each CUDA major, on their own |
+| `crispasr-windows-x86_64-cuda*-runtime-sha256.txt` | SHA-256 of each trio (one manifest per major) |
 
 To upgrade without re-downloading the runtime: take the `-non-cuda` archive,
 unpack it, and copy the three DLLs you already have next to `crispasr.exe`
-(for the libs package, into `bin\`).
+(for the libs package, into `bin\`). The DLL file names carry the CUDA major
+(`cudart64_12.dll` vs `cudart64_13.dll`), so a CUDA 12 trio cannot be
+mistakenly installed into a CUDA 13 package or vice versa.
 
-The three DLLs are published **once** per release and shared by both packages —
-sound only because every CUDA-bundling job pins the same toolkit (12.8.0).
+Each trio is published **once** per release and shared by that major's
+packages — sound only because every CUDA-bundling job of the same major pins
+the same toolkit (12.8.0 for the CUDA 12 packages, 13.0.0 for CUDA 13).
 `tools/check-cuda-split-packaging.py` enforces that, along with the rule that
 any job bundling them must also ship a split archive and attach it to the
 release. Check the SHA-256 manifest before reusing DLLs from an older download;
 a CUDA version bump changes the filenames, which is your signal to re-fetch.
+
+The Windows CUDA 13 recipe is proven in CI by
+`.github/workflows/win-cuda13-verify.yml`: it rebuilds the exact release
+package on a GPU-less `windows-2022` runner, asserts the `*64_13.dll` wiring
+(`dumpbin /dependents` on `ggml-cuda.dll`), and runs the packaged
+`crispasr.exe` end-to-end on `samples/jfk.wav` — which also proves the zip's
+CPU fallback on a machine with no NVIDIA driver.
 
 ## Prerequisites
 
