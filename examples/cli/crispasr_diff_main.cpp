@@ -7827,7 +7827,7 @@ int main(int argc, char** argv) {
         {
             // Scratch file next to the reference, not a hardcoded machine path.
             std::string conv_dump = dirname_of(ref_path) + "/.moss-diarize-conv-stem.bin";
-            setenv("CRISPASR_MOSS_DIARIZE_CONV_DUMP", conv_dump.c_str(), 1);
+            setenv("CRISPASR_MOSS_DIARIZE_DUMP_CONV", conv_dump.c_str(), 1);
         }
 
         // encoder_output + audio_embeds: full chunked pipeline
