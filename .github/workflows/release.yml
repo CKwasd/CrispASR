@@ -2182,10 +2182,10 @@ jobs:
         with:
           cuda: '13.0.0'
           method: 'network'
-          # "crt" is NEW in the CUDA 13 Windows installer: crt/host_config.h
-          # moved out of the nvcc component into its own sub-package, and
-          # without it every nvcc compile dies with C1083 on cuda_runtime.h.
-          sub-packages: '["nvcc", "crt", "cudart", "cublas", "cublas_dev", "nvrtc", "nvrtc_dev", "nvtx", "cuda_profiler_api", "visual_studio_integration"]'
+          # "crt" and "nvvm" are NEW in the CUDA 13 Windows installer: crt/host_config.h
+          # and cicc.exe moved out of the nvcc component into their own sub-packages;
+          # without them every nvcc compile dies (C1083 on cuda_runtime.h / cicc not found).
+          sub-packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "nvrtc", "nvrtc_dev", "nvtx", "cuda_profiler_api", "visual_studio_integration"]'
 
       - name: Build
         shell: cmd
