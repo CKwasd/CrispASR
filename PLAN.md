@@ -1,6 +1,44 @@
 # CrispASR — Pending work
 
-## CLAIMED 2026-08-28 — #397 Windows first-run recovery and release proof
+## 2026-08-29 — external PRs #408 + #406 merged (with fixes); #404 stays open
+
+Worktree: `.claude/worktrees/integr-prs`, branch `integr/prs` (merge commits
+preserve contributor authorship).
+
+**#408 (tilllt) — `GET /progress`** merged, then hardened: the
+`progress_scope` moved INSIDE the model-mutex block (a request queued behind
+a running job used to reset the live job's progress to 0, and the first
+finisher flipped the server "idle" while the second still ran); busy is now
+an active-job COUNTER so it stays honest under `--server-workers`; the chunk
+loop claims a chunk when it STARTS (`i`, not `i+1` — which read 100 while the
+last chunk was still decoding) and pins 100 through the diarize/punc/truecase
+tail; the route is auth-gated like /backends (only /health is public);
+contributor's "Change 150 (polyschnack)" German comments replaced; endpoint
+documented in docs/server.md ("Progress endpoint").
+
+**#406 (jltjarvinen) — packed SIMD Conv1d (Chatterbox F0 + HiFT ResBlocks,
+CosyVoice3 HiFT)** merged as-is: it already follows the house rules — opt-in
+env gates (`CRISPASR_S3GEN_SIMDCONV`, `CRISPASR_COSYVOICE3_SIMDCONV`, plus
+`*_DEBUG`), default ggml path untouched, engages only when the vocoder is
+CPU-resident, load-time pack with full rollback on any unexpected tensor,
+runtime ISA dispatch (scalar/NEON/AVX2/AVX-512F via target attributes, so no
+portable-CPU-baseline violation), fp-contract off + fixed K→IC reduction
+order for scalar/SIMD parity, hermetic unit tests for both adapters. F0's
+k=3 conv was refactored onto the shared `core/cpu_packed_conv1d.h` (covered
+by the pre-existing `test-chatterbox-f0-simd` suite). Author measured
+~20–25 % CPU HiFT reduction on Zen 4. Follow-up before any default flip:
+Kaggle A/B under identical load + TTS→ASR roundtrip per HARD RULE 4 (local
+roundtrip proof for chatterbox in this merge's validation, below).
+
+**#404 (CKwasd) — cohere streaming delta encoding RFC** NOT merged, by the
+author's own framing ("proposal, not ready-to-merge"): the delta chain
+replaces the full-encode streaming path UNCONDITIONALLY (no env gate — the
+one hard blocker), clang-format job is red, and the 11-point A/B matrix is
+partially `pending_re-run`. Direction to give: stage it, P0 ring-buffer +
+VAD-throttle first (uncontroversial), delta encode behind
+`CRISPASR_COHERE_DELTA=1` with the full-encode default retained, acceptance
+= transcript equality vs the full-encode path over long audio, not wall
+clock.
 
 Worktree: `.claude/worktrees/fix-397-windows-release-proof`.
 Correct the missed diagnosis in #397 (the reporter's v0.8.29 Windows CUDA

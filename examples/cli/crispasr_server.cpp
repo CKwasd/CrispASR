@@ -14,6 +14,7 @@
 //   POST /v1/audio/separation          — source separation (--separate-model; §381)
 //   POST /load                        — hot-swap model
 //   GET  /health                      — server status
+//   GET  /progress                    — poll the active job's progress (#408)
 //   GET  /backends                    — list available backends
 //   GET  /v1/models                   — OpenAI-compatible model list
 //   GET  /v1/voices                   — list voices in --voice-dir (CAP_TTS only)
@@ -452,19 +453,25 @@ struct stage_scope {
 // Load audio from a multipart file upload, transcribe it, return result.
 // Acquires model_mutex internally.
 
-// Change 150 (polyschnack): per-server progress for the webapp. One job per
-// container today, so a single atomic is honest; with --server-workers
-// concurrency this needs per-request scoping (future work).
-static std::atomic<int> g_server_progress{-1}; // 0..100, -1 = idle
-static std::atomic<bool> g_server_busy{false};
+// GET /progress state (#408). busy = any transcription job in flight (primary
+// or pooled worker); progress = chunk-loop position of the most recent writer,
+// 0..100, -1 when idle. A progress_scope is constructed AFTER the job's model
+// mutex is acquired, so a request queued behind a running job neither resets
+// the running job's progress nor flips the server idle when it was first to
+// finish. With --server-workers > 1, concurrent pure-ASR jobs share the one
+// progress slot (last writer wins); per-request scoping would need job ids,
+// which the polling client in #408 does not need yet — the busy count stays
+// honest either way.
+static std::atomic<int> g_server_progress{-1};
+static std::atomic<int> g_server_active{0};
 struct progress_scope {
-    explicit progress_scope() {
-        g_server_progress = 0;
-        g_server_busy = true;
+    progress_scope() {
+        g_server_active.fetch_add(1, std::memory_order_relaxed);
+        g_server_progress.store(0, std::memory_order_relaxed);
     }
     ~progress_scope() {
-        g_server_busy = false;
-        g_server_progress = -1;
+        if (g_server_active.fetch_sub(1, std::memory_order_acq_rel) == 1)
+            g_server_progress.store(-1, std::memory_order_relaxed);
     }
     progress_scope(const progress_scope&) = delete;
     progress_scope& operator=(const progress_scope&) = delete;
@@ -477,7 +484,6 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
                                           truecaser_lstm_context* tc_lstm_ctx = nullptr) {
     transcription_result result;
     result.language = rp.language;
-    progress_scope _progress; // Change 150: /progress liefert 0..100
 
     if (rp.verbose)
         fprintf(stderr, "crispasr-server: processing '%s' (%zu bytes)\n", log_sanitize(audio_file.filename).c_str(),
@@ -686,6 +692,7 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
 
     {
         std::lock_guard<std::mutex> lock(model_mutex);
+        progress_scope _progress; // #408: GET /progress reports this job now
         auto t0 = std::chrono::steady_clock::now();
 
         // Match file-mode `-l auto`: run LID once per uploaded audio sample
@@ -750,7 +757,9 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
 
         for (size_t i = 0; i < slices.size(); ++i) {
             const auto& sl = slices[i];
-            g_server_progress = (int)((i + 1) * 100 / slices.size()); // Change 150
+            // #408: claim the chunk when it STARTS — (i+1) here would read 100
+            // while the last chunk is still transcribing.
+            g_server_progress = (int)(i * 100 / slices.size());
             auto tc0 = std::chrono::steady_clock::now();
             auto segs = backend->transcribe(pcmf32.data() + sl.start, sl.end - sl.start, sl.t0_cs, rp);
             if (rp.return_logits)
@@ -790,6 +799,11 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
                         (sl.end - sl.start) / (double)SR, slice_s);
             }
         }
+
+        // #408: all chunks decoded; the job stays busy at 100 through the
+        // post-steps below (diarization/punctuation/truecasing) until the
+        // scope exits.
+        g_server_progress = 100;
 
         // Issue #356: same guard as the CLI's merge_segments. The server has no
         // merge step of its own — it appends each slice's segments straight into
@@ -2302,12 +2316,15 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     });
 
     // -----------------------------------------------------------------------
-    // GET /progress — Change 150 (polyschnack): 0..100 des aktuellen Jobs.
-    // busy=false → idle; progress=-1 → kein Fortschritt bekannt.
+    // GET /progress (#408) — poll the active transcription job:
+    // {"busy": bool, "progress": -1..100}, -1 = idle. Auth-gated like the
+    // other introspection routes; /health stays the public liveness probe.
     // -----------------------------------------------------------------------
-    svr.Get("/progress", [&](const Request&, Response& res) {
+    svr.Get("/progress", [&](const Request& req, Response& res) {
+        if (!require_auth(req, res))
+            return;
         char buf[96];
-        snprintf(buf, sizeof(buf), "{\"busy\": %s, \"progress\": %d}", g_server_busy.load() ? "true" : "false",
+        snprintf(buf, sizeof(buf), "{\"busy\": %s, \"progress\": %d}", g_server_active.load() > 0 ? "true" : "false",
                  g_server_progress.load());
         res.set_content(buf, "application/json");
     });

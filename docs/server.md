@@ -706,6 +706,28 @@ Error codes: `chat_disabled` (503), `chat_init_failed`, `chat_reset_failed`,
 `chat_generate_failed`, `chat_stream_failed` (500), `invalid_json`,
 `missing_required_field`, `invalid_message` (400).
 
+## Progress endpoint (#408)
+
+`GET /progress` lets a client poll the progress of the transcription job the
+server is currently running, so a UI can show a real 0–100 bar instead of a
+heartbeat while a long synchronous `POST` is in flight:
+
+```bash
+curl -H "Authorization: Bearer $KEY" http://localhost:8080/progress
+# idle:            {"busy": false, "progress": -1}
+# job running:     {"busy": true,  "progress": 42}
+# post-processing: {"busy": true,  "progress": 100}   (diarization/punctuation tail)
+```
+
+`progress` advances per chunk of the server's chunk loop, reaches 100 when the
+last chunk has decoded, and stays there while post-steps (diarization,
+punctuation, truecasing) finish; it returns to `-1` when the job completes.
+Requests queued behind a running job do not disturb its reading. With
+`--server-workers > 1`, `busy` counts every in-flight job but concurrent jobs
+share the single `progress` slot (last writer wins) — per-request progress
+would need job ids and is out of scope for now. The endpoint requires an API
+key when keys are configured (only `/health` is public).
+
 ## Request limits & error handling
 
 - **Upload cap: 512 MB.** A larger `Content-Length` is rejected with `413`

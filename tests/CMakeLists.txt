@@ -4908,6 +4908,17 @@ set_tests_properties(test-server-tts PROPERTIES
     LABELS "live;server;tts"
     TIMEOUT 600)
 
+# ─── test-server-progress — live: GET /progress contract (#408): idle -1,
+# busy with 0..100 during a running job, reset after, and auth-gated like the
+# other introspection routes. Auto-discovers a small whisper/moonshine model;
+# SKIPs (exit 0) otherwise.
+add_test(NAME test-server-progress
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-server-progress.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-server-progress PROPERTIES
+    LABELS "live;server"
+    TIMEOUT 600)
+
 # ─── test-server-stream-resilience — live: the detached streaming-TTS worker
 # must not crash the server on an exception. Forces a worker throw
 # (CRISPASR_TEST_STREAM_THROW=1 + magic input) and asserts the server survives +

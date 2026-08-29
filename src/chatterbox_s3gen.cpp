@@ -824,7 +824,11 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
     {
         const char* e = std::getenv("CRISPASR_S3GEN_SIMDCONV");
         const bool requested = e && *e && e[0] != '0';
-        const bool cpu_vocoder = c->backend == c->backend_cpu || s3gen_env_force_cpu(s3gen_subgraph::vocoder);
+        // is_cpu(), not `backend == backend_cpu`: a context can hold a separate
+        // CPU backend instance for compute, and the pointer compare then reads
+        // "GPU" under --no-gpu (the parakeet pick_backend lesson) — which would
+        // silently keep SIMDCONV off on the exact machines it exists for.
+        const bool cpu_vocoder = core_cpu_backend::is_cpu(c->backend) || s3gen_env_force_cpu(s3gen_subgraph::vocoder);
         core_hift_simdconv::Packer pack(requested && cpu_vocoder);
 
         const int dilations[3] = {1, 3, 5};
