@@ -902,7 +902,7 @@ original providers, not with a downstream requantizer. Model cards in
 | Text translation | Minimal risk; semantics-preserving | — |
 | Language identification | Not biometric categorisation | — |
 | Denoise / source separation | Art. 50(2) assistive exemption | — |
-| TTS synthesis (52 engines) | **Art. 50(2)** — marked | watermark + C2PA, default-on, watertight floor on CLI, server *and* Wyoming |
+| TTS synthesis (54 engines) | **Art. 50(2)** — marked | watermark + C2PA, default-on, watertight floor on CLI, server *and* Wyoming |
 | Wyoming TTS (`--wyoming-port`) | **Art. 50(2) + 50(4)** | watermark always forced; clones disclaimed, and refused without operator `--i-have-rights` |
 | Voice cloning (`.wav` ref, inline bake, stamped pack, **or bank entry**) | **Art. 50(2) + 50(4)** | + spoken disclaimer + `--i-have-rights`; `test-voice-clone-policy` |
 | **Preset voice that is a real person** | **Art. 50(2) + 50(4)** — a deep fake without being a clone | `speaker_identity=real_person` → spoken disclaimer, **no** consent gate; `test-speaker-identity` (§6.2a) |
@@ -960,10 +960,10 @@ rots:
 | Chat / synthetic-text disclosure | `crispasr_chat_ai_disclosure_text()` in `src/chat.cpp`; call sites in `crispasr_chat_main.cpp`, `crispasr_server.cpp` (`X-Crispasr-Ai-*`), `flutter/crispasr/lib/src/chat.dart` |
 | Voice upload consent gate | `POST /v1/voices` in `crispasr_server.cpp` (`consent_attestation`, `[CONSENT] scope=voice-upload`) |
 | Which containers carry a manifest | `crispasr_marking::container_marking_for_format()` in `crispasr_marking_policy.h` |
-| Voice-pack clone provenance stamp | written by `tada_encoder_write_ref_gguf()` + all 3 `models/*` voice bakers; read by `crispasr_voice::read_pack_provenance()` |
+| Voice-pack clone provenance stamp | written by `tada_encoder_write_ref_gguf()` + all 5 `models/*` voice bakers; read by `crispasr_voice::read_pack_provenance()` |
 | Legacy pack classification by producer | `crispasr_voice::architecture_is_recording_derived()` |
 | Watermark score → p-value / verdict | `examples/cli/crispasr_watermark_stats.h` (+ `tests/test-voice-clone-policy.cpp`) |
-| Watermark embed / detect | `examples/cli/crispasr_watermark.h`, `crispasr_watermark_dispatch.h` |
+| Watermark embed / detect | `src/core/crispasr_watermark.h`, `examples/cli/crispasr_watermark_dispatch.h` |
 | Watertight CLI marking floor | `crispasr_enforce_cli_watermark_floor()` in `examples/cli/crispasr_run.cpp` |
 | **Container-less surfaces (Wyoming)** | `crispasr_marking::decide_raw_surface()` in `crispasr_marking_policy.h` (+ `tests/test-marking-policy.cpp`); call site in `examples/cli/wyoming.cpp` (+ `tests/test-wyoming-marking.py`) |
 | C2PA signing | `src/core/crispasr_c2pa.h`, `third_party/c2pa-audio` |

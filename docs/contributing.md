@@ -255,7 +255,7 @@ The `--list-backends` capability row is read live from the backend's
 
 ### C ABI — `src/crispasr_c_api.cpp` (this is what the bindings/server call)
 Python/Go/Dart/server use the **session C ABI**, not the CLI factory.
-Nine edit points, each mirroring the `CA_HAVE_CHATTERBOX` blocks:
+Ten edit points, each mirroring the `CA_HAVE_CHATTERBOX` blocks:
 1. **include + flag:** `#if __has_include("yourmodel.h")` → `#include` →
    `#define CA_HAVE_YOURMODEL 1` → `#endif`.
 2. **session struct field:** `#ifdef CA_HAVE_YOURMODEL  yourmodel_context* yourmodel_ctx = nullptr;  #endif`.
@@ -277,15 +277,20 @@ Nine edit points, each mirroring the `CA_HAVE_CHATTERBOX` blocks:
    prompt)` setter to the runtime, and forward `s->ask` in the transcribe
    dispatch. This lets `set_ask()` override the default transcription
    instruction. Currently wired for: granite, voxtral, qwen3-asr,
-   glm-asr, gemma4-e2b, mimo-asr, higgs-stt.
+   glm-asr, gemma4-e2b, mimo-asr, higgs-stt, ark-asr, moss-audio,
+   moss-diarize, mini-omni2, lfm2-audio.
 9b. **`params.language` wiring** — if the backend is an audio-LLM, also
    inject a language hint into the prompt when `params.language` is set
    and non-auto. Pattern: `else if (!params.language.empty() && params.language
    != "auto") { sys_instruction = "Transcribe the speech in " + lang_name(params.language) + "."; }`.
-   For **English-only** models (moonshine-streaming, kyutai-stt), emit a
-   `fprintf(stderr, ...)` warning instead of silently ignoring the flag.
+   For a model that cannot honour the request, emit a `fprintf(stderr, ...)`
+   warning instead of silently ignoring the flag — moonshine-streaming warns
+   "English-only model; language=… ignored", and kyutai-stt asks the context
+   (`kyutai_stt_supports_language`) and names what the loaded GGUF actually
+   supports (#366: the blanket "English-only" warning was wrong for the default
+   `stt-1b-en_fr`). Both warnings live in the CLI adapters.
    Currently wired for: granite (v3 + v4 templates), qwen3-asr, glm-asr,
-   moss-audio, mimo-asr, higgs-stt; warned for moonshine-streaming, kyutai-stt.
+   moss-audio, mimo-asr, higgs-stt, ark-asr.
 10. **`crispasr_session_set_speaker_id()`** — if the backend is a
     multi-speaker TTS model with integer-indexed speakers (e.g. melotts,
     piper, fastpitch). Add a dispatch block that bounds-checks against
@@ -414,11 +419,14 @@ escape hatch.
   architecture details"; README/tts.md link `docs/architecture.md#yourmodel`.
 
 ### Build targets (don't be fooled by stale binaries)
-- `crispasr` → the **library** (libcrispasr / `.dylib`).
+- `crispasr-lib` → the **library** (`OUTPUT_NAME crispasr` → libcrispasr / `.dylib`).
 - `crispasr-cli` → the **CLI binary** (`OUTPUT_NAME crispasr`).
 - `crispasr-diff` → the diff harness.
 
-After C-ABI edits, build **`crispasr`** (the dylib) and re-test the Python
+(There is no bare `crispasr` target — `add_library(whisper ALIAS crispasr-lib)`
+is the only alias.)
+
+After C-ABI edits, build **`crispasr-lib`** (the dylib) and re-test the Python
 `Session` — building only `crispasr-cli` may leave the dylib stale, and the
 binding then loads an old backend list. Verify with:
 ```python
@@ -596,8 +604,9 @@ This is not hypothetical: #308's capitalisation fix landed in
 `src/fireredpunc.cpp` while `crisp_punc/src/fireredpunc.cpp` — the copy that
 actually links — kept the bug for months. Every symptom pointed at the file that
 was already correct, and instrumenting that file produced no output at all,
-which is the tell. `tests/test-punc-copies-in-sync.cpp` now fails when the two
-diverge; keep it green rather than deleting the assertion.
+which is the tell. `tests/test-copies-in-sync.cpp` now fails when the two
+diverge (it was extended from the punc pair to all 14 duplicated files); keep it
+green rather than deleting the assertion.
 
 ### Mel spectrogram
 

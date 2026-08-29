@@ -59,9 +59,15 @@ crispasr -m auto --backend cohere -f meeting.wav \
 `--diarize-speakers` is shorthand for `--diarize --diarize-method pyannote
 --diarize-embedder auto` (it only fills in fields you didn't set explicitly):
 the pyannote segmenter gives proper speaker-turn boundaries and the embedder
-clusters them into stable per-recording labels. Tune clustering with
-`--diarize-cluster-threshold` (default `0.5`; higher = more distinct clusters)
-and `--diarize-max-speakers` (default `8`). The first run auto-downloads the
+clusters them into stable per-recording labels. By default the embedding stage
+**estimates the speaker count itself** (`core_spectral::cluster_speakers` —
+PCA + GMM/BIC, then spectral clustering), bounded above by
+`--diarize-max-speakers` (default `8`) and, when you know it, pinned by
+`--diarize-num-speakers`. Passing `--diarize-cluster-threshold` *explicitly*
+(default `0.5`; higher = more distinct clusters) switches that stage to the
+legacy agglomerative single-linkage clusterer instead — the threshold is
+meaningless to the spectral path, so its default value is never applied.
+The first run auto-downloads the
 pyannote segmentation GGUF (~6 MB) and the TitaNet embedder (~46 MB).
 
 The output uses generic labels:
@@ -246,8 +252,10 @@ outside Annex III(1)(a), and what the Act requires of you as deployer — is in
 
 - Session clustering: `crispasr_remap_speakers_via_embeddings()` in
   `examples/cli/crispasr_diarize_cli.cpp` — per-recording embedding extraction
-  + agglomerative clustering (`src/crispasr_speaker_cluster.cpp`). No
-  persistence.
+  + `core_spectral::cluster_speakers()` (`src/core/spectral_diarize.h`, the
+  count-estimating spectral clusterer foxnose also uses), falling back to
+  `crispasr_agglomerative_cluster()` (`src/crispasr_speaker_cluster.cpp`) only
+  when `--diarize-cluster-threshold` was passed explicitly. No persistence.
 - Embedder adapters (pluggable): `src/crispasr_speaker_embedder.{h,cpp}`
   (TitaNet-Large 192-d default; IndexTTS-BigVGAN ECAPA-TDNN 512-d).
 - Named profiles: `src/speaker_db.{h,cpp}` — the `.spkr` on-disk format

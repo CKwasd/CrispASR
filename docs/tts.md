@@ -1,7 +1,8 @@
 # Text-to-Speech (TTS)
 
-CrispASR ships **fourteen open-weights TTS engines** behind the same
-`crispasr` binary, each with a distinct voice / quality / footprint
+CrispASR ships **thirty-five open-weights TTS engine families** (54 registered
+TTS backends once variants are counted — see `docs/feature-matrix.md`) behind
+the same `crispasr` binary, each with a distinct voice / quality / footprint
 trade-off:
 
 ## Contents
@@ -44,7 +45,7 @@ trade-off:
 | **`piper`** | Tiniest footprint (30 MB). rhasspy/piper VITS; 250+ community voices across 30+ languages. Built-in G2P (CMUdict + LTS rules) for English — no espeak-ng needed. Optional espeak-ng for other langs (loaded via dlopen). 22 kHz output. Use `--g2p-dict` to select dictionary source. | No (per-voice GGUF) | Manual `wget` |
 | [`kokoro`](#kokoro--multilingual-smallest) | Smallest + fastest. 82 M-param StyleTTS2-derived model. Multilingual via built-in G2P or espeak-ng (dlopen/popen fallback). | No (preset voice packs) | Manual `wget` (no `-m auto`) |
 | [`qwen3-tts`](#qwen3-tts--voice-cloning-highest-fidelity) | Highest fidelity / strongest cloning. Speech-LLM (talker + code predictor + 12 Hz codec). Default voice auto-downloaded with `-m auto`; or supply your own WAV + ref-text. | Optional (auto default voice; or WAV + ref-text or baked voice GGUF) | ~1.3 GB via `-m auto` |
-| **`miotts`** | MioTTS-0.6B (Qwen3 LLM + MioCodec-v2). EN/JA. Single GGUF, 44.1 kHz output. Codec-aware mixed quantization (LLM Q4_K + codec F16). | Yes — `--voice preset.emb.gguf` (preset speaker embeddings) | 502 MB Q4_K via `-m auto` |
+| **`miotts`** | MioTTS-0.6B (Qwen3 LLM + MioCodec-v2). EN/JA. Single GGUF, 24 kHz output. Codec-aware mixed quantization (LLM Q4_K + codec F16). | Yes — `--voice preset.emb.gguf` (preset speaker embeddings) | 502 MB Q4_K via `-m auto` |
 | **`moss-tts`** | MOSS-TTS-v1.5 (MossTTSDelay): Qwen3-8B backbone emitting 32 RVQ audio codebooks under a delay pattern, decoded by a 1.6B transformer codec. Needs the codec companion (`--codec-model`, or auto-downloaded/sibling). | Yes — `--voice ref.wav` (the codec encoder clones the reference speaker) | ~5 GB Q4_K backbone + ~3.5 GB F16 codec via `-m auto` |
 | **`moss-tts-local`** | MOSS-TTS-Local-Transformer-v1.5 (MossTTSLocal, 4B): Qwen3-4B backbone + a 1-layer local/depth transformer that autoregressively emits 12 RVQ codebooks per frame (RQ-Transformer; no delay pattern), decoded to 48 kHz stereo by MOSS-Audio-Tokenizer-v2 (downmixed to mono). Needs the codec companion (`--codec-model`, or auto-downloaded/sibling). | `--voice ref.wav --i-have-rights` (needs the encoder-carrying codec, `--codec-model moss-tts-local-v1.5-codec-enc.gguf`; the plain `-codec.gguf` is decode-only and falls back to the default voice) | ~9.1 GB F16 backbone + ~2.1 GB codec via `-m auto` (F16 is the reliable target; Q4_K long-form runs away) |
 | **`omnivoice`** | 600+ languages, selected with `-l` / `-tl` (or `"language"` on `/v1/audio/speech`) — see the language note below. Qwen3-0.6B backbone with masked iterative 8-codebook TTS (SoundStorm-style). Zero-shot voice cloning from reference audio. Supports finetunes (omnivoice-singing). | Yes (`--voice <wav> --ref-text "..."`) | ~1.2 GB F16 + ~400 MB tokenizer |
@@ -65,7 +66,7 @@ trade-off:
 | **`fastpitch`** | NVIDIA FastPitch 60M: non-autoregressive parallel TTS — 6L FFTransformer encoder + duration/pitch predictors + length regulator + 6L FFTransformer decoder + HiFi-GAN @ 22 kHz. Deterministic (no sampling). CC-BY-4.0. | No (single speaker) | ~230 MB via `-m auto` (Q8_0 GGUF) |
 | **`bananamind-tts`** | BananaMind-TTS-V2.1 13M: Tacotron-lite (char tokenizer + Conv1d+BN+ReLU encoder + BiLSTM + AR GRU decoder with location-sensitive attention + postnet) + HiFi-GAN @ 22 kHz. English (LJ Speech) and German (ThorstenVoice). Apache-2.0. Runtime is designed as a template for standard Tacotron2 ports — add `decoder_rnn_type=lstm` to the GGUF to switch to the LSTM decoder path ([architecture notes](architecture.md#bananamind-tts)). | No (fixed voice per locale) | ~40 MB Q8_0 / ~50 MB F32 per locale |
 | [`parler-tts`](#parler-tts--prompt-conditioned-voice-description) | Parler TTS Mini v1.1 (~900M): T5 encoder + MusicGen decoder + DAC 44.1 kHz. Apache-2.0. Prompt-conditioned: describe the voice in natural language via `--instruct`. | No (prompt-conditioned) | ~900 MB via `-m auto` (Q8_0 GGUF) |
-| **`voxcpm2-tts`** | VoxCPM2: 2B Qwen2 backbone + flow matching + BigVGAN @ 48 kHz (decimated to 24 kHz). Zero-shot voice cloning via `--voice <ref.wav>`. | Yes | ~2.4 GB via `-m auto` |
+| **`voxcpm2-tts`** | VoxCPM2: 2B Qwen2 backbone + flow matching + VAE decoder @ 48 kHz. Zero-shot voice cloning via `--voice <ref.wav>`. | Yes | ~2.4 GB via `-m auto` |
 | [`pocket-tts`](#pocket-tts-voices-and-environment-switches) | Kyutai Pocket TTS 100M: continuous-latent AR @ 12.5 Hz + one-step LSD flow head + Mimi VAE decoder → 24 kHz. CC-BY-4.0 plus gated-use conditions. Voice cloning via `--voice ref.wav`. | Yes (`--voice`) | ~220 MB via `-m auto` (F16 GGUF) |
 | **`kugelaudio`** | KugelAudio-0-Open: 7B Qwen2.5 backbone + 4-layer DiT diffusion head (20-step SDE-DPMSolver++) + acoustic VAE decoder → 24 kHz. 23 languages. MIT. | Pre-encoded voices (`--voice voice.gguf`) | ~17.3 GB F16 via `-m auto` — needs >16 GB VRAM, else `--no-gpu`. The ~5.7 GB Q4_K is **not** a usable substitute: it stutters and loops (WER 0.72 vs 0.056 for F16) |
 | [`tada-1b`](#tada--multilingual-and-voice-cloning) | HumeAI TADA 1B: Llama-3.2-1B backbone + per-token flow-matching diffusion head + TADA codec → 24 kHz. **English-only.** `-m auto` downloads model + default `tada-ref.gguf`. | Yes (`--voice <tada-ref.gguf>`, English voice refs only) | ~1.7 GB Q4_K + ~1 GB codec |
@@ -178,9 +179,10 @@ speech. Two options — pure C++ (no Python) or the Python converter:
 
 #### Option 1: C++ `--make-ref` (no Python needed)
 
-Place `tada-encoder-f16.gguf` and `tada-aligner-en.gguf` (from
-[cstr/tada-encoder-GGUF](https://huggingface.co/cstr/tada-encoder-GGUF))
-next to your TADA model GGUF, then:
+Place `tada-encoder-f16.gguf` and `tada-aligner-en.gguf` (they ship in the
+same repo as the model — [cstr/tada-tts-3b-ml-GGUF](https://huggingface.co/cstr/tada-tts-3b-ml-GGUF)
+for `tada` / `tada-3b-ml`, [cstr/tada-tts-1b-GGUF](https://huggingface.co/cstr/tada-tts-1b-GGUF)
+for `tada-1b`) next to your TADA model GGUF, then:
 
 ```bash
 # Step 1 — bake the ref GGUF (one-time per speaker):
@@ -224,8 +226,10 @@ the language of the text you will synthesise.
 ### Encoder / aligner GGUFs
 
 The encoder pipeline (WAV+transcript → voice reference) is ported to C++/ggml.
-Pre-converted GGUFs are on HuggingFace at
-[cstr/tada-encoder-GGUF](https://huggingface.co/cstr/tada-encoder-GGUF):
+Pre-converted GGUFs sit alongside the model in
+[cstr/tada-tts-3b-ml-GGUF](https://huggingface.co/cstr/tada-tts-3b-ml-GGUF)
+(and [cstr/tada-tts-1b-GGUF](https://huggingface.co/cstr/tada-tts-1b-GGUF) for
+`tada-1b`); `--auto-download` fetches them into the cache on demand:
 
 | File | Size | Description |
 |------|------|-------------|
@@ -251,15 +255,18 @@ voice).
 TADA predicts each token's duration with a per-token flow-matching head that
 is **noise-sensitive**: an unlucky noise draw can collapse durations into a
 rushed, unintelligible utterance (a known property of the model — the PyTorch
-reference behaves identically with the same noise). To make output robust,
-CrispASR generates several flow-matching candidates per token and keeps the
-best one by reconstruction likelihood (the same `num_acoustic_candidates`
-ranking the reference implements).
+reference behaves identically with the same noise). CrispASR can generate
+several flow-matching candidates per token and keep the best one by
+reconstruction likelihood (the same `num_acoustic_candidates` ranking the
+reference implements).
 
-The CLI defaults to **4 candidates**. Override with `CRISPASR_TADA_NUM_CANDIDATES`:
+The default is **1 candidate**, matching upstream `InferenceOptions` — best-of-N
+is opt-in because the reconstruction scorer looks at acoustic dims only and can
+prefer a duration outlier ("…four hours" → "…and forth", #192). Override with
+`CRISPASR_TADA_NUM_CANDIDATES`:
 
 ```bash
-# Fastest, single noise draw (may occasionally rush/garble timing):
+# Default: single noise draw (may occasionally rush/garble timing):
 CRISPASR_TADA_NUM_CANDIDATES=1 crispasr --backend tada-3b-ml -m auto -l fr \
     --tts "Bonjour, comment allez-vous ?" --tts-output out.wav
 
@@ -272,8 +279,8 @@ All candidates for a step are solved in a single batched flow-matching forward,
 so raising the count adds little wall-clock on top of the (model-load-dominated)
 baseline. `1` reproduces a single draw and is the fastest.
 
-The same **default of 4** applies through the session C ABI, so the bindings
-and HTTP server get robust timing out of the box. Bindings can override it at
+The same **default of 1** applies through the session C ABI, so the bindings
+and HTTP server track the CLI. Bindings can override it at
 runtime with `set_tts_num_candidates(n)` (Python/Go/Rust/Ruby),
 `SetTtsNumCandidates` (C#/Java), or `setTtsNumCandidates` (Dart/JS) — and the
 `CRISPASR_TADA_NUM_CANDIDATES` env var is honoured by every consumer, not just the CLI.
@@ -711,7 +718,7 @@ the better single choice (68% vs 31%). Same for `used`, `read`, `desert`.
 
 ```bash
 crispasr --tts "unused" --tts-phonemes "həlˈO wˈɜɹld" --backend kokoro \
-         -m kokoro-82m-q8_0.gguf --voice kokoro-voice-af_heart.gguf -o out.wav
+         -m kokoro-82m-q8_0.gguf --voice kokoro-voice-af_heart.gguf --tts-output out.wav
 ```
 
 Synthesizes the phoneme string verbatim, skipping the G2P. This is the seam
@@ -916,7 +923,7 @@ defaults reproduce the validated, end-to-end-tested code path.
 | Variable | Default | Effect when set |
 |---|---|---|
 | `CRISPASR_QWEN3_TTS_SEED` | `42` | Override the AR sampling seed (superseded by `--seed N` on the CLI). |
-| `CRISPASR_QWEN3_TTS_MAX_FRAMES` | `1500` | Hard cap on AR decode steps. Short prompts that fail to sample `codec_eos` would otherwise run to the 1500-frame ceiling. |
+| `CRISPASR_QWEN3_TTS_MAX_FRAMES` | auto | Hard cap on AR decode steps, overriding the computed one. The default is the talker's KV ceiling (`1500` when unknown), then tightened per input to `max(240, codepoints × 12)` (#337) so a prompt that fails to sample `codec_eos` cannot run to a 4096-frame / 340 s "successful" synthesis. |
 | `CRISPASR_QWEN3_TTS_O15` | unset | Pin code-predictor `Lk = cp_kv_max_ctx` and reuse one cached T=1 graph across AR steps 2..14 (saves ~14-19 ms/frame on Mac/Metal — alloc+build collapse from ~20 ms/frame to ~1.6 ms/frame). Default flipped back to OFF after [#56](https://github.com/CrispStrobe/CrispASR/issues/56): the cached-graph reuse asserts on the CUDA backend (`GGML_ASSERT` in `ggml_backend_tensor_set` on first `code_pred_generate_15` call, Jetson Orin AGX sm_87). M1 Metal users who want the speedup should set `CRISPASR_QWEN3_TTS_O15=1`. Default goes back to ON once the CUDA path is verified. Largely superseded by `CRISPASR_QWEN3_TTS_CP_DIRECT`, which gets the same graph-reuse win without touching the scheduler. |
 | `CRISPASR_QWEN3_TTS_CP_DIRECT` | auto (GPU on, CPU off) | §232/#245: dispatch the code predictor through two persistent sched-free graphs (one T=2 step-0 graph, one T=1 step graph with the O15 topology), gallocr-allocated once on the code-pred backend. Each of the 15 per-frame steps is then just input `tensor_set` + one `ggml_backend_graph_compute` — no scheduler reset/alloc, so the sched-reuse breakage behind #56 cannot occur. Validated md5-identical WAV vs. the sched path on M1 Metal and CUDA P100 (0.6B Q8_0, seed 42; ASR roundtrip verbatim). Default ON when the code predictor runs on a GPU backend: Metal is ~equal on an idle box but ~3x faster under load (the sched path degrades badly under contention), CUDA P100 is ~11% faster. Default OFF on CPU, where there is no dispatch cost to save and the per-step lm_head slot blit (~2.2 MB memcpy ×14/frame) makes it ~2x slower. Set `=1`/`=0` to override either way; falls back to the sched path automatically when an op is unsupported on the backend or the code predictor is CPU-pinned. |
 | `CRISPASR_QWEN3_TTS_LK_BUCKET` | unset | Bucketed fixed-`Lk` talker AR steps (256/512/1024/2048/4096), one persistent graph per bucket. Since §232 the bucket graphs are gallocr-allocated once and dispatched sched-free (the previous sched-plan reuse segfaulted on current ggml — nil-buffer inputs, same root cause as #56). Stays opt-in: on Metal the fixed-`Lk` attention costs ~10% at short outputs; on CUDA P100 it was the fastest config (~5% under CP_DIRECT alone) — CUDA users can enable both. |
@@ -1049,15 +1056,15 @@ and the GPT-2-T3 path (turbo/kartoffelbox-turbo):
 
 ```bash
 # Distilled English (350 M, 2-step meanflow S3Gen — faster than base):
-./build/bin/crispasr --backend chatterbox-turbo -m auto --tts "..." -ow out.wav
+./build/bin/crispasr --backend chatterbox-turbo -m auto --tts "..." --tts-output out.wav
 
 # German fine-tune of Turbo (SebastianBodza/Kartoffelbox_Turbo):
 ./build/bin/crispasr --backend kartoffelbox-turbo -m auto -l de \
-    --tts "Hallo, das ist Kartoffelbox-Turbo." -ow out-de.wav
+    --tts "Hallo, das ist Kartoffelbox-Turbo." --tts-output out-de.wav
 
 # Arabic Llama-T3 fine-tune (oddadmix/lahgtna-chatterbox-v1):
 ./build/bin/crispasr --backend lahgtna-chatterbox -m auto -l ar \
-    --tts "مرحباً" -ow out-ar.wav
+    --tts "مرحباً" --tts-output out-ar.wav
 ```
 
 ### Multilingual language selection
@@ -1093,7 +1100,7 @@ not a guarantee of native pronunciation.
 For voice cloning, pass `--source-lang <code>` when the reference recording's
 language differs from the requested output language (`-l` or `--target-lang`).
 Chatterbox then follows the upstream V3 cross-lingual recommendation and uses
-CFG weight 0 unless an explicit `--cfg-scale` override is supplied. This keeps
+CFG weight 0 unless an explicit `--tts-cfg-scale` override is supplied. This keeps
 the reference speaker's timbre while reducing transfer of the reference
 language's accent. In server/session use, set the output language with the
 target/source language setter and the recording language with
@@ -1298,8 +1305,8 @@ Session-API knobs (runtime-settable via the session API, not CLI flags):
 | Setter | Default | Purpose |
 |---|---|---|
 | `set_top_p(p)` | 1.0 | Top-p nucleus-sampling threshold for the AR T3 token loop |
-| `set_min_p(p)` | 0.0 | Min-p sampling threshold |
-| `set_repetition_penalty(r)` | 1.0 | Repetition penalty (1.0 = no penalty; > 1 discourages repeated tokens) |
+| `set_min_p(p)` | 0.05 | Min-p sampling threshold |
+| `set_repetition_penalty(r)` | 1.2 | Repetition penalty (1.0 = no penalty; > 1 discourages repeated tokens) |
 | `set_cfg_weight(w)` | 0.5 | Classifier-free-guidance weight. 0 = unconditional; 0.5 = upstream default |
 | `set_exaggeration(e)` | 0.5 | Emotion-exaggeration scalar. Raise for dramatic delivery, lower for monotone |
 | `set_max_speech_tokens(n)` | 1000 | Upper bound on AR speech tokens per call (≈ 20 s at 50 Hz codes) |
@@ -1507,9 +1514,11 @@ blocks, perceiver output) useful for diff-testing against Python.
 
 Token IDs are bit-identical to Python `sentencepiece.SentencePieceProcessor.Encode`
 on the preprocessed string. Mixed CJK+English
-(`他用Python写了一个程序。`) works without special flags. Pass `-vv` to
-dump the BPE token IDs (`indextts: text_ids[...]`) for diffing against
-the Python reference if output sounds wrong.
+(`他用Python写了一个程序。`) works without special flags. Pass `-v` to
+print the preprocessed string and token count (`indextts: text "..." ->
+N tokens`) if output sounds wrong; the full BPE id dump
+(`indextts: text_ids[...]`) needs verbosity ≥ 2, which only the library /
+session API reaches — the CLI adapter pins verbosity to 1.
 
 **ASR-validate Chinese output with a real Chinese ASR.** `whisper-base`
 over-counts CER ~5× on Mandarin (we measured 21 % whisper-base vs
@@ -1579,18 +1588,18 @@ model (auto-discovered) or via `--codec-model`.
 ```bash
 # Plain synthesis:
 crispasr --backend irodori-tts -m irodori-tts-500m-v3-q8_0.gguf \
-    --codec-model dacvae-ja-32dim-f16.gguf --tts "こんにちは、世界。" -o out.wav
+    --codec-model dacvae-ja-32dim-f16.gguf --tts "こんにちは、世界。" --tts-output out.wav
 
 # Zero-shot voice cloning from any reference WAV:
 crispasr --backend irodori-tts -m irodori-tts-500m-v3-q8_0.gguf \
     --codec-model dacvae-ja-32dim-f16.gguf \
-    --voice reference.wav --i-have-rights --tts "テスト。" -o cloned.wav
+    --voice reference.wav --i-have-rights --tts "テスト。" --tts-output cloned.wav
 
 # VoiceDesign (600M-v3): style/emotion control via --instruct:
 crispasr --backend irodori-tts -m irodori-tts-600m-v3-voicedesign-q4_k.gguf \
     --codec-model dacvae-ja-32dim-f16.gguf \
     --instruct "落ち着いた大人の男性。深く響く声で丁寧に話している。" \
-    --tts "こんにちは、世界。" -o voicedesign.wav
+    --tts "こんにちは、世界。" --tts-output voicedesign.wav
 ```
 
 **Voice cloning** encodes the reference through the DAC-VAE encoder (resample →
@@ -1605,9 +1614,10 @@ breath, 😭 crying, …); include them in the text. See the model's
 harmlessly ignored.
 
 **Output length** is set by the model's duration predictor (kanji unpack to a
-variable number of mora, so a fixed chars/sec heuristic truncates). Nudge it with
-`--duration-scale` (`>1` longer), or pin the exact frame count with
-`CRISPASR_IRODORI_T_LATENT=N`.
+variable number of mora, so a fixed chars/sec heuristic truncates). Pin the exact
+frame count with `CRISPASR_IRODORI_T_LATENT=N`; the runtime's `duration_scale`
+multiplier has no CLI flag today (the CLI adapter leaves it at 1.0), so the env
+var is the only lever from the command line.
 
 **Knobs (env):**
 
@@ -1649,13 +1659,13 @@ carries the provenance marker.
 
 ```bash
 # Synthesize and play through default speaker
-crispasr --tts --tts-play -m model.gguf "Hello world."
+crispasr --tts "Hello world." --tts-play -m model.gguf
 
 # Write file AND play
-crispasr --tts --tts-play -m model.gguf -o output.wav "Hello world."
+crispasr --tts "Hello world." --tts-play -m model.gguf --tts-output output.wav
 
-# Select a non-default output device (index from --list-audio-devices)
-crispasr --tts --tts-play --tts-play-device 2 -m model.gguf "Hello world."
+# Select a non-default output device (miniaudio playback device index)
+crispasr --tts "Hello world." --tts-play --tts-play-device 2 -m model.gguf
 ```
 
 Playback is synchronous — the CLI blocks until audio drains, then exits.
@@ -1700,22 +1710,35 @@ python3 models/convert-audioseal-to-gguf.py -o audioseal.gguf
 # Use with TTS
 crispasr --tts "hello" -m kokoro.gguf --watermark-model audioseal.gguf
 
+# Or let the registry fetch it: "auto" / "default" resolves the AudioSeal
+# GGUF (auto-downloading when --auto-download is on). An unloadable model
+# falls back to the built-in spread-spectrum watermark rather than failing.
+crispasr --tts "hello" -m kokoro.gguf --watermark-model auto --auto-download
+
 # Debug: CRISPASR_AUDIOSEAL_DEBUG=1 for shape traces, CRISPASR_AUDIOSEAL_DUMP_STAGES=1 for binary dumps
 ```
 
 ### Disabling the watermark (operator opt-out)
 
-The waveform watermark is on by default. It can be turned off two equivalent
-ways — neither is more "official" than the other:
+The waveform watermark is on by default. It can be turned off two ways:
 
-- **CLI flag**: `--no-watermark`
-- **Env var**: `CRISPASR_NO_WATERMARK=1`
+- **CLI flag**: `--no-watermark` — **requires `--accept-marking-responsibility`**,
+  else the run is refused (exit 12) with a `[MARKING]` audit line when it is
+  honoured. The same gate covers `--no-spoken-disclaimer` and `--no-c2pa`, on
+  the CLI and at server startup.
+- **Env var**: `CRISPASR_NO_WATERMARK=1` — takes effect without the attestation
+  flag, so it is the escape hatch for embedders, not the documented CLI path.
 
 Either one disables watermark embedding for the whole process and logs, once:
 
 ```
 crispasr: warning: watermarking disabled. AI usage marking responsibility rests with the operator.
 ```
+
+**The opt-out has a floor.** When the chosen output container cannot carry a
+C2PA manifest (raw `.aac` / `.opus` with `CRISPASR_NO_C2PA_REMUX=1`, or a build
+with C2PA compiled out) the watermark is the only machine-readable mark left, so
+`--no-watermark` is overridden and the mark is kept, with a note naming the file.
 
 **Rationale.** Disabling the mark does not remove any AI-disclosure obligation
 that may apply to the generated audio — it transfers responsibility for meeting
@@ -1750,7 +1773,7 @@ embedded directly in the output file. This is the "signed metadata" layer that
 complements the waveform watermark.
 
 **Build.** WAV signing needs **no build flags and no external library** — it is
-handled by the built-in native signer (`src/core/crispasr_c2pa_native.{h,cpp}`),
+handled by the built-in native signer (`src/core/crispasr_c2pa_native.h`),
 a pure-C++ implementation of C2PA (hand-built CBOR / JUMBF / COSE_Sign1, ES256
 via the vendored BSD-2 micro-ecc + a header-only SHA-256). It compiles into
 `crispasr-lib` on every platform with zero dependencies. Its output validates
@@ -1867,22 +1890,42 @@ All consent attestations are logged with ISO 8601 timestamps.
 ### Post-embed watermark verification (automatic)
 
 After writing a watermarked WAV in TTS mode, CrispASR automatically
-reads back the in-memory PCM and runs watermark detection on it. If
-the detected confidence is below 0.6, a warning is emitted to stderr.
-This catches cases where the watermark was degraded during synthesis
-or encoding — no extra flags needed.
+reads back the in-memory PCM and runs watermark detection on it. If the
+score lands in the `No watermark detected` band (see the verdict table
+below), a warning is emitted to stderr. The self-check only runs for the
+built-in spread-spectrum detector (not AudioSeal) and only on clips long
+enough to score — **≥ 2.5 s** for the default per-frame statistic, **≥ 5 s**
+for the legacy sign test — because the detector averages across frames and a
+short clip reads near chance even when the embed worked. A bare `< 0.6` bar
+used to warn on most sub-two-second clips. No extra flags needed; the
+self-check is a diagnostic and never the marking gate (embedding is
+unconditional).
 
 ### `--detect-watermark PATH` — standalone watermark detection
 
 Reads a WAV file, runs watermark detection (spread-spectrum by default,
-or AudioSeal if `--watermark-model` is given), prints the confidence
-score and a human-readable verdict, then exits.
+or AudioSeal if `--watermark-model` is given), prints the file, the detector
+used, the analysed duration, the confidence score and a human-readable
+verdict, then exits.
 
-| Confidence | Verdict |
-|---|---|
-| > 0.65 | `AI-GENERATED WATERMARK DETECTED` |
-| 0.4 – 0.65 | `UNCERTAIN` |
-| < 0.4 | `No watermark detected` |
+The default spread-spectrum statistic is the **per-frame** one (t-statistic +
+decoy specificity); `CRISPASR_WATERMARK_DETECT=sign` selects the legacy
+averaged-spectrum bin-sign test, which additionally prints the exact
+probability of the score arising without a watermark.
+
+| Detector | Score | Verdict |
+|---|---|---|
+| spread-spectrum, per-frame (default) | > 0.65 | `AI-GENERATED WATERMARK DETECTED` |
+| spread-spectrum, per-frame (default) | > 0.5 – 0.65 | `INCONCLUSIVE - consistent with a watermark, but not statistically significant` |
+| spread-spectrum, per-frame (default) | ≤ 0.5 | `No watermark detected (this does NOT mean the audio is human-made)` |
+| spread-spectrum, sign (legacy) | p < 0.01 | `AI-GENERATED WATERMARK DETECTED` |
+| spread-spectrum, sign (legacy) | p < 0.20 | `INCONCLUSIVE …` |
+| spread-spectrum, sign (legacy) | otherwise (or score ≤ 0.5) | `No watermark detected …` |
+| AudioSeal (neural) | > 0.5 | `AI-GENERATED WATERMARK DETECTED` |
+
+AudioSeal returns a probability rather than a bin-agreement fraction, so no
+p-value is quoted for it. Note that an unwatermarked file scores ~0.5 on the
+spread-spectrum detector, not 0.
 
 ```bash
 # Detect watermark using the built-in spread-spectrum detector

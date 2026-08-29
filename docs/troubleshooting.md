@@ -155,8 +155,9 @@ crispasr --backend kokoro -m auto --tts "test" --tts-output out.wav --no-gpu
   your GPU, driver version, and which zip/tarball you downloaded.
 - **Fails both ways** → not the GPU. The model, the file, or the CLI arguments.
 
-Note that the `-cuda` / `-hip` / `-vulkan` builds **require** the matching GPU
-driver and do *not* silently fall back to CPU — see
+Note that the `-hip` / `-vulkan` builds **require** the matching GPU driver and
+do *not* silently fall back to CPU. The Linux `-cuda` / `-cuda13` tarballs *do*
+fall back since v0.8.30 (dynamic backend loading) — see
 [install.md](install.md#prebuilt-linux-tarballs--which-one-to-download-355).
 Passing `--no-gpu` to such a build is fine; it just uses the CPU path.
 
