@@ -1,5 +1,45 @@
 # CrispASR — Pending work
 
+## 2026-08-29 — #409 silero-LID garbage languages on hard audio: confidence gate + whisper fallback
+
+Worktree `.claude/worktrees/fix-409-lid`, branch `fix/409-lid-confidence`.
+
+Root cause is NOT a port bug. Reproduced on stock samples: jfk.mp3 → 'yo'
+(logp -3.46) while the same speech as wav/opus/vorbis-webm → 'en' (-0.79 to
+-0.29); ko-369.wav → 'zh-CN'. The CONTROL ARM settles it: the upstream ONNX
+(deepghs/silero-lang95-onnx, onnxruntime venv ~/venvs/onnx-lid) produces the
+SAME wrong answers with the same top-5 ordering (jfk.mp3 → yo -3.35/en -4.23;
+ko-369 → zh-CN -5.14). Both C++ arms (ggml + LEGACY=1) agree with each other
+to 3 decimals and track the reference — the silero-lang95 model itself
+collapses to near-uniform on codec-artifacted / hard audio, and #409's
+'be' p=-7.455 (=0.06 %) on French OGG is that collapse being TRUSTED.
+Also ruled out for #409: Vulkan (the v0.8.30 build already routes this graph
+to CPU via the CRISPASR_SILERO_LID_VULKAN guard) and our audio decoders
+(ffmpeg-decoded jfk.mp3 fails identically).
+
+Fix, split across two sessions (cross-session coordination 2026-08-29):
+- fbe39169 (session 01Fn…): silero out_confidence becomes the softmax
+  PROBABILITY (whisper-arm contract). Important negative result from the
+  full-vector softmax: the probability does NOT separate the failures —
+  jfk.mp3 reads yo at p=0.578, ko-369 reads zh-CN at p=0.627 — because the
+  whole logit vector deflates and softmax renormalizes noise into fake
+  confidence.
+- e9f767d7 (same session, to this session's spec): evidence floor on the
+  RAW top logit inside silero_lid_detect — env CRISPASR_SILERO_LID_MIN_LOGIT,
+  default -2.0 (observed separation: correct >= ~-1.1, every failure
+  <= -3.35; free-energy OOD scoring), stderr note, returns null.
+- this branch: crispasr_lid_cli.cpp falls back to whisper-tiny LID when
+  silero comes back inconclusive/failed (both the gguf-native and sherpa
+  arms; CLI and server share the path — whisper on the same jfk clip:
+  en 0.977). C-API callers see rc=1 (no detection) per contract.
+  Docs: cli.md evidence-gate note + environment-variables.md row.
+
+Relation to the "silero-lid audio arm misclassifies (pa-in)" NOW entry
+above/below: that C-API-path repro could NOT be reproduced via the CLI here
+(both arms say en on jfk.wav); if pa-in is real it lives in the caller's
+input conditioning, not the LID compute — coordinated with the owning
+session via cross-session message 2026-08-29.
+
 ## 2026-08-29 — external PRs #408 + #406 merged (with fixes); #404 stays open
 
 Worktree: `.claude/worktrees/integr-prs`, branch `integr/prs` (merge commits

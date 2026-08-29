@@ -256,6 +256,25 @@ bool crispasr_backend_probe_language(CrispasrBackend& backend, const float* samp
     return true;
 }
 
+static bool detect_whisper_cli(const float* samples, int n_samples, const whisper_params& params,
+                               crispasr_lid_result& out) {
+    CrispasrLidOptions opts;
+    opts.method = CrispasrLidMethod::Whisper;
+    opts.model_path = resolve_whisper_lid_model(params);
+    opts.n_threads = params.n_threads;
+    opts.use_gpu = params.use_gpu;
+    opts.gpu_device = params.gpu_device;
+    opts.flash_attn = params.flash_attn;
+    opts.verbose = !params.no_prints;
+    CrispasrLidResult r;
+    if (!crispasr_detect_language(samples, n_samples, opts, r))
+        return false;
+    out.lang_code = r.lang_code;
+    out.confidence = r.confidence;
+    out.source = r.source;
+    return true;
+}
+
 bool crispasr_detect_language_cli(const float* samples, int n_samples, const whisper_params& params,
                                   crispasr_lid_result& out) {
     out = {};
@@ -274,23 +293,8 @@ bool crispasr_detect_language_cli(const float* samples, int n_samples, const whi
         be = "whisper";
     }
 
-    if (be == "whisper" || be == "whisper-tiny") {
-        CrispasrLidOptions opts;
-        opts.method = CrispasrLidMethod::Whisper;
-        opts.model_path = resolve_whisper_lid_model(params);
-        opts.n_threads = params.n_threads;
-        opts.use_gpu = params.use_gpu;
-        opts.gpu_device = params.gpu_device;
-        opts.flash_attn = params.flash_attn;
-        opts.verbose = !params.no_prints;
-        CrispasrLidResult r;
-        if (!crispasr_detect_language(samples, n_samples, opts, r))
-            return false;
-        out.lang_code = r.lang_code;
-        out.confidence = r.confidence;
-        out.source = r.source;
-        return true;
-    }
+    if (be == "whisper" || be == "whisper-tiny")
+        return detect_whisper_cli(samples, n_samples, params, out);
 
     if (be == "silero") {
         const std::string model_path = resolve_silero_lid_model(params);
@@ -309,11 +313,19 @@ bool crispasr_detect_language_cli(const float* samples, int n_samples, const whi
                 out.source = r.source;
                 return true;
             }
-            fprintf(stderr, "crispasr[lid]: silero-native returned null — "
-                            "falling back to sherpa subprocess\n");
+            // #409: inconclusive (confidence-gated) or failed. Sherpa would
+            // re-run the SAME model and reach the same non-answer, so go
+            // straight to the robust default instead of returning garbage.
+            fprintf(stderr, "crispasr[lid]: silero LID inconclusive or failed — "
+                            "falling back to whisper-tiny LID\n");
+            return detect_whisper_cli(samples, n_samples, params, out);
         }
         // Sherpa-ONNX subprocess fallback (for ONNX models).
-        return detect_with_sherpa(samples, n_samples, params, out);
+        if (detect_with_sherpa(samples, n_samples, params, out))
+            return true;
+        fprintf(stderr, "crispasr[lid]: silero (sherpa) LID failed — "
+                        "falling back to whisper-tiny LID\n");
+        return detect_whisper_cli(samples, n_samples, params, out);
     }
 
     if (be == "firered") {
