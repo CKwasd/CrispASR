@@ -162,7 +162,12 @@ def convert(args):
     written = 0
     for name, tensor in sd.items():
         data = tensor.float().numpy()
-        keep_f32 = should_keep_f32(name) or data.size < 256
+        # ndim == 1: every 1-D tensor is a bias / norm affine / LayerScale that
+        # ends up as src1 of a broadcast add/mul in the ggml graph, and CUDA's
+        # binbcast kernels reject non-F32 src1 there (issue #398). The name
+        # rules alone missed the DConv GroupNorm affines (`dconv.layers.N.4.
+        # weight` — a bare nn.Sequential index, no ".norm" in the name).
+        keep_f32 = should_keep_f32(name) or data.size < 256 or data.ndim == 1
         if keep_f32 or args.dtype == "f32":
             w.add_tensor(name, data.astype(np.float32), raw_dtype=f32_type)
         else:
