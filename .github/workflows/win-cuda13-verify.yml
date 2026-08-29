@@ -40,7 +40,8 @@ jobs:
         with:
           cuda: '13.0.0'
           method: 'network'
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "nvrtc", "nvrtc_dev", "nvtx", "cuda_profiler_api", "visual_studio_integration"]'
+          # "crt" is NEW in the CUDA 13 Windows installer (owns crt/host_config.h).
+          sub-packages: '["nvcc", "crt", "cudart", "cublas", "cublas_dev", "nvrtc", "nvrtc_dev", "nvtx", "cuda_profiler_api", "visual_studio_integration"]'
 
       - name: Build
         shell: cmd
