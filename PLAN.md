@@ -3939,3 +3939,19 @@ by the log-mel HiFT vocoder → flow mel cosine(cpu,vk)=0.961 → garbage. The L
   release was never affected (shims are branch-only).
 - Default stays the shipped all-CPU route under Vulkan — correct, and the right
   answer unless the lever above ever pays off.
+
+## NOW — silero-lid audio arm misclassifies on linux/x86_64 (found 2026-08-29 via CrisperWeaver live suite)
+
+`crispasr_detect_language_pcm(method=Silero)` answers **pa-in** on the JFK
+English sample (jfk.wav, 16 kHz mono) with `silero-lid-lang95-f32.gguf`
+(byte-identical to the HF catalogue copy, sha1 fb24ca95…). The legacy CPU
+path (`CRISPASR_SILERO_LID_LEGACY=1`) answers **fr** on the same input —
+the two paths disagree with each other AND with the truth, which per the
+A/B rule means at least one is miscomputing (and the label table may be
+suspect too: the harness-blind zone). Whisper LID on the same clip: en
+0.977. Reproduce from the CrisperWeaver repo:
+`tools/run_live_tests.sh test/silero_lid_live_test.dart` (remove the
+known-upstream skip in that test first). Suggested first steps: diff the
+ggml vs legacy logits on the same 30 s slice; verify the index→label
+table against the ONNX blueprint's ordering; check the mel/frontend
+scale columns, not just cosine.
