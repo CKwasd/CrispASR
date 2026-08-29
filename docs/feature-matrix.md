@@ -116,4 +116,36 @@ All 108 backends compiled into the `crispasr` binary, with their declared capabi
 | `rvc-svc` |  |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `beat-this` |  |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  | ✓ |  |  |  |  |  |  |  |  |
 
+## What each capability means
+
+| Capability | Meaning |
+|---|---|
+| TTS | Text-to-speech synthesis (--tts). |
+| Voice cloning | TTS clones a target voice from a short reference sample (--voice ref.wav). |
+| Translate | Translates speech into another language during transcription. |
+| Src/Tgt language | Takes an explicit source/target language pair for translation. |
+| Language detect | Detects the spoken language automatically. |
+| Auto-download | `-m auto` downloads the model from the HF registry on first use. |
+| Timestamps (native) | Model produces segment timestamps natively. |
+| Timestamps (CTC) | Timestamps recovered by CTC alignment, not predicted by the model. |
+| Word timestamps | Per-word start/end timestamps. |
+| Token confidence | Per-token probability/confidence scores. |
+| Temperature | Sampling temperature control for decoding. |
+| Beam search | Beam-search decoding (-bs N). |
+| Punctuation toggle | Punctuation can be enabled/disabled at runtime. |
+| Flash attention | Flash-attention toggle for faster, lower-memory inference. |
+| Diarize | Speaker diarization: labels who spoke when. |
+| GBNF grammar | Output constrained to a GBNF grammar. |
+| VAD (internal) | Backend runs voice-activity detection internally. |
+| Parallel processors | Whisper-style parallel processors (-p N) over audio slices. |
+| Beats | Beat / downbeat tracking (--beats). |
+| Chords | Chord-recognition timeline (--chords). |
+| Piano | Polyphonic piano-note transcription (--piano). |
+| Pitch | Monophonic F0 / pitch-track estimation (--pitch). |
+| Punctuation Native | Model already emits punctuation; no post-processing needed. |
+| S2S | Speech-to-speech: audio in, spoken response out. |
+| Separate | Source separation into stems, e.g. vocals vs. instruments (--separate). |
+| Streaming | True token-level streaming output. |
+| Tab | Guitar tablature: per-frame per-string fret scores (--tab). |
+
 Regenerate with `python tools/gen-feature-matrix.py`.
