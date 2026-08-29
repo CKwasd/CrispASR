@@ -17,7 +17,7 @@ per-backend porting detail (Per-model port notes + the family cross-reference).
 Reach for the topic groups when you are stuck on a *technique*, and the
 cross-reference when you already know which model you are touching.
 
-## Index by topic (293 lessons)
+## Index by topic (294 lessons)
 
 **Security & untrusted input** (2)
 
@@ -134,7 +134,7 @@ cross-reference when you already know which model you are touching.
 - L16839 — chatterbox hift_pcm(ref_mel) cos≈0.879 was a diff-harness layout bug (source_stft fed transposed), not a…
 - L18469 — Chatterbox Multilingual V3: checkpoint names, quant hashes, and a non-silent clone are not parity
 
-**ggml graphs, allocation & caching** (43)
+**ggml graphs, allocation & caching** (44)
 
 - L1153 — Reusing a cached scheduler graph across `sched_reset`/`alloc` cycles is CPU-safe but SIGSEGVs on GPU — the reused input tensor is bound to the prior cycle's freed buffer
 - L1723 — Metal-validated GPU TTS graph paths DID transfer cleanly to CUDA — the stricter-CUDA risk is real but not universal
@@ -179,6 +179,7 @@ cross-reference when you already know which model you are touching.
 - L14430 — Before optimizing a graph's *dispatch*, split host-encode vs GPU-execute — and never trust a GPU benchmark taken under load
 - L14525 — A "GPU" model can be silently running on CPU — audit for hot graphs pinned to backend_cpu and CLI adapters that never forward use_gpu
 - L18013 — PR #244 dequant-cache fix MERGED
+- L18578 — A binary-broadcast op with a non-F32 weight is a latent abort on EVERY ggml backend — and a graph port extended layer-by-layer silently outgrows its old verification
 
 **GPU portability — Metal / CUDA / Vulkan** (24)
 

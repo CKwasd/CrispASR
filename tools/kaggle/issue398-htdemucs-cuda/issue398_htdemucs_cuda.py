@@ -38,7 +38,7 @@ RESULTS = WORK / "issue398_results.json"
 
 HERE = Path(__file__).resolve().parent
 CRISPASR_URL = "https://github.com/CrispStrobe/CrispASR.git"
-BRANCH = "fix/issue-398-402"
+BRANCH = "main"  # proof runs used fix/issue-398-402 (merged); main keeps re-runs working
 CLONE = Path("/kaggle/temp/CrispASR")
 if not CLONE.exists():
     try:
