@@ -30,8 +30,13 @@ jobs:
           cd /d C:\crispasr-repro\app
           echo #include ^<intrin.h^> > ggml-cpu.c
           echo __declspec(dllexport) void ggml_fake_kernel(void) { __ud2(); } >> ggml-cpu.c
-          echo __declspec(dllimport) void ggml_fake_kernel(void); > crashme.c
-          echo int main(void) { ggml_fake_kernel(); return 0; } >> crashme.c
+          echo #include ^<windows.h^> > crashme.c
+          echo __declspec(dllimport) void ggml_fake_kernel(void); >> crashme.c
+          rem the sleep mimics crispasr's model-loading startup: procdump -w
+          rem polls by name about once a second and must attach BEFORE the
+          rem fault — an instant fault races WER's process-snapshot clone and
+          rem -w dies with "Multiple processes match the specified name"
+          echo int main(void) { Sleep(10000); ggml_fake_kernel(); return 0; } >> crashme.c
           for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           rem no /Zi: release zips ship no PDBs, and the doc's claim is that
