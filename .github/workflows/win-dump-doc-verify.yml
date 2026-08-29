@@ -168,8 +168,10 @@ jobs:
           $doc = Get-Content (Get-ChildItem C:\crispasr-dumps\crispasr-illegal-instruction*.txt | Select-Object -First 1).FullName -Raw
           $analyze = Get-Content C:\crispasr-dumps\analyze-log.txt -Raw
           $fail = @()
-          # "the disassembly labels the address ... prints it as ggml_cpu+0x"
-          if ($doc -notmatch 'ggml_cpu\+0x') { $fail += 'doc pass: no ggml_cpu+0x module label — .exepath did not resolve the DLL' }
+          # the disassembly must label the address inside the module: with the
+          # image mapped via .exepath the DLL's export table yields
+          # ggml_cpu!<export>; unmapped it degrades to bare ggml_cpu+0x
+          if ($doc -notmatch 'ggml_cpu(!|\+0x)') { $fail += 'doc pass: no ggml_cpu label at @rip — module not resolved' }
           # "The instruction at RIP" — here the deterministic ud2
           if ($doc -notmatch '(?i)\bud2\b') { $fail += 'doc pass: u @rip did not disassemble the ud2 instruction' }
           # lm must list the module the doc tells users to look for

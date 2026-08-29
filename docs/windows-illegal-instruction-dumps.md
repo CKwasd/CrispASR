@@ -140,7 +140,13 @@ Give the folder holding `crispasr.exe` and `ggml-cpu.dll`, not a single DLL.
 `!analyze -v` (a bucketing wrapper that resolves the
 whole module list to build a stack, normally not necessary, the fault
 address comes from `.ecxr` and `u @rip`) can be run as a
-separate second pass after you already have the address.
+separate second pass after you already have the address. Two things to know
+before trusting its output: pointed at the Microsoft symbol server it downloads
+PDBs for every OS module in the list, which is slow and can fail outright
+(#403); run offline with the paths above it finishes in about a second but
+mis-buckets the crash as `WRONG_SYMBOLS … ntdll.wrong.symbols.dll`. Both are
+cosmetic — its `ExceptionCode: c000001d (Illegal instruction)` line is correct
+either way, and the fields that matter come from the main sequence.
 
 ## What a useful result looks like
 
@@ -150,9 +156,14 @@ operand — and the module containing `RIP` should be `ggml-cpu.dll`. That is th
 ISA-mismatch signature. A ZMM operand on a host whose flags show only AVX2/FMA
 is the confirmed shape of #374.
 
-Once `.exepath` finds the DLL, the disassembly labels the address for you and
-prints it as `ggml_cpu+0x98e9` — WinDbg substitutes an underscore for the hyphen
-in the module name. There is no need to subtract the load base by hand.
+Once `.exepath` finds the DLL, the disassembly labels the address for you —
+WinDbg substitutes an underscore for the hyphen in the module name. With no
+PDBs the label comes from the DLL's export table, so it usually reads as the
+nearest exported function plus an offset (`ggml_cpu!ggml_graph_compute+0x…`),
+and `lm` shows the module as `(export symbols)`. If the image was not mapped,
+the label degrades to the bare `ggml_cpu+0x98e9` form instead. Either way the
+log carries the module load address from `lm`, so there is no need to subtract
+the load base by hand.
 
 `db @rip L20` is there because the raw bytes still identify the instruction when
 the disassembler chokes on an encoding it does not know.
