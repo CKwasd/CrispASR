@@ -93,8 +93,12 @@ jobs:
           $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
           $deps = (& $dumpbin.FullName /dependents release\crispasr-windows-x86_64-cuda13\ggml-cuda.dll) -join "`n"
           Write-Host $deps
-          if ($deps -notmatch 'cudart64_13\.dll') { throw "ggml-cuda.dll does not import cudart64_13.dll" }
-          if ($deps -match 'cudart64_12\.dll')    { throw "ggml-cuda.dll imports the CUDA 12 runtime" }
+          # cudart is linked STATICALLY (CMake's CUDA_USE_STATIC_CUDA_RUNTIME
+          # default), so it never appears in the import table — run 33264970611
+          # proved that the hard way. cublas is the dynamic CUDA dependency, and
+          # its major-suffixed name is the CUDA-13-linkage proof.
+          if ($deps -notmatch 'cublas64_13\.dll') { throw "ggml-cuda.dll does not import cublas64_13.dll" }
+          if ($deps -match '64_12\.dll')          { throw "ggml-cuda.dll imports a CUDA 12 runtime DLL" }
 
       - name: Run the packaged exe on a GPU-less host (CPU fallback E2E)
         shell: pwsh
