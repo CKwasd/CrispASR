@@ -4041,6 +4041,34 @@ int crispasr_run_backend(const whisper_params& params_in) {
         std::string last_partial_text; // dedupe key + prefix-mode tail
         int64_t last_partial_decode_sample = -1;
         int64_t cumulative_samples = 0;
+        // --stream-partial-tail-sec (#404): per-utterance tail-cap state.
+        // `tail_anchor_abs` is the absolute sample the next partial decode
+        // starts from; `tail_committed` is the post-processed text of
+        // everything decoded ahead of it. Both reset when an utterance
+        // finalizes. See crispasr::plan_partial_tail for the policy.
+        const int tail_cap_samples =
+            params.stream_partial_tail_sec > 0
+                ? std::max(params.stream_partial_tail_sec * SR, 2 * crispasr::kStreamRedecodeMinSamples)
+                : 0;
+        const int tail_slack_samples = std::max(tail_cap_samples / 2, crispasr::kStreamRedecodeMinSamples);
+        int64_t tail_anchor_abs = -1;
+        std::string tail_committed;
+        // CRISPASR_STREAM_SLICE_MEMO=1 (#404): memoize per-slice partial
+        // decodes by their ABSOLUTE sample range. A VAD-closed slice keeps the
+        // same (start, end) while it stays in the rolling window, and the
+        // decode is deterministic, so re-decoding it every step repeats
+        // byte-identical work — the bulk of the RFC's "194 full transcribes".
+        // The still-growing slice changes its end every step and always
+        // misses. Exact by construction; default off per the perf-gate rule.
+        struct StreamSliceMemo {
+            int64_t s = 0, e = 0;
+            std::vector<crispasr_segment> segs; // pristine, pre-post-chain
+        };
+        std::vector<StreamSliceMemo> slice_memo;
+        const bool slice_memo_on = [] {
+            const char* e = getenv("CRISPASR_STREAM_SLICE_MEMO");
+            return e && *e && *e != '0';
+        }();
         const int64_t utterance_max_samples = (int64_t)params.stream_utterance_max_sec * SR;
         const int64_t partial_decode_interval_samples =
             crispasr_stream_partial_decode_interval_samples(params.stream_partial_decode_ms, params.stream_step_ms, SR);
@@ -4132,6 +4160,14 @@ int crispasr_run_backend(const whisper_params& params_in) {
                         // trim finalized rolling-window slices before decode;
                         // plain-text mode below still decodes full slices.
                         std::vector<crispasr_segment> sl_for_text;
+                        // #404: how many leading segments of sl_for_text came
+                        // from a tail-cap COMMIT decode. Their post-processed
+                        // text is promoted into `tail_committed` after the
+                        // post chain below. `tail_stitch` marks the one slice
+                        // (the growing one, under an active cap) whose emitted
+                        // text must be prefixed with `tail_committed`.
+                        size_t tail_commit_seg_count = 0;
+                        bool tail_stitch = false;
 
                         // Round 3 (CKwasd #1 corner): if the VAD slice
                         // straddles a previously-finalized boundary
@@ -4178,9 +4214,78 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             // step once the subrange exceeds the min.
                         } else {
                             partial_decode_attempted_this_step = true;
-                            const int64_t abs_t0_cs = window_start_sample_now * 100 / SR + sl.t0_cs;
-                            sl_for_text =
-                                backend->transcribe(pcm_window.data() + sl.start, sl.end - sl.start, abs_t0_cs, params);
+                            const int64_t abs_s = window_start_sample_now + (int64_t)sl.start;
+                            const int64_t abs_e = window_start_sample_now + (int64_t)sl.end;
+                            // The still-growing slice is the one whose end
+                            // rides the window edge; VAD-closed slices keep a
+                            // fixed absolute range while the window holds them.
+                            const bool slice_growing = sl.end >= (int)pcm_window.size() - step_samples;
+                            bool served = false;
+                            if (slice_memo_on && !slice_growing) {
+                                for (const auto& m : slice_memo) {
+                                    if (m.s == abs_s && m.e == abs_e) {
+                                        sl_for_text = m.segs; // copy: post chain mutates
+                                        served = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            // #404: tail-cap the live partial decode of the
+                            // GROWING slice only. The plan either says "decode
+                            // the whole range" (cap off / slice short / stale
+                            // anchor), or first commits [commit_start,
+                            // commit_end) — one decode, its post-processed
+                            // text promoted into `tail_committed` below — and
+                            // starts this step's decode at the energy-min cut,
+                            // keeping per-step cost O(tail).
+                            if (!served) {
+                                const int cap_here = slice_growing ? tail_cap_samples : 0;
+                                const auto tail_plan = crispasr::plan_partial_tail(
+                                    pcm_window.data(),
+                                    tail_anchor_abs < 0 ? sl.start : (int)(tail_anchor_abs - window_start_sample_now),
+                                    sl.start, sl.end, cap_here, tail_slack_samples, kStraddleMinSamples);
+                                if (getenv("CRISPASR_STREAM_TAIL_DEBUG")) {
+                                    fprintf(stderr,
+                                            "stream-tail: t=%.2f grow=%d anchor_abs=%lld range=[%d,%d) plan{start=%d "
+                                            "commit=%d [%d,%d)} committed=%zuB\n",
+                                            (double)cumulative_samples / SR, (int)slice_growing,
+                                            (long long)tail_anchor_abs, sl.start, sl.end, tail_plan.decode_start,
+                                            (int)tail_plan.commit, tail_plan.commit_start, tail_plan.commit_end,
+                                            tail_committed.size());
+                                }
+                                if (tail_plan.commit) {
+                                    whisper_params commit_params = params;
+                                    commit_params.vad = false;
+                                    commit_params.vad_model.clear();
+                                    const int64_t commit_cs =
+                                        (window_start_sample_now + (int64_t)tail_plan.commit_start) * 100 / SR;
+                                    sl_for_text = backend->transcribe(pcm_window.data() + tail_plan.commit_start,
+                                                                      tail_plan.commit_end - tail_plan.commit_start,
+                                                                      commit_cs, commit_params);
+                                }
+                                tail_commit_seg_count = sl_for_text.size();
+                                if (cap_here > 0) {
+                                    tail_anchor_abs = window_start_sample_now + (int64_t)tail_plan.decode_start;
+                                    tail_stitch = true;
+                                }
+                                const int64_t abs_t0_cs =
+                                    (window_start_sample_now + (int64_t)tail_plan.decode_start) * 100 / SR;
+                                auto tail_segs =
+                                    backend->transcribe(pcm_window.data() + tail_plan.decode_start,
+                                                        sl.end - tail_plan.decode_start, abs_t0_cs, params);
+                                sl_for_text.insert(sl_for_text.end(), std::make_move_iterator(tail_segs.begin()),
+                                                   std::make_move_iterator(tail_segs.end()));
+                                // Memoize only complete, uncapped decodes of a
+                                // CLOSED slice — its range is stable, so later
+                                // steps replay this result instead of paying
+                                // an identical encoder pass.
+                                if (slice_memo_on && !slice_growing && tail_commit_seg_count == 0 &&
+                                    tail_plan.decode_start == sl.start) {
+                                    if (slice_memo.size() >= 8)
+                                        slice_memo.erase(slice_memo.begin());
+                                    slice_memo.push_back({abs_s, abs_e, sl_for_text});
+                                }
+                            }
                         }
                         if (!sl_for_text.empty())
                             decoded_segments_this_step = true;
@@ -4194,9 +4299,29 @@ int crispasr_run_backend(const whisper_params& params_in) {
                             for (auto& seg : sl_for_text)
                                 crispasr_strip_punctuation(seg);
                         }
+                        // #404: promote this step's commit-decode text (the
+                        // first tail_commit_seg_count segments, now post-
+                        // processed) into the per-utterance committed prefix,
+                        // then emit committed + tail so partial.text still
+                        // covers the whole utterance under the tail cap.
                         std::string sl_text;
-                        for (const auto& s : sl_for_text)
-                            sl_text += s.text;
+                        for (size_t si = 0; si < sl_for_text.size(); ++si) {
+                            if (si < tail_commit_seg_count) {
+                                // Successive commit decodes are independent
+                                // clips whose texts rarely carry boundary
+                                // whitespace — join with a space like the
+                                // stitcher does, or words fuse at the seam.
+                                const std::string& t = sl_for_text[si].text;
+                                if (!tail_committed.empty() && !t.empty() && tail_committed.back() != ' ' &&
+                                    t.front() != ' ')
+                                    tail_committed += ' ';
+                                tail_committed += t;
+                            } else {
+                                sl_text += sl_for_text[si].text;
+                            }
+                        }
+                        if (tail_stitch && !tail_committed.empty())
+                            sl_text = crispasr::stitch_partial_accumulator(tail_committed, sl_text);
                         step_slice_text.emplace_back(sl, std::move(sl_text));
                     } else {
                         const int64_t abs_t0_cs = window_start_sample_now * 100 / SR + sl.t0_cs;
@@ -4355,6 +4480,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     utterance_pcm.clear();
                     prefix_committed.clear();
                     last_partial_text.clear();
+                    tail_anchor_abs = -1; // #404: tail-cap state is per-utterance
+                    tail_committed.clear();
                 };
 
                 auto open_utterance_at = [&](int window_offset, int64_t stream_start) {
@@ -4369,6 +4496,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                     utterance_pcm.assign(pcm_window.begin() + window_offset, pcm_window.end());
                     prefix_committed.clear();
                     last_partial_text.clear();
+                    tail_anchor_abs = -1; // #404: fresh utterance, fresh tail state
+                    tail_committed.clear();
                 };
 
                 auto on_partial_text = [&](const std::string& new_text) {

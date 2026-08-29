@@ -39,6 +39,53 @@ above/below: that C-API-path repro could NOT be reproduced via the CLI here
 (both arms say en on jfk.wav); if pa-in is real it lives in the caller's
 input conditioning, not the LID compute — coordinated with the owning
 session via cross-session message 2026-08-29.
+## 2026-08-29 — #404 resolution: --stream-partial-tail-sec (text-level streaming incrementality)
+
+Worktree `.claude/worktrees/feat-stream-tail`, branch `feat/stream-partial-tail`.
+
+**The architectural verdict that settles the RFC:** the cohere encoder is a
+Conformer with UNMASKED Transformer-XL relative-position self-attention over
+the whole window in all 48 layers (`cohere_rel_shift`, `pos_enc [d, 2T-1]`).
+Every cached frame's encoding depends on audio that arrives later, so the
+RFC's activation-level delta cache (cross-KV trim + T_guard splice) can never
+be transcript-exact — T_guard=floor(K/2) covers the conv modules only, and
+attention influence is unbounded. Its measured wins are real but the approach
+is structurally approximate, plus per-model splice state forever.
+
+**The exact alternative (this branch), at the orchestration layer:**
+- Finals stay bit-exact — `--stream-final-mode redecode` (default) re-decodes
+  the buffered utterance PCM; that path is untouched.
+- `--stream-partial-tail-sec N` (default 0 = off) bounds each live PARTIAL
+  decode to ~the last N s of the open utterance. The region behind the cap is
+  decoded once, cut at the quietest 100 ms (`find_energy_min_split`, same
+  policy as the long-audio chunker), its post-processed text promoted into a
+  per-utterance committed prefix; `partial.text` = committed + tail via the
+  existing `stitch_partial_accumulator`. Pure planner
+  (`crispasr::plan_partial_tail` in crispasr_stream_finalize.h) with unit
+  tests; per-utterance state resets at open/finalize.
+- Measured cost model (VPS, 4-core CPU, cohere q4_k): encode ≈ 22 s constant
+  (weights-bandwidth: 1.5 GB streamed per graph) + ~0.22 s per encoder frame.
+  So on CPU the decode COUNT dominates (use `--stream-partial-decode-ms`);
+  the tail cap's per-decode saving dominates on GPU (the RFC's own Vulkan
+  numbers: cost ≈ 18 ms + ~11 ms/s of window). Also measured: enc graph
+  build+alloc = 41 ms vs 32.6 s compute on CPU (0.13 %) — the RFC's "graph
+  reuse" option A is a GPU-only lever, not worth CPU complexity.
+
+Proofs (2026-08-29, cohere q4_k on the VPS; wall-clock void — shared box —
+so judged on the load-independent telemetry + byte equality):
+- jfk2 (6 utterances) 3-arm off/memo/memo+tail: finals AND partials
+  byte-identical across all arms; memo cut decoded audio 43.42s → 38.82s
+  (−10.6 % on a short clip; grows with window/slice count). First run
+  caught a real bug via the debug trace: a GLOBAL anchor was poisoned
+  across VAD slices in multi-slice steps (0-length decode, lost prefix,
+  and a partly FABRICATED speedup — the 4a lesson). Fixed: cap applies
+  only to the growing slice + stale-anchor guard + regression unit test.
+- long-utt (12.3 s continuous synth sentence): commits engage (3 anchor
+  advances at energy-min cuts), stitched partial covers the WHOLE
+  utterance under a 4 s decode cap, final byte-identical to the off arm.
+  Seam artifacts in partials are cosmetic (capitalization/periods at
+  join points — documented); finals replace them.
+- 14 planner/stitcher unit cases green; full unit label green.
 
 ## 2026-08-29 — external PRs #408 + #406 merged (with fixes); #404 stays open
 
