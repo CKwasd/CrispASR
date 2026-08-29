@@ -1131,6 +1131,14 @@ The CPU thread count defaults to `min(8, hardware_concurrency)`; override with
 `CRISPASR_CHATTERBOX_THREADS=<n>` (e.g. dial down on a heavily shared host).
 Output is bit-identical regardless of thread count.
 
+On **Vulkan** the T3 GPT-2 (turbo/nano) attention uses the explicit
+softmax(QK^T)V path by default instead of `ggml_flash_attn_ext`: the Vulkan
+flash-attention pipeline crashes on RADV (Radeon 780M, issue #402) while the
+explicit path completes full syntheses there with both F16 and Q4_K weights.
+Opt back into flash on Vulkan with `CRISPASR_CHATTERBOX_FLASH_ATTN=1`;
+`CRISPASR_CHATTERBOX_NAIVE_ATTN=1` still forces the explicit path on every
+backend (debug gate).
+
 ### Voice cloning
 
 Two paths are supported. **The recommended path is the python baker

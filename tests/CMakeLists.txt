@@ -5122,6 +5122,31 @@ catch_discover_tests(test-btc-vocab
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test-htdemucs-binbcast — issue #398 CUDA binbcast F16-src1 guard (hermetic, unit)
+add_executable(test-htdemucs-binbcast test-htdemucs-binbcast.cpp)
+target_include_directories(test-htdemucs-binbcast PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-htdemucs-binbcast PRIVATE Catch2::Catch2WithMain ggml)
+catch_discover_tests(test-htdemucs-binbcast
+    TEST_SPEC "[htdemucs]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
+# ─── test-chatterbox-attn-policy — issue #402 T3 attention decision table (hermetic, unit)
+add_executable(test-chatterbox-attn-policy test-chatterbox-attn-policy.cpp)
+target_include_directories(test-chatterbox-attn-policy PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-chatterbox-attn-policy PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-chatterbox-attn-policy
+    TEST_SPEC "[attn-policy]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test-num2words-fr-es — French + Spanish number expansion (hermetic, unit)
 add_executable(test-num2words-fr-es test-num2words-fr-es.cpp)
 target_include_directories(test-num2words-fr-es PRIVATE ${PROJECT_SOURCE_DIR}/src)

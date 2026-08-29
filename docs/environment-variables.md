@@ -394,10 +394,15 @@ suffixes.
 - `CRISPASR_CHATTERBOX_DUMP_QPROJ_AT`
 - `CRISPASR_CHATTERBOX_DUMP_VPROJ_AT`
 - `CRISPASR_CHATTERBOX_DUMP_WK`
+- `CRISPASR_CHATTERBOX_FLASH_ATTN` — force `ggml_flash_attn_ext` for the T3
+  GPT-2 (turbo/nano) attention even on Vulkan, where naive attention is the
+  default since issue #402 (RADV 780M crashes in the Vulkan FLASH_ATTN_EXT
+  pipeline; the explicit softmax(QK^T)V path is verified working there).
 - `CRISPASR_CHATTERBOX_FORCE_GPU`
 - `CRISPASR_CHATTERBOX_FULL_CPU`
 - `CRISPASR_CHATTERBOX_LANG`
-- `CRISPASR_CHATTERBOX_NAIVE_ATTN`
+- `CRISPASR_CHATTERBOX_NAIVE_ATTN` — force the explicit softmax(QK^T)V T3
+  attention on every backend (debug gate; outranks `_FLASH_ATTN`).
 - `CRISPASR_CHATTERBOX_S3GEN_CPU`
 - `CRISPASR_CHATTERBOX_T3_CPU_S3GEN_GPU`
 - `CRISPASR_CHATTERBOX_T3_GPU`
@@ -698,6 +703,11 @@ suffixes.
 - `CRISPASR_HTDEMUCS_GPU` — request a GPU backend (CUDA > Metal > Vulkan, CPU
   fallback). Only meaningful together with `_GGML=1`: under the CPU/BLAS path
   the weights would sit on the device and every kernel would pay a read back.
+- `CRISPASR_HTDEMUCS_NO_BCAST_CAST` — disable the issue-#398 fix that casts
+  non-F32 affine/bias weights to F32 in-graph before broadcast add/mul sites
+  (bisection aid). With `=1` the pre-fix graph is rebuilt, which on CUDA
+  aborts in `binbcast.cu` (`nb10 % sizeof(src1_t)`) because the F16 GGUF
+  stores the DConv GroupNorm affines (`*.dconv.layers.N.4.weight`) as F16.
 - `CRISPASR_HTDEMUCS_PROFILE` — print a per-phase wall-time breakdown of one
   forward pass (stft / enc / transformer / dec / istft).
 - `CRISPASR_HTDEMUCS_DEBUG` — verbose per-layer shape and NaN diagnostics.
