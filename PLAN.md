@@ -4014,7 +4014,30 @@ by the log-mel HiFT vocoder → flow mel cosine(cpu,vk)=0.961 → garbage. The L
 - Default stays the shipped all-CPU route under Vulkan — correct, and the right
   answer unless the lever above ever pays off.
 
-## NOW — silero-lid audio arm misclassifies on linux/x86_64 (found 2026-08-29 via CrisperWeaver live suite)
+## RESOLVED 2026-08-29 — silero-lid audio arm verified correct; confidence contract fixed
+
+Full-pipeline verification against the upstream ONNX (`lang_classifier_95.onnx`
+@ silero-vad v3.0, onnxruntime, byte-identical jfk PCM): frontend cos 0.999956
+(only the final frame differs — tail zero-pad vs reflect-pad), all 8 encoder
+stages cos ≥ 0.999986, pooled cos 0.9979, and the exact Dart-equivalent chain
+`crispasr_audio_load → crispasr_detect_language_pcm(silero)` answers
+**en** on jfk.wav on BOTH the ggml and legacy paths (logits −0.795 vs ref
+−1.104; the sharper score is the tail-frame difference). No silero code
+changed between v0.8.30 and this verification, so 0.8.30 computes the same.
+
+The CrisperWeaver-observed `pa-in`/`fr` did NOT reproduce against a clean
+chain and is attributable to that run's environment (whatever `CRISPASR_LIB`
+loaded), not the engine. Demonstrated failure MODE: feeding even ~17 junk
+samples (a sloppy WAV parse reading metadata as PCM) flips the model to
+`yo` — the classifier is extremely fragile to input conditioning, which is
+the same shape as #409's codec-artifact findings.
+
+Real defect found and fixed: `silero_lid_detect` returned the RAW top logit
+as `out_confidence` while the whisper arm returns a probability — every
+probability threshold (CLI `p=` prints, CrisperWeaver's 0.35 floor) silently
+rejected correct answers. Now softmaxed: jfk → en p=0.9985 on both paths.
+
+## (was NOW) — original report, kept for the record
 
 `crispasr_detect_language_pcm(method=Silero)` answers **pa-in** on the JFK
 English sample (jfk.wav, 16 kHz mono) with `silero-lid-lang95-f32.gguf`

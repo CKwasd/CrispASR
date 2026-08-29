@@ -1216,6 +1216,16 @@ extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const f
         if (logits[i] > logits[best])
             best = i;
 
+    // Softmax the raw classifier logits so out_confidence is a probability in
+    // [0, 1], matching the whisper LID arm's contract. Callers (CLI "p=",
+    // the C ABI, CrisperWeaver's 0.35 floor) all treat it as one; before
+    // this the silero arm handed back the raw top logit (e.g. -0.79 for a
+    // 99.8%-confident answer), which every probability threshold rejected.
+    double denom = 0.0;
+    for (float l : logits)
+        denom += std::exp((double)l - (double)logits[best]);
+    const float best_p = (float)(1.0 / denom);
+
     if (crispasr_env::get("CRISPASR_SILERO_LID_DEBUG")) {
         std::vector<int> order(logits.size());
         for (int i = 0; i < (int)order.size(); i++)
@@ -1231,7 +1241,7 @@ extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const f
     }
 
     if (out_confidence)
-        *out_confidence = logits[best];
+        *out_confidence = best_p;
 
     if (best < (int)ctx->lang_strs.size())
         return ctx->lang_strs[best].c_str();
