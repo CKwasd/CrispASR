@@ -25,8 +25,27 @@ the CUDA backend simply does not load and the CPU backend is used instead —
 the "auto-select the best backend, fall back to CPU" behavior works as
 advertised. No wrapper script is needed.
 
+Since #405 the CUDA tarballs also ship the CPU backend as a **set of
+ISA-variant modules** (`libggml-cpu-x64.so` … `libggml-cpu-icelake.so`); at
+startup ggml scores each against the host CPU and loads the best supported
+one. A pre-AVX2 host (e.g. a Sandy/Ivy Bridge Xeon next to a Tesla P40) gets
+the `x64`/`sse42`/`sandybridge` module instead of *no CPU backend at all* —
+v0.8.30's single AVX2 `libggml-cpu.so` was refused there, which aborted every
+model load with `GGML_ASSERT(backend)` / `GGML_ASSERT(device)`. If no CPU
+module can load, crispasr now exits with a clear "no CPU ggml backend" error
+pointing at the `-cpu-legacy` artifact instead of aborting.
+
 For GPU acceleration, the NVIDIA driver and CUDA toolkit must be installed on
 the host (or injected into the container via `--gpus` / `runtime: nvidia`).
+
+> **Installing via `mise` (or another GitHub-release installer)?** Those tools
+> pick ONE asset per OS/arch — for Linux that is the plain
+> `crispasr-linux-x86_64.tar.gz`, which is an AVX2 CPU build (2013+ Intel /
+> 2015+ AMD; it fails fast with an explanatory error on older CPUs since
+> #380/#405 instead of dying on an illegal instruction). The CUDA / Vulkan /
+> HIP / legacy-CPU flavors are separate assets the installer does not know
+> about — download the tarball you need from the releases page directly, or
+> configure your installer's asset selection if it supports one.
 
 The HIP and Vulkan tarballs still require their respective runtimes at
 link time (no CPU fallback). Use the plain CPU tarball if you need a
