@@ -1,5 +1,18 @@
 # CrispASR — Pending work
 
+## NOW — Kaggle quiet-box A/Bs in flight for the #406 + #404 default flips (2026-08-30)
+
+Both gates merged default-off; the platform-matched perf proofs are running:
+- `chr1str/crispasr-simdconv-cpu-ab` (tools/kaggle/simdconv-cpu-ab) —
+  PR #406 SIMDCONV off/on stage medians on chatterbox-turbo AND
+  cosyvoice3-tts (closes cv3's model-coverage gap), waveform diff +
+  whisper roundtrips.
+- `chr1str/crispasr-stream404-ab` (tools/kaggle/stream404-ab) — #404
+  slice-memo/tail-cap off/memo/memotail on cpu+gpu, jfk2 + an in-kernel
+  synthesized 12 s continuous utterance; finals-equality gate + decoded-
+  audio telemetry; CPU walls finally valid (uncontended box).
+Flip decisions on the results; kernels launched from main afe0a6c1.
+
 ## 2026-08-29 — #409 silero-LID garbage languages on hard audio: confidence gate + whisper fallback
 
 Worktree `.claude/worktrees/fix-409-lid`, branch `fix/409-lid-confidence`.
