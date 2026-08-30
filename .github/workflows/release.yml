@@ -383,7 +383,7 @@ jobs:
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_BACKEND_DL=ON \
             -DGGML_CUDA=ON \
-            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+            -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON \
             -DGGML_OPENBLAS=ON \
             -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
@@ -397,11 +397,19 @@ jobs:
           mkdir -p release/crispasr-linux-x86_64-cuda
           cp build/bin/crispasr release/crispasr-linux-x86_64-cuda/
           cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-cuda/
-          # §355: bundle ggml backend shared libs (ggml-cuda.so, ggml-cpu.so, etc.)
-          # so the main binary can dlopen them from $ORIGIN at runtime.
+          # §355: bundle ggml backend shared libs (ggml-cuda.so, the
+          # libggml-cpu-<variant>.so set, etc.) so the main binary can dlopen
+          # them from $ORIGIN at runtime.
           for so in build/bin/libggml*.so* build/bin/libcrispasr*.so*; do
             [ -f "$so" ] && cp -P "$so" release/crispasr-linux-x86_64-cuda/
           done
+          # #405: the CPU backend ships as GGML_CPU_ALL_VARIANTS modules and the
+          # loader picks the best one the host supports (ggml_backend_score).
+          # The x64 baseline is the one that makes ANY x86-64 host work — a
+          # package without it leaves pre-AVX2 hosts with NO cpu backend, and
+          # every model load then dies on GGML_ASSERT(backend). Assert it.
+          test -f release/crispasr-linux-x86_64-cuda/libggml-cpu-x64.so || {
+            echo "::error::libggml-cpu-x64.so (baseline CPU variant) missing from the CUDA package (#405)"; exit 1; }
           bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-cuda || true
           # Self-contained: rewrite RUNPATH to $ORIGIN and copy in the non-system
           # dependency closure — libopenblas AND libgomp, per CrispASR #296.
@@ -480,7 +488,7 @@ jobs:
             -DBUILD_SHARED_LIBS=ON \
             -DGGML_BACKEND_DL=ON \
             -DGGML_CUDA=ON \
-            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON \
+            -DGGML_NATIVE=OFF -DGGML_CPU_ALL_VARIANTS=ON \
             -DGGML_OPENBLAS=ON \
             -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120a-real;120-virtual" \
             -DCRISPASR_BUILD_TESTS=OFF \
@@ -498,6 +506,9 @@ jobs:
           for so in build/bin/libggml*.so* build/bin/libcrispasr*.so*; do
             [ -f "$so" ] && cp -P "$so" release/crispasr-linux-x86_64-cuda13/
           done
+          # #405: baseline CPU variant must ship — see the CUDA 12 leg.
+          test -f release/crispasr-linux-x86_64-cuda13/libggml-cpu-x64.so || {
+            echo "::error::libggml-cpu-x64.so (baseline CPU variant) missing from the CUDA 13 package (#405)"; exit 1; }
           bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-cuda13 || true
           CRISPASR_BUNDLE_HOST_DIRS=/usr/local/cuda \
           CRISPASR_BUNDLE_EXTRA_RPATH=/usr/local/cuda/lib64 \
