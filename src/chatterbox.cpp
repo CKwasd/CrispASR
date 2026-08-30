@@ -2649,8 +2649,8 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
             ggml_view_3d(ctx0, use_kv_k, hd, Lk, n_kv, use_kv_k->nb[1], use_kv_k->nb[2], (size_t)il * use_kv_k->nb[3]);
         ggml_tensor* v_layer_view =
             ggml_view_3d(ctx0, use_kv_v, hd, Lk, n_kv, use_kv_v->nb[1], use_kv_v->nb[2], (size_t)il * use_kv_v->nb[3]);
-        ggml_tensor* Kfull = ggml_cont(ctx0, k_layer_view);
-        ggml_tensor* Vfull = ggml_cont(ctx0, v_layer_view);
+        ggml_tensor* Kfull = k_layer_view;
+        ggml_tensor* Vfull = v_layer_view;
 
         // Permute Q to (hd, T, n_h)
         Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
@@ -2673,6 +2673,8 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
         // earlier attempt.
         ggml_tensor* attn;
         if (naive_attn) {
+            Kfull = ggml_cont(ctx0, Kfull);
+            Vfull = ggml_cont(ctx0, Vfull);
             ggml_tensor* scores = ggml_mul_mat(ctx0, Kfull, Q);
             scores = ggml_soft_max_ext(ctx0, scores, (T > 1) ? causal_mask : nullptr, attn_scale, 0.0f);
             ggml_tensor* Vp = ggml_cont(ctx0, ggml_permute(ctx0, Vfull, 1, 0, 2, 3));
