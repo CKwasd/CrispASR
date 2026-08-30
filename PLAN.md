@@ -443,6 +443,13 @@ real GPU, add finite-value/code-predictor guards, implement a correctness-safe
 HIP disposition, and add an AMD self-hosted Actions proof workflow. Kaggle's
 P100/T4 CUDA workers cannot prove gfx1100/HIP behavior.
 
+Checkpoint: implementation ready on `fix/337-hip-final`. ROCm now defaults the
+content-dependent codec encoder to CPU and the affected 0.6B-F16 predictor to
+CPU; native-HIP A/B overrides remain, and non-finite predictor logits abort
+instead of sampling token 30. Hermetic unit suite 17/17; `crispasr-diff` builds.
+The manual `qwen3-tts-hip-proof.yml` requires a self-hosted Linux gfx1100 runner;
+GitHub reports zero configured runners, and its hosted GPU offering is NVIDIA.
+
 ## CLAIMED 2026-08-13 — #344 MOSS valid-frame metadata in stable C ABI
 
 Worktree: `.claude/worktrees/fix-344-moss-valid-frame-metadata`

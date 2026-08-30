@@ -2873,7 +2873,11 @@ int main(int argc, char** argv) {
         auto cp = qwen3_tts_context_default_params();
         cp.n_threads = 4;
         cp.verbosity = 0;
-        cp.use_gpu = false;
+        cp.use_gpu = crispasr_env::get("CRISPASR_DIFF_USE_GPU") != nullptr;
+        if (cp.use_gpu) {
+            fprintf(stderr, "[crispasr-diff] CRISPASR_DIFF_USE_GPU=1 -> qwen3-tts-cenc use_gpu=true "
+                            "(set CRISPASR_QWEN3_TTS_HIP_CODEC_NATIVE=1 to test native HIP)\n");
+        }
         qwen3_tts_context* qctx = qwen3_tts_init_from_file(model_path.c_str(), cp);
         if (!qctx) {
             fprintf(stderr, "failed to load talker\n");

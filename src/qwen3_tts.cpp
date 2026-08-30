@@ -60,6 +60,7 @@
 //     - encoder/decoder up-/downsample = 1920, 12.5 fps @ 24 kHz
 
 #include "qwen3_tts.h"
+#include "qwen3_tts_hip_policy.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -880,7 +881,11 @@ static bool qwen3_tts_codec_use_gpu_by_default(const qwen3_tts_context* c) {
     if (!c || !c->backend || c->backend == c->backend_cpu) {
         return false;
     }
-    // All GPU backends are safe: the CONV_TRANSPOSE_1D hang that originally
+    const bool hip_native = crispasr_env::get("CRISPASR_QWEN3_TTS_HIP_CODEC_NATIVE") != nullptr;
+    if (qwen3_tts_hip_policy::codec_must_use_cpu(ggml_backend_name(c->backend), hip_native)) {
+        return false;
+    }
+    // CUDA and Metal are safe: the CONV_TRANSPOSE_1D hang that originally
     // forced the codec to CPU on Metal (and crashed CUDA/HIP in #155) was
     // fixed in f8fc8b8e, and the op itself was replaced by mul_mat+col2im_1d
     // in 5f600f25 — no backend has a transposed-conv problem any more.
@@ -1300,8 +1305,7 @@ ggml_cgraph* build_graph_code_pred_kv(qwen3_tts_context* c, int n_past, int n_to
 }
 
 static ggml_backend_sched_t code_pred_pick_sched(qwen3_tts_context* c) {
-    const char* cp_be = env_str("CRISPASR_QWEN3_TTS_CP_BACKEND");
-    if (cp_be && std::strncmp(cp_be, "cpu", 3) == 0 && c->cp_cpu_pinned && c->cp_sched) {
+    if (c->cp_cpu_pinned && c->cp_sched) {
         return c->cp_sched;
     }
     return c->sched;
@@ -2425,6 +2429,18 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
     // the historical behaviour.
     const float temperature = c->params.temperature > 0 ? c->params.temperature : 0.9f;
     const char* dump_dir = env_str("CRISPASR_QWEN3_TTS_DUMP_DIR");
+    auto logits_are_finite = [&](const float* values, int step) {
+        for (uint32_t j = 0; j < hp.cp_vocab_size; ++j) {
+            if (!std::isfinite(values[j])) {
+                fprintf(stderr,
+                        "qwen3_tts: ERROR: code predictor emitted non-finite logits at frame %d step %d "
+                        "(index %u); synthesis aborted\n",
+                        frame_idx, step, j);
+                return false;
+            }
+        }
+        return true;
+    };
 
     // ---- step 0: inputs_embeds = (past_hidden, last_id_hidden), n_past=0 ----
     // For 1.7B variants (talker_hidden=2048, cp_hidden=1024) the talker's
@@ -2472,6 +2488,10 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
     }
     float* logits0 = run_code_pred_kv(c, step0.data(), 2, /*n_past=*/0, cp.lm_head[0]);
     if (!logits0) {
+        return false;
+    }
+    if (!logits_are_finite(logits0, 0)) {
+        free(logits0);
         return false;
     }
     if (dump_dir && frame_idx >= 0) {
@@ -2561,6 +2581,10 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
         }
         float* logits = run_code_pred_kv(c, cp_in, 1, n_past, cp.lm_head[i], /*skip_plan=*/i >= 2);
         if (!logits) {
+            return false;
+        }
+        if (!logits_are_finite(logits, i)) {
+            free(logits);
             return false;
         }
         if (dump_dir && frame_idx >= 0) {
@@ -4200,11 +4224,14 @@ static bool load_codec(qwen3_tts_context* c, const char* path) {
     const bool codec_gpu = force_metal || force_gpu || (!force_cpu && default_gpu);
     ggml_backend_t weight_backend = codec_gpu ? c->backend : c->backend_cpu;
     if (c->params.verbosity >= 1) {
-        const char* why =
-            force_metal
-                ? "QWEN3_TTS_CODEC_FORCE_METAL=1"
-                : (force_gpu ? "QWEN3_TTS_CODEC_GPU=1"
-                             : (force_cpu ? "QWEN3_TTS_CODEC_CPU=1" : (default_gpu ? "GPU default" : "CPU default")));
+        const bool hip_safety_fallback = qwen3_tts_hip_policy::codec_must_use_cpu(
+            ggml_backend_name(c->backend), crispasr_env::get("CRISPASR_QWEN3_TTS_HIP_CODEC_NATIVE") != nullptr);
+        const char* why = force_metal           ? "QWEN3_TTS_CODEC_FORCE_METAL=1"
+                          : force_gpu           ? "QWEN3_TTS_CODEC_GPU=1"
+                          : force_cpu           ? "QWEN3_TTS_CODEC_CPU=1"
+                          : hip_safety_fallback ? "#337 ROCm correctness fallback"
+                          : default_gpu         ? "GPU default"
+                                                : "CPU default";
         fprintf(stderr, "qwen3_tts: codec: %s - loading weights onto %s\n", why, ggml_backend_name(weight_backend));
     }
     core_gguf::WeightLoad wl;
@@ -6130,9 +6157,23 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_from_file(const char* path_m
     c->compute_meta.resize(ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
 
     const char* cp_be = env_str("CRISPASR_QWEN3_TTS_CP_BACKEND");
-    if (cp_be && std::strncmp(cp_be, "cpu", 3) == 0) {
-        if (!copy_cp_weights_to_cpu(c, code_pred_cpu_copy_type_from_env(cp_be))) {
+    const bool explicit_cp_cpu = cp_be && std::strncmp(cp_be, "cpu", 3) == 0;
+    const bool hip_cp_native = crispasr_env::get("CRISPASR_QWEN3_TTS_HIP_CP_NATIVE") != nullptr;
+    // The sampling-critical lm_heads stay F16 even in q8/q4 artifacts; use a
+    // transformer matmul weight to distinguish the all-F16 checkpoint.
+    const bool cp_transformer_is_f16 = !c->code_pred.blocks.empty() && c->code_pred.blocks[0].attn_q_w &&
+                                       c->code_pred.blocks[0].attn_q_w->type == GGML_TYPE_F16;
+    const bool hip_f16_cp_fallback =
+        c->code_pred.lm_head[0] && qwen3_tts_hip_policy::code_predictor_must_use_cpu(
+                                       ggml_backend_name(c->backend), hip_cp_native, (int)c->hp.cp_n_layers,
+                                       (int)c->hp.cp_d_model, cp_transformer_is_f16);
+    if (explicit_cp_cpu || hip_f16_cp_fallback) {
+        const enum ggml_type copy_type = explicit_cp_cpu ? code_pred_cpu_copy_type_from_env(cp_be) : GGML_TYPE_F16;
+        if (!copy_cp_weights_to_cpu(c, copy_type)) {
             fprintf(stderr, "qwen3_tts: code_pred CPU pin requested but copy failed; using main backend\n");
+        } else if (hip_f16_cp_fallback && c->params.verbosity >= 1) {
+            fprintf(stderr, "qwen3_tts: ROCm 0.6B-F16 code predictor routed to CPU (#337 NaN guard; set "
+                            "CRISPASR_QWEN3_TTS_HIP_CP_NATIVE=1 to override)\n");
         }
     }
 

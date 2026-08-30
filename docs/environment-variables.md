@@ -1154,6 +1154,12 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_QWEN3_TTS_CODEC_FORCE_METAL`
 - `CRISPASR_QWEN3_TTS_CODEC_GGUF`
 - `CRISPASR_QWEN3_TTS_CODEC_GPU`
+- `CRISPASR_QWEN3_TTS_HIP_CODEC_NATIVE` — bypass the #337 ROCm codec-encoder
+  correctness fallback and run it natively on HIP. Diagnostic/A/B only until
+  the triggering Daphne spans pass on a real AMD GPU.
+- `CRISPASR_QWEN3_TTS_HIP_CP_NATIVE` — bypass the #337 CPU fallback for the
+  ROCm 0.6B-F16 code predictor. Diagnostic/A/B only; its native gfx1100 path
+  was observed to emit all-NaN logits.
 - `CRISPASR_QWEN3_TTS_CODEC_TRACE`
 - `CRISPASR_QWEN3_TTS_CP_BACKEND`
 - `CRISPASR_QWEN3_TTS_CP_DIRECT`
@@ -1469,4 +1475,3 @@ end-to-end cosine cannot do.
 - `CRISPASR_ZONOS_TTS_BENCH`
 - `CRISPASR_ZONOS_TTS_TEXT`
 - `CRISPASR_ZONOS_VULKAN_NATIVE`
-
