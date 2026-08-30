@@ -1,18 +1,27 @@
 # CrispASR — Pending work
 
-## NOW — Kaggle quiet-box A/Bs in flight for the #406 + #404 default flips (2026-08-30)
+## DONE 2026-08-30 — Kaggle quiet-box A/Bs → default flips for #404 memo + cv3 SIMDCONV
 
-Both gates merged default-off; the platform-matched perf proofs are running:
-- `chr1str/crispasr-simdconv-cpu-ab` (tools/kaggle/simdconv-cpu-ab) —
-  PR #406 SIMDCONV off/on stage medians on chatterbox-turbo AND
-  cosyvoice3-tts (closes cv3's model-coverage gap), waveform diff +
-  whisper roundtrips.
-- `chr1str/crispasr-stream404-ab` (tools/kaggle/stream404-ab) — #404
-  slice-memo/tail-cap off/memo/memotail on cpu+gpu, jfk2 + an in-kernel
-  synthesized 12 s continuous utterance; finals-equality gate + decoded-
-  audio telemetry; CPU walls finally valid (uncontended box).
-Flip decisions on the results; kernels launched from main afe0a6c1.
+Kernels `chr1str/crispasr-simdconv-cpu-ab` + `chr1str/crispasr-stream404-ab`
+(tools/kaggle/…) ran to completion; finals/outputs byte-equal in EVERY arm.
 
+**#404 knobs (P100 box):** slice memo −12.2 % wall (jfk2/cpu), −5.9 % (gpu),
+neutral on the single-utterance case; tail cap −20.3 % on its engagement
+case (12 s continuous utterance, cpu), never a regression.
+→ `CRISPASR_STREAM_SLICE_MEMO` **flipped default ON** (=0 reverts; gate
+kept). `--stream-partial-tail-sec` stays opt-in: it is a preview-behavior
+choice (cosmetic seams in partials), documented with the measured win.
+
+**#406 SIMDCONV (Xeon avx512f, 72/72 packed, 1-LSB output, roundtrips
+exact):** cosyvoice3 hift_vocoder 4400→4114 ms (**1.07x**; contributor's
+Zen 4: 1.34x) — wins everywhere measured → **flipped default ON** (=0
+reverts). chatterbox s3gen 7170→7582 ms (**0.946x, a 5.4 % REGRESSION** vs
+1.25x on Zen 4) — micro-arch dependent → **stays opt-in** per rule 3a,
+numbers recorded in environment-variables.md.
+
+Follow-ups: refresh the chr1str ccache dataset (stream404's CUDA build ran
+cold, ~28 min — tools/kaggle/ccache-refresh); an ARM/NEON datapoint would
+complete the SIMDCONV picture; PR #406's author gets the numbers on the PR.
 ## 2026-08-29 — #409 silero-LID garbage languages on hard audio: confidence gate + whisper fallback
 
 Worktree `.claude/worktrees/fix-409-lid`, branch `fix/409-lid-confidence`.

@@ -4053,13 +4053,17 @@ int crispasr_run_backend(const whisper_params& params_in) {
         const int tail_slack_samples = std::max(tail_cap_samples / 2, crispasr::kStreamRedecodeMinSamples);
         int64_t tail_anchor_abs = -1;
         std::string tail_committed;
-        // CRISPASR_STREAM_SLICE_MEMO=1 (#404): memoize per-slice partial
+        // CRISPASR_STREAM_SLICE_MEMO (#404): memoize per-slice partial
         // decodes by their ABSOLUTE sample range. A VAD-closed slice keeps the
         // same (start, end) while it stays in the rolling window, and the
         // decode is deterministic, so re-decoding it every step repeats
         // byte-identical work — the bulk of the RFC's "194 full transcribes".
         // The still-growing slice changes its end every step and always
-        // misses. Exact by construction; default off per the perf-gate rule.
+        // misses. Exact by construction. DEFAULT ON since the quiet-box A/B
+        // (chr1str/crispasr-stream404-ab, P100 + Xeon): finals byte-equal in
+        // every arm, wall −12.2 % (multi-utterance CPU) / −5.9 % (GPU), never
+        // a regression beyond noise. Set =0 to restore the re-decode path
+        // (the gate stays per the never-remove-gates rule).
         struct StreamSliceMemo {
             int64_t s = 0, e = 0;
             std::vector<crispasr_segment> segs; // pristine, pre-post-chain
@@ -4067,7 +4071,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
         std::vector<StreamSliceMemo> slice_memo;
         const bool slice_memo_on = [] {
             const char* e = getenv("CRISPASR_STREAM_SLICE_MEMO");
-            return e && *e && *e != '0';
+            return !e || !*e || *e != '0';
         }();
         const int64_t utterance_max_samples = (int64_t)params.stream_utterance_max_sec * SR;
         const int64_t partial_decode_interval_samples =

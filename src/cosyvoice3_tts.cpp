@@ -4901,8 +4901,14 @@ extern "C" int cosyvoice3_tts_init_hift_from_file(struct cosyvoice3_tts_context*
     // Shared core_hift_simdconv handles validation, tensor dequantization and
     // rollback; this model adapter contributes only the bound tensors + causal padding.
     {
+        // DEFAULT ON since the quiet-box A/B (chr1str/crispasr-simdconv-cpu-ab,
+        // Xeon avx512f, packed 72/72): hift_vocoder median 4400→4114 ms
+        // (1.07x), on top of the contributor's 1.34x on Zen 4 — wins on every
+        // platform measured, output within 1 int16 LSB, roundtrip exact.
+        // Set =0 to restore the ggml path. (Chatterbox's sibling gate stays
+        // OPT-IN: the same kernel REGRESSED s3gen 5.4 % on this Xeon.)
         const char* env2 = crispasr_env::get("CRISPASR_COSYVOICE3_SIMDCONV");
-        const bool requested = env2 && *env2 && *env2 != '0';
+        const bool requested = !env2 || !*env2 || *env2 != '0';
         const bool cpu_hift = core_cpu_backend::is_cpu(hift_backend);
         core_hift_simdconv::Packer pack(requested && cpu_hift);
         const int dilations[3] = {1, 3, 5};

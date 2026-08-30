@@ -254,6 +254,13 @@ utterance state machine. When trailing silence has crossed the finalization
 threshold, one step may bypass the partial-decode throttle before finalization
 so short-utterance fallback finals can use a fresh normal partial.
 
+Related, and **on by default**: `CRISPASR_STREAM_SLICE_MEMO` memoizes each
+VAD-closed slice's partial decode by its absolute sample range — a closed
+slice keeps the same audio while it stays in the rolling window, so
+re-decoding it every step repeated byte-identical work. Exact by decode
+determinism (finals and partials byte-equal in the A/Bs; wall −12 % CPU /
+−6 % GPU on an uncontended box); set `=0` to restore the old re-decode path.
+
 `--stream-partial-tail-sec` attacks the other axis of partial cost: not how
 *often* a partial decodes, but how much *audio* each one covers. Without it, the
 partial decode of an open utterance re-encodes the whole utterance-so-far (up to

@@ -160,6 +160,7 @@ surviving artifact. Applied on both the CLI and the session C-ABI.
 | `CRISPASR_TDT_BATCH` / `CRISPASR_RNNT_BATCH` | Batch the TDT / RNNT joint decode. |
 | `CRISPASR_RNNT_GGML_PERSTEP` | Per-step (vs. persistent-graph) ggml RNNT decode. |
 | `CRISPASR_NGRAM_LOOPFIX_OFF` | Disable the n-gram decode-loop breaker. |
+| `CRISPASR_STREAM_SLICE_MEMO` | Memoize per-slice streaming partial decodes by absolute sample range (#404). **Default ON** — finals byte-equal, wall −12 % CPU / −6 % GPU in the quiet-box A/B; `=0` re-decodes closed slices every step. |
 | `CRISPASR_GAP_FILL` / `_GAP_FILL_MIN_CS` | Re-transcribe spans a first pass left empty (long audio); on by default for parakeet, threshold non-JA 300 cs / JA 100 cs. |
 
 ### G2P / phonemizer
@@ -424,7 +425,7 @@ suffixes.
 - `CRISPASR_S3GEN_ENCODER_CPU`
 - `CRISPASR_S3GEN_FASTCONV`
 - `CRISPASR_S3GEN_FASTCONV_DEBUG`
-- `CRISPASR_S3GEN_SIMDCONV` — opt into the CPU HiFT packed SIMD path for all 72 ResBlock Conv1d kernels; default off.
+- \`CRISPASR_S3GEN_SIMDCONV\` — opt into the CPU HiFT packed SIMD path for all 72 ResBlock Conv1d kernels; default off. Stays OPT-IN deliberately: the Kaggle A/B measured a 5.4 % s3gen REGRESSION on Xeon avx512f against the contributor's 1.25x win on Zen 4 — micro-arch dependent; A/B on your own hardware before enabling.
 - `CRISPASR_S3GEN_SIMDCONV_DEBUG` — print pack count, selected ISA, and CPU/GPU fallback status.
 - `CRISPASR_S3GEN_RC_AS_MUL_MAT`
 - `CRISPASR_S3GEN_VOCODER_CPU`
@@ -503,7 +504,7 @@ suffixes.
 - `CRISPASR_COSYVOICE3_DUMP_TOKENS`
 - `CRISPASR_COSYVOICE3_FASTCONV`
 - `CRISPASR_COSYVOICE3_FASTCONV_DEBUG`
-- `CRISPASR_COSYVOICE3_SIMDCONV` — opt into the CPU-only direct SIMD Conv1d path for the 72 HiFT ResBlock convolutions; default off.
+- `CRISPASR_COSYVOICE3_SIMDCONV` — CPU-only direct SIMD Conv1d path for the 72 HiFT ResBlock convolutions; **default ON** since the Kaggle quiet-box A/B (1.07x on Xeon avx512f, 1.34x on Zen 4, output 1-LSB-equal, roundtrip exact). Set `=0` for the ggml path.
 - `CRISPASR_COSYVOICE3_SIMDCONV_DEBUG` — print pack count, selected ISA, and GPU fallback status.
 - `CRISPASR_COSYVOICE3_FLOW_STEPS`
 - `CRISPASR_COSYVOICE3_FORCE_GALLOCR`
