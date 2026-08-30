@@ -10,7 +10,7 @@ jobs:
   gfx1100-proof:
     # GitHub-hosted GPU runners are NVIDIA. Attach an ephemeral AMD machine
     # with these labels; the job then proves the shipping fallback on real HIP.
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, linux, x64, gfx1100]
     timeout-minutes: 120
     env:
       WORK: /var/tmp/crispasr-337-${{ github.run_id }}
@@ -95,3 +95,7 @@ jobs:
             /var/tmp/crispasr-337-${{ github.run_id }}/hip.wav
             /var/tmp/crispasr-337-${{ github.run_id }}/roundtrip.log
             rocminfo.txt
+
+      - name: Remove downloaded models and generated audio
+        if: always()
+        run: rm -rf -- /var/tmp/crispasr-337-${{ github.run_id }}

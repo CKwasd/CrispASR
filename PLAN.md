@@ -433,23 +433,6 @@ Audit PR #345, verify the additive C ABI and failure contracts, and run the
 hermetic plus available model-backed/live tests before deciding whether any
 changes are needed.
 
-## CLAIMED 2026-08-30 — #337 Qwen3-TTS HIP codec/CP correctness (final pass)
-
-Worktree: `.claude/worktrees/fix-337-hip-final`.
-The reporter's corrected localization supersedes the stale talker-prefill claim:
-on RX 7900 XTX the codec encoder diverges content-dependently, while the 0.6B
-F16 code predictor separately emits NaN logits. Make the codec diff exercise a
-real GPU, add finite-value/code-predictor guards, implement a correctness-safe
-HIP disposition, and add an AMD self-hosted Actions proof workflow. Kaggle's
-P100/T4 CUDA workers cannot prove gfx1100/HIP behavior.
-
-Checkpoint: implementation ready on `fix/337-hip-final`. ROCm now defaults the
-content-dependent codec encoder to CPU and the affected 0.6B-F16 predictor to
-CPU; native-HIP A/B overrides remain, and non-finite predictor logits abort
-instead of sampling token 30. Hermetic unit suite 17/17; `crispasr-diff` builds.
-The manual `qwen3-tts-hip-proof.yml` requires a self-hosted Linux gfx1100 runner;
-GitHub reports zero configured runners, and its hosted GPU offering is NVIDIA.
-
 ## CLAIMED 2026-08-13 — #344 MOSS valid-frame metadata in stable C ABI
 
 Worktree: `.claude/worktrees/fix-344-moss-valid-frame-metadata`

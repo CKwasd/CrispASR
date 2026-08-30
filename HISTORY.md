@@ -311,6 +311,29 @@ matrix; the graceful-degradation fix needs `GGML_BACKEND_DL`, which is a
 bounded rather than fixed — the length trigger does not reproduce on Metal at
 T=419.
 
+## #337 Qwen3-TTS HIP correctness fallback — 2026-08-30
+
+The reporter's later RX 7900 XTX traces isolated two native-HIP defects rather
+than the earlier suspected talker trajectory divergence: content-dependent
+codec-encoder drift on the Daphne reference, and all-NaN code-predictor logits
+for the 0.6B F16 talker. `3fb042e0` makes the shipping path fail-safe: ROCm
+routes the codec encoder to CPU and routes that affected predictor shape to CPU,
+while explicit native-HIP environment switches preserve the A/B diagnostic
+paths. Every predictor logit is now checked for finiteness before sampling, so a
+backend failure aborts instead of silently selecting token 30. The shared model
+runtime owns this routing, so CLI, C ABI, sessions, server, and bindings receive
+the same behavior.
+
+Proof is deliberately split. Hermetic qwen3-tts policy tests passed 17/17 with
+the available unit tier; CI run 33316132718 passed; release run 33316140657
+compiled and packaged the HIP leg. `.github/workflows/qwen3-tts-hip-proof.yml`
+is the real gfx1100 end-to-end gate (public 0.6B F16 model + Daphne clip + ASR
+round-trip), but it requires a self-hosted runner labelled `gfx1100`. GitHub has
+no AMD hosted runner for this repository and no self-hosted runner is currently
+registered, so these results prove the safe routing and HIP compilation, not
+that the two native kernels are repaired. Kaggle's NVIDIA workers cannot close
+that evidence gap.
+
 ## #343 / #361 / #362 docs TOC and the chat ABI bindings — merged 2026-08-16
 
 Three community PRs. #343 (Juste-Leo2) adds a TOC and section links to
