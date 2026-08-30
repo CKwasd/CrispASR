@@ -7683,10 +7683,26 @@ int main(int argc, char** argv) {
         }
 
         // Compare encoder_output if present in ref
-        // TODO: expose nemotron_run_encoder as a stage API for per-stage comparison.
-        // For now, only transcript-level regression is checked.
         if (ref.has("encoder_output")) {
-            printf("[SKIP] encoder_output          (stage API not yet wired — transcript-only regression)\n");
+            int n_mels = 0, T_mel = 0;
+            float* mel = nemotron_compute_mel(ctx, samples.data(), (int)samples.size(), &n_mels, &T_mel);
+            if (mel) {
+                int T_enc = 0, d_model = 0;
+                float* enc = nemotron_run_encoder_ext(ctx, mel, n_mels, T_mel, &T_enc, &d_model);
+                free(mel);
+                if (enc) {
+                    auto rep = ref.compare("encoder_output", enc, (size_t)T_enc * d_model);
+                    print_row("encoder_output", rep, COS_THRESHOLD);
+                    record(rep);
+                    free(enc);
+                } else {
+                    printf("[ERR ] encoder_output          nemotron_run_encoder_ext returned null\n");
+                    n_fail++;
+                }
+            } else {
+                printf("[ERR ] encoder_output          nemotron_compute_mel returned null\n");
+                n_fail++;
+            }
         }
 
         nemotron_result_free(r);

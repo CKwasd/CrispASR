@@ -94,6 +94,12 @@ int nemotron_n_vocab(struct nemotron_context* ctx);
 int nemotron_blank_id(struct nemotron_context* ctx);
 const char* nemotron_token_to_str(struct nemotron_context* ctx, int token_id);
 
+// ---- Diagnostics / diff API ----
+
+float* nemotron_compute_mel(struct nemotron_context* ctx, const float* samples, int n_samples, int* out_n_mels, int* out_T_mel);
+
+float* nemotron_run_encoder_ext(struct nemotron_context* ctx, const float* mel, int n_mels, int T_mel, int* out_T_enc, int* out_d_model);
+
 // Hyper-parameters
 int nemotron_frame_dur_cs(struct nemotron_context* ctx);
 int nemotron_n_mels(struct nemotron_context* ctx);
