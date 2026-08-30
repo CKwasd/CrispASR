@@ -433,14 +433,15 @@ Audit PR #345, verify the additive C ABI and failure contracts, and run the
 hermetic plus available model-backed/live tests before deciding whether any
 changes are needed.
 
-## CLAIMED 2026-08-13 — #337 Qwen3-TTS HIP prefill divergence (second pass)
+## CLAIMED 2026-08-30 — #337 Qwen3-TTS HIP codec/CP correctness (final pass)
 
-Worktree: `.claude/worktrees/fix-337-qwen3-tts-hip`.
-The first-pass single-backend allocator fix was disproven on RX 7900 XTX:
-the reporter confirms it is byte-identical to the scheduler path and CPU-vs-HIP
-full-frame replay still diverges at prefill. Reproduce with the diff harness,
-bisect the first divergent talker tensor/op under identical teacher-forced
-history, then fix and validate on the real HIP path via the Kaggle regime.
+Worktree: `.claude/worktrees/fix-337-hip-final`.
+The reporter's corrected localization supersedes the stale talker-prefill claim:
+on RX 7900 XTX the codec encoder diverges content-dependently, while the 0.6B
+F16 code predictor separately emits NaN logits. Make the codec diff exercise a
+real GPU, add finite-value/code-predictor guards, implement a correctness-safe
+HIP disposition, and add an AMD self-hosted Actions proof workflow. Kaggle's
+P100/T4 CUDA workers cannot prove gfx1100/HIP behavior.
 
 ## CLAIMED 2026-08-13 — #344 MOSS valid-frame metadata in stable C ABI
 
