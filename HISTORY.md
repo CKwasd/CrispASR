@@ -6,6 +6,44 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #405 CUDA package on a pre-AVX2 CPU had NO cpu backend — variant CPU modules + graceful no-CPU failure, fixed 2026-08-30
+
+A Tesla P40 user (old pre-AVX2 Xeon) crashed on every run of the
+linux-x86_64-cuda package: `--no-gpu` died at `ggml-backend.cpp:471
+GGML_ASSERT(backend)` inside `core_gguf::load_weights` (parakeet), the GPU
+run died at `:595 GGML_ASSERT(device)` inside whisper LID's
+`make_buft_list`. Root cause chain: the CUDA legs built ONE `libggml-cpu.so`
+at AVX2+FMA+F16C; under `GGML_BACKEND_DL` its `ggml_backend_score()`
+(correctly) returns 0 on that host, ggml refuses the module, and the
+registry registers only CUDA — `registered backends: 1` in the report. The
+#380 ISA fail-fast could not fire because `has_feature()` needs the very
+module that was refused; `core_cpu_backend::init()` returned null; and both
+abort sites deref'd it. Reproduced bit-for-bit from the shipped v0.8.30
+tarball under `qemu-x86_64 -cpu Nehalem` (rc=134, same assert line).
+
+Fix, two layers. (1) Packaging: the CUDA legs now build
+`GGML_CPU_ALL_VARIANTS` — 14 `libggml-cpu-<variant>.so` modules from the
+always-works `x64` baseline up; the loader scores and picks the best at
+runtime, so the reporter's box gets sse42 and CUDA inference works. The
+package step asserts the x64 baseline shipped. (2) Robustness when no CPU
+module loads at all: `load_weights` rejects a null backend with a clean
+error (hermetic guard: tests/test-gguf-null-backend.cpp — the pre-fix test
+binary dies on the GGML_ASSERT), `make_buft_list` tolerates the missing CPU
+device with whisper/VAD loads failing properly, `cpu_device()` prints a
+one-time diagnosis naming the cause, and the CLI + server probe the CPU
+backend at startup and exit 1 with the `-cpu-legacy` pointer.
+
+Proof: `.github/workflows/linux-isa-fallback-verify.yml` (runs on every push
+touching the involved files) — native arm picks an AVX2+ variant and
+transcribes jfk.wav; the `qemu -cpu Nehalem` arm picks x64/sse42 and still
+transcribes; the no-modules arm exits 1 with the diagnosis instead of
+SIGABRT. Locally: skylakex picked natively, arm A exit 1 verified, and the
+shipped-tarball repro above. Kaggle P100
+(`chr1s4/crispasr-issue405-cuda-variants`) builds the exact release-CUDA-leg
+shape and runs parakeet-on-CUDA + whisper-LID end-to-end with the variant
+set, plus the graceful no-CPU arm. Also documented: `mise` installs get the
+default AVX2 asset — flavor guidance now in docs/install.md.
+
 ## #398 htdemucs GPU path aborted in ggml-cuda binbcast — F32-cast broadcast weights, fixed 2026-08-29
 
 The first `/v1/audio/separation` under `CRISPASR_HTDEMUCS_GGML=1` +

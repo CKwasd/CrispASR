@@ -17,7 +17,7 @@ per-backend porting detail (Per-model port notes + the family cross-reference).
 Reach for the topic groups when you are stuck on a *technique*, and the
 cross-reference when you already know which model you are touching.
 
-## Index by topic (294 lessons)
+## Index by topic (295 lessons)
 
 **Security & untrusted input** (2)
 
@@ -352,11 +352,12 @@ cross-reference when you already know which model you are touching.
 - L18186 — Four bugs that together caused empty/garbage transcripts; all patched in src/vibevoice.cpp +…
 - L18411 — "Verified byte-identical at 225 s" verified a clip, not a length — and a decoder that drops spans needs a repair pass, not a better cap
 
-**Uncategorised** (3)
+**Uncategorised** (4)
 
 - L195 — An arm that fails under every condition cannot discriminate a fix
 - L216 — Hardcoded token ids need a guard that DECODES them
 - L267 — Model-emitted sentinels are not transcript text
+- L18638 — An ISA gate that "safely refuses" the only CPU module ships a process that cannot run — and every safety layer downstream assumed the layer above had fired
 
 ## Cross-reference by model / family
 
@@ -368,7 +369,7 @@ lookup, not a partition.
 - **cosyvoice3** (9) — L1114, L9428, L13446, L14494, L14943, L15820, L16053, L17012, L17040
 - **vibevoice** (15) — L216, L1039, L2190, L3097, L5665, L6434, L8945, L13297, L13332, L13375, L14051, L15507, L15527, L15758, L18186
 - **tada** (9) — L1520, L1893, L2237, L2287, L2301, L13446, L13709, L16435, L18138
-- **whisper** (22) — L714, L2406, L3384, L4184, L4368, L4441, L4577, L5084, L6025, L7996, L8364, L13208, L15066, L15572, L15615, L15681, L16123, L16671, L17012, L17768, L17828, L17944
+- **whisper** (23) — L714, L2406, L3384, L4184, L4368, L4441, L4577, L5084, L6025, L7996, L8364, L13208, L15066, L15572, L15615, L15681, L16123, L16671, L17012, L17768, L17828, L17944, L18638
 - **parakeet / TDT** (18) — L485, L1247, L2406, L2439, L3508, L4441, L4787, L6885, L8879, L11197, L11282, L12322, L13880, L15023, L15066, L16123, L17944, L18411
 - **moss** (13) — L974, L1170, L1662, L1864, L2039, L2045, L2336, L2361, L2386, L3508, L14686, L15441, L15459
 - **firered** (9) — L1831, L4993, L5084, L5665, L5832, L6696, L13827, L15572, L15615
