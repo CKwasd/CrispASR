@@ -5148,6 +5148,20 @@ catch_discover_tests(test-chatterbox-attn-policy
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test-gguf-null-backend — issue #405 null-backend load guard (hermetic, unit)
+add_executable(test-gguf-null-backend test-gguf-null-backend.cpp)
+target_include_directories(test-gguf-null-backend PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-gguf-null-backend PRIVATE Catch2::Catch2WithMain crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+catch_discover_tests(test-gguf-null-backend
+    TEST_SPEC "[null-backend]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test-num2words-fr-es — French + Spanish number expansion (hermetic, unit)
 add_executable(test-num2words-fr-es test-num2words-fr-es.cpp)
 target_include_directories(test-num2words-fr-es PRIVATE ${PROJECT_SOURCE_DIR}/src)

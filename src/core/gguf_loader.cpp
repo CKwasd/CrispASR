@@ -526,6 +526,23 @@ static bool load_weights_impl(const char* path, ggml_backend_t backend, IncludeT
                               const char* model_tag, WeightLoad& out) {
     const char* tag = model_tag ? model_tag : "core_gguf";
 
+    // Issue #405: under GGML_BACKEND_DL every backend init can legitimately
+    // return null — when the host CPU is below the ISA floor of every shipped
+    // libggml-cpu variant, ggml_backend_score() refuses them all and the
+    // registry has NO CPU device. A null backend used to sail into
+    // ggml_backend_get_device() and abort the whole process
+    // (GGML_ASSERT(backend), ggml-backend.cpp:471). Fail the load cleanly so
+    // the caller's init path reports an error instead.
+    if (!backend) {
+        fprintf(stderr,
+                "%s: no ggml backend available to load '%s' into.\n"
+                "%s: if this is a packaged (dynamic-backend) build, the shipped libggml-cpu\n"
+                "%s: modules may all require CPU features this host lacks — use the\n"
+                "%s: crispasr-*-cpu-legacy artifact or build from source on this machine.\n",
+                tag, path, tag, tag, tag);
+        return false;
+    }
+
     ggml_context* source_ctx = nullptr;
     gguf_init_params gp = {/*.no_alloc=*/true, /*.ctx=*/&source_ctx};
     gguf_context* gctx = gguf_init_from_file(path, gp);

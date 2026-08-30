@@ -25,7 +25,8 @@
 // Adapted from examples/server/server.cpp for multi-backend support.
 
 #include "crispasr_backend.h"
-#include "core/asr_sensitivity.h" // §W7 --sensitivity presets over the HTTP API
+#include "core/asr_sensitivity.h"  // §W7 --sensitivity presets over the HTTP API
+#include "core/ggml_cpu_backend.h" // CPU-backend probe — refuse to start when no module loads (#405)
 #include "crispasr_diarize_cli.h"
 #include "tiron_link.h" // #295: tiron cross-window speaker linking (shared with the CLI)
 #include "crispasr_gap_fill.h"
@@ -1220,6 +1221,22 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     // degrade) instead of crashing mid-request. Computed once; read by handlers.
     const crispasr_cpu_isa::IsaCheck cpu_isa = crispasr_cpu_isa::check();
     fprintf(stderr, "%s\n", crispasr_cpu_isa::banner(cpu_isa).c_str());
+
+    // Issue #405: in a GGML_BACKEND_DL package the check above cannot see a CPU
+    // module that REFUSED to load (host below every shipped variant's ISA
+    // floor) — the registry then has no CPU device and the first model load
+    // aborts the whole server on a bare GGML_ASSERT. Probe once and refuse to
+    // start with the real story instead. Never fails in non-DL builds.
+    {
+        ggml_backend_t cpu_probe = core_cpu_backend::init();
+        if (!cpu_probe) {
+            fprintf(stderr, "crispasr-server: error: no CPU ggml backend could be initialised (see above) — "
+                            "refusing to start. Use the '-cpu-legacy' release artifact on this machine, or "
+                            "build from source.\n");
+            return 1;
+        }
+        ggml_backend_free(cpu_probe);
+    }
 
     crispasr_c2pa_startup_check();
     if (!params.watermark_model.empty()) {

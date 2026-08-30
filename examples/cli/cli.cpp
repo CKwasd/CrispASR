@@ -13,6 +13,7 @@
 #include "crispasr_stream_punc.h"      // streaming punctuation mode helpers (#112)
 #include "crispasr_cache.h"            // crispasr_cache::ensure_cached_file (for --hf-repo, #128)
 #include "core/asr_sensitivity.h"      // --sensitivity presets (PLAN.md §W7)
+#include "core/ggml_cpu_backend.h"     // CPU-backend probe — fail fast when no module loads (#405)
 #include "core/gpu_backend_pref.h"     // crispasr_set_gpu_backend_pref (#214)
 #include "core/win_compat.h"           // setenv/unsetenv shims for MSVC
 #include "crispasr_model_mgr_cli.h"
@@ -2424,6 +2425,27 @@ int main(int argc, char** argv) {
             }
             fprintf(stderr, "warning: CRISPASR_IGNORE_CPU_ISA=1 set — continuing anyway.\n");
         }
+    }
+
+    // Issue #405 — the case the #380 check above cannot see: in a
+    // GGML_BACKEND_DL package the CPU backend is a dlopen'd module with an ISA
+    // gate of its own (ggml_backend_score()), and on a host below every shipped
+    // variant's floor NONE of them registers. has_feature() then reports no
+    // features, isa.checked stays false, and the process used to run on until
+    // the first null-backend deref aborted it (GGML_ASSERT(backend) /
+    // GGML_ASSERT(device) — the two #405 stacks). Probe the CPU backend once,
+    // up front, and fail with the actual story instead. In non-DL builds the
+    // probe is ggml_backend_cpu_init() and never fails.
+    {
+        ggml_backend_t cpu_probe = core_cpu_backend::init();
+        if (!cpu_probe) {
+            fprintf(stderr, "error: no CPU ggml backend could be initialised (see the message above).\n"
+                            "       Nothing can run without one — even GPU inference stages audio and\n"
+                            "       falls back per-op on the CPU backend. Use the '-cpu-legacy' release\n"
+                            "       artifact for this machine, or build from source.\n");
+            return 1;
+        }
+        ggml_backend_free(cpu_probe);
     }
 
     if (params.use_gpu) {

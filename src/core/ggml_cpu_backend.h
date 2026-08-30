@@ -26,6 +26,7 @@
 
 #include "ggml-backend.h"
 
+#include <cstdio>
 #include <cstring>
 
 // ggml-cpu.h is included in BOTH branches: `ggml_cplan` is a plain struct and
@@ -160,7 +161,23 @@ inline ggml_backend_dev_t cpu_device() {
         return true;
     }();
     (void)loaded;
-    return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    // Issue #405: when the host CPU is below the ISA floor of EVERY shipped
+    // libggml-cpu module, ggml_backend_score() refuses them all and this
+    // lookup returns null. That is a terminal condition for the process
+    // (nothing computes without a CPU backend), and downstream it used to
+    // surface as a bare GGML_ASSERT abort. Say what actually happened, once.
+    if (!dev) {
+        static const bool warned = [] {
+            fprintf(stderr, "crispasr: no CPU ggml backend registered — the libggml-cpu module(s) shipped "
+                            "next to this binary were either not found or refused because this host's CPU "
+                            "lacks the instruction-set features they were built for. Use the "
+                            "crispasr-*-cpu-legacy artifact, or build from source on this machine.\n");
+            return true;
+        }();
+        (void)warned;
+    }
+    return dev;
 }
 
 inline ggml_backend_t init() {

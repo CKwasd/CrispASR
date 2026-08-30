@@ -1915,7 +1915,17 @@ static buft_list_t make_buft_list(whisper_context_params& params) {
     }
 
     // CPU Extra
+    //
+    // Issue #405: under GGML_BACKEND_DL the registry can have NO CPU device
+    // (every shipped libggml-cpu variant refused by ggml_backend_score() on a
+    // host below their ISA floor). ggml_backend_dev_backend_reg(nullptr)
+    // aborts the process (GGML_ASSERT(device), ggml-backend.cpp:595 — the LID
+    // crash in the report), so return the GPU-only list and let the caller
+    // fail the model load with a real error message.
     auto* cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (!cpu_dev) {
+        return buft_list;
+    }
     auto* cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
     auto get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)ggml_backend_reg_get_proc_address(
         cpu_reg, "ggml_backend_dev_get_extra_bufts");
@@ -2326,6 +2336,14 @@ static bool whisper_model_load(struct whisper_model_loader* loader, whisper_cont
 
     // Create a list of available bufts, in priority order
     buft_list_t buft_list = make_buft_list(wctx.params);
+    if (!ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        CRISPASR_LOG_ERROR("%s: no CPU ggml backend is registered — cannot place model weights. "
+                           "If this is a packaged (dynamic-backend) build, the shipped libggml-cpu modules "
+                           "may all require CPU features this host lacks; use the crispasr-*-cpu-legacy "
+                           "artifact or build from source on this machine.\n",
+                           __func__);
+        return false;
+    }
 
     auto create_tensor = [&](asr_tensor type, asr_system system, ggml_tensor* meta, int layer = 0) -> ggml_tensor* {
         ggml_op op = ASR_TENSOR_INFO.at(type);
@@ -5422,6 +5440,12 @@ struct whisper_vad_context* whisper_vad_init_with_params(struct whisper_model_lo
     wparams.use_gpu = params.use_gpu;
     wparams.gpu_device = params.gpu_device;
     buft_list_t buft_list = make_buft_list(wparams);
+    if (!ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        CRISPASR_LOG_ERROR("%s: no CPU ggml backend is registered — cannot place VAD weights (see the "
+                           "cpu-legacy note in the ASR loader error above / issue #405).\n",
+                           __func__);
+        return nullptr;
+    }
 
     auto create_tensor = [&](vad_tensor type, ggml_tensor* meta) -> ggml_tensor* {
         ggml_op op = VAD_TENSOR_OPS.at(type);
