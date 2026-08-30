@@ -950,6 +950,20 @@ a transcript or arbitrary UTF-8 string).
 | `--lid-backend NAME` | Audio-LID provider: `whisper` (default), `silero` (95 langs, 16 MB), `ecapa` (107 or 45 langs, 40-43 MB), `firered` (120 langs, 544 MB), `probe` (ask the ASR model itself — cohere; no second model, and it can only return a language that model supports), or `off` / `none` |
 | `--lid-model FNAME` | Override the audio-LID model path (default: auto-downloads `ggml-tiny.bin` ~75 MB on first use) |
 
+**Silero evidence gate (#409).** On hard inputs — heavily compressed audio
+(MP3/OGG artifacts), very short or band-limited speech — the 16 MB
+silero-lang95 classifier's whole logit vector deflates and the softmax then
+renormalizes noise into a confident-looking wrong answer (`yo` at softmax
+p=0.58 on an MP3-coded JFK clip; `be` on clearly French audio in #409 — the
+upstream ONNX reference produces the same garbage, so this is the model, not
+the port). The separating signal is the RAW top-logit magnitude (free-energy
+OOD scoring): correct detections sit at ~`-1.1`, every observed failure at
+`-3.35` or below. A silero answer whose top logit is below `-2.0` is treated
+as **inconclusive**: discarded with a stderr note, and LID falls back to
+whisper-tiny, which is markedly more robust on such audio. Tune or disable
+with `CRISPASR_SILERO_LID_MIN_LOGIT` (e.g. `-3.0` to relax, `-999` to accept
+everything).
+
 ### Text LID (post-ASR / standalone)
 
 Runs on a transcript or any UTF-8 string. The dispatcher in

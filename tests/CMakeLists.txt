@@ -617,6 +617,7 @@ add_executable(test-stream-finalize
 )
 target_include_directories(test-stream-finalize PRIVATE
     ${PROJECT_SOURCE_DIR}/examples/cli
+    ${PROJECT_SOURCE_DIR}/src
 )
 target_link_libraries(test-stream-finalize PRIVATE
     Catch2::Catch2WithMain
