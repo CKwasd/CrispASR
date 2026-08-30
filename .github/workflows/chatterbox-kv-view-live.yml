@@ -52,10 +52,22 @@ jobs:
             2>&1 | tee "$WORK/materialized.log"
 
           test -s "$WORK/direct.wav"
-          cmp "$WORK/direct.wav" "$WORK/materialized.wav"
+          # The container carries timestamped provenance metadata, so whole-file
+          # bytes legitimately differ. Compare decoded PCM and stream metadata.
+          python - "$WORK/direct.wav" "$WORK/materialized.wav" <<'PY'
+          import hashlib, sys, wave
+          def read(path):
+              with wave.open(path, "rb") as wav:
+                  params = wav.getparams()
+                  pcm = wav.readframes(wav.getnframes())
+              return params, pcm
+          direct, materialized = map(read, sys.argv[1:])
+          assert direct[0] == materialized[0], (direct[0], materialized[0])
+          assert direct[1] == materialized[1]
+          print("PCM sha256:", hashlib.sha256(direct[1]).hexdigest())
+          PY
           grep -q 'chatterbox_bench: t3_ar_decode' "$WORK/direct.log"
           grep -q 'chatterbox_bench: t3_ar_decode' "$WORK/materialized.log"
-          sha256sum "$WORK/direct.wav" "$WORK/materialized.wav"
 
       - name: Upload A/B proof
         if: always()
