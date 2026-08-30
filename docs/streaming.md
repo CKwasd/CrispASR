@@ -237,7 +237,6 @@ block.
 | `--stream-length N` | `10000` ms | Rolling context window cap. The decode buffer accumulates audio up to this many ms, then drops the oldest samples from the front. Larger = better accuracy on long-form content but higher per-step cost. |
 | `--stream-keep N` | `200` ms | Legacy — kept for compatibility, currently a no-op. The rolling buffer above subsumes it (see issue #84). |
 | `--stream-partial-decode-ms N` | `0` ms | JSON+VAD only. Minimum interval between live partial ASR decodes. `0` preserves the previous behavior and decodes every `--stream-step`; larger values keep VAD/final timing at `--stream-step` while reducing partial ASR cadence. |
-| `--stream-partial-tail-sec N` | `0` (off) | JSON+VAD only (#404). Cap each live partial decode to the last ~N seconds of the open utterance. Text decoded ahead of the moving anchor is kept as a committed prefix, so `partial.text` still covers the whole utterance, and `final.text` is untouched (redecode mode re-decodes the full utterance regardless). Cuts land on the quietest 100 ms, the same boundary policy as the long-audio chunker. Effective floor ~4 s. |
 
 `--stream-vad-merge-gap-ms` defaults to `250` ms and applies only to
 `--stream-json --vad`. It merges adjacent VAD slices only across gaps smaller
@@ -253,24 +252,6 @@ finalization checks at 500 ms while allowing live partial ASR text at most every
 utterance state machine. When trailing silence has crossed the finalization
 threshold, one step may bypass the partial-decode throttle before finalization
 so short-utterance fallback finals can use a fresh normal partial.
-
-`--stream-partial-tail-sec` attacks the other axis of partial cost: not how
-*often* a partial decodes, but how much *audio* each one covers. Without it, the
-partial decode of an open utterance re-encodes the whole utterance-so-far (up to
-`--stream-length`) every time, so preview cost grows with utterance length even
-though only the tail changes. Encoder-state reuse cannot fix this exactly — a
-bidirectional encoder (e.g. cohere's Conformer, unmasked relative-position
-attention over the whole window in every layer) makes every earlier frame's
-encoding depend on later audio — so the incrementality lives at the *text*
-level instead: the region behind the cap is decoded once at a quiet cut, its
-text committed, and each subsequent partial decodes only `[cut, now]`. On
-CPU, where every encoder pass pays a large weights-bandwidth constant, pair it
-with `--stream-partial-decode-ms`; on GPU the per-decode saving dominates.
-Finals are exact either way: `--stream-final-mode redecode` (the default)
-re-decodes the buffered utterance PCM from scratch. Expect small cosmetic
-seams in the stitched *partials* (a capital letter or period where two
-independently-decoded regions join — e.g. "…that the Proposed…"); the final
-replaces them with the seamless full-utterance text.
 
 The default value `0` means **"follow `--stream-step`"** — the throttle is
 always conceptually present in the JSON+VAD path, but at `0` it locks to the

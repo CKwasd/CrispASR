@@ -37,8 +37,9 @@ def dump(model_dir: str, audio, stages=None, max_new_tokens: int = 0, verbose: b
     audio_t = torch.from_numpy(audio).unsqueeze(0)
     audio_len = torch.tensor([audio_t.shape[1]], dtype=torch.long)
 
+    model_dir = str(model_dir)
     print(f"Loading NeMo model from {model_dir} ...")
-    if os.path.exists(model_dir) and str(model_dir).endswith(".nemo"):
+    if os.path.exists(model_dir) and model_dir.endswith(".nemo"):
         model = nemo_asr.models.EncDecRNNTModel.restore_from(model_dir, map_location="cpu")
     else:
         model = nemo_asr.models.EncDecRNNTModel.from_pretrained(model_dir, map_location="cpu")

@@ -1429,6 +1429,19 @@ done. Nothing clean+validatable-locally remains — do NOT keep sprinkling std::
   tiny for most consumers (kokoro=20, cosyvoice3=16) so the per-frame IRFFT is
   already cheap. Poor risk/reward — SKIP (would need per-thread out buffers + merge
   or a stride-coloring scheme for a marginal win).
+  **2026-08-30 re-audit:** the "miocodec has a scalar FFT" line below was
+  misattributed — `src/miocodec.cpp` contains no FFT of its own; its one
+  `core_istft::istft` call sits behind `miocodec_extract_stage`, whose only
+  caller is the diff harness (decode is a stub; `miotts.cpp:1770` calls
+  core_istft directly). Measured miotts share: iSTFT ≈ 2.0% of synthesis CPU
+  (n_fft=392/hop=98/T=1332 — 3.5 s of 176.6 s) — under the 5% gate, so still
+  SKIP. For the record, a BIT-IDENTICAL parallel design DOES exist if a heavy
+  consumer ever appears: parallelize only `irfft_hermitian` into a T×n_fft
+  frame buffer (each frame self-contained, ~2 MB scratch at miotts sizes,
+  ~99% of the stage) and keep the overlap-add strictly serial — the naive
+  frame-parallel OLA is both a race and FP-non-associative, and per-thread
+  buffers + ordered merge does NOT restore bit-identity, but the irfft split
+  does by construction. Gate as `CRISPASR_ISTFT_SERIAL=1` if ever done.
 - Own-mel backends NOT on core_mel (f5_tts, gemma4_e2b, titanet, chatterbox_s3gen,
   outetts_wavtok, ecapa_lid): their FFT runs ONCE on the reference clip or on TTS
   output where the DiT/decoder dominates — marginal fractions, not the
@@ -3997,8 +4010,17 @@ ggml port targets. New category: audio → note events (MIDI).
   session, 2026-07-19).
 - [ ] **Basic Pitch** (Spotify, Apache-2.0). Lightweight CNN (~10 MB). Polyphonic
   audio → MIDI. After piano_transcription.
-- [ ] **MT3** (Google, Apache-2.0). Seq2seq multi-instrument. Large (~1 GB+).
-  Feasibility check first.
+- [ ] **MT3** (Google, Apache-2.0). Seq2seq multi-instrument. Feasibility check
+  DONE 2026-08-30 → **GO**, `docs/music-transcription/mt3-feasibility.md`.
+  Corrections to the old line: the checkpoint is **171.6 MB** (60 M params, ~120
+  MB F16 — verified against the live GCS listing), not "1 GB+", and the T5X/zarr
+  checkpoint decodes with stdlib+numpy (no JAX/t5x/TensorStore). ~80% of
+  `src/t5_translate.cpp` reuses directly; the gotcha is MT3 uses sinusoidal
+  ABSOLUTE positions (`FixedEmbed`, network.py:180/225 — zero
+  relative_attention_bias params in the checkpoint), so the T5 runtime needs a
+  second positional branch. Gate on note-level F1 vs `openmirlab/mt3-infer`
+  (numpy ref dumper required — mt3-infer excludes Magenta MT3 deps), NOT cosine:
+  the risk is the tie-section cross-segment note stitching. ~8 working days.
 
 **New CLI surface:** `--task transcribe-music` / `--backend piano-transcription`
 → MIDI output file.
@@ -4136,6 +4158,18 @@ Real defect found and fixed: `silero_lid_detect` returned the RAW top logit
 as `out_confidence` while the whisper arm returns a probability — every
 probability threshold (CLI `p=` prints, CrisperWeaver's 0.35 floor) silently
 rejected correct answers. Now softmaxed: jfk → en p=0.9985 on both paths.
+
+x86 confirmation (2026-08-30, CrisperWeaver session): a minimal C driver over
+the exact Dart chain (crispasr_audio_load → detect_language_pcm(silero))
+answers **en** on this linux/x86_64 box at HEAD (p=0.9985) AND with the
+surviving 0.8.29 artifact (raw logit −0.795) — the engine never miscomputed
+here either. The pa-in/fr answers came solely from the Aug-28 22:07
+libcrispasr.so.0.8.30 artifact, which was overwritten by the Aug-29 22:04
+rebuild before it could be autopsied: a stale/mixed incremental build, i.e.
+the artifact-not-source hazard ci.yml already documents. Downstream note:
+CrisperWeaver's pinned CRISPASR_REF 110fd5ce predates fbe39169, so its
+shipped 0.35 floor discards raw-logit silero confidences — ref bump queued
+on their side.
 
 ## (was NOW) — original report, kept for the record
 

@@ -814,12 +814,6 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
             fprintf(stderr, "crispasr: --stream-partial-decode-ms must be >= 0\n");
             exit(2);
         }
-    } else if (arg == "--stream-partial-tail-sec") {
-        params.stream_partial_tail_sec = std::stoi(ARGV_NEXT);
-        if (params.stream_partial_tail_sec < 0) {
-            fprintf(stderr, "crispasr: --stream-partial-tail-sec must be >= 0\n");
-            exit(2);
-        }
     } else if (arg == "--stream-punc") {
         std::string mode = ARGV_NEXT;
         if (!crispasr_stream_punc_mode_valid(mode)) {
@@ -1311,10 +1305,6 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "  --stream-partial-decode-ms N      [%-7d] JSON+VAD minimum interval between partial ASR decodes; 0 = "
             "every step\n",
             params.stream_partial_decode_ms);
-    fprintf(stderr,
-            "  --stream-partial-tail-sec N       [%-7d] JSON+VAD cap partial decodes to the last N s of the open "
-            "utterance (0 = full slice)\n",
-            params.stream_partial_tail_sec);
     fprintf(stderr, "  --stream-punc MODE                [%-7s] JSON+VAD FireRedPunc mode: off, final, or partial\n",
             params.stream_punc.c_str());
     fprintf(stderr,

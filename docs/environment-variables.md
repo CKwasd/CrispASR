@@ -1225,7 +1225,6 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_SILERO_LID_DUMP`
 - `CRISPASR_SILERO_LID_LEGACY`
 - `CRISPASR_SILERO_LID_MAX_S`
-- `CRISPASR_SILERO_LID_MIN_LOGIT` — evidence gate (#409): discard a silero LID answer whose top-1 RAW logit is below this floor (default `-2.0`; `-999` disables) and fall back to whisper-tiny LID. The raw-logit magnitude separates in-domain from out-of-domain audio where the softmax probability does not.
 - `CRISPASR_SILERO_LID_TRACE`
 - `CRISPASR_SILERO_LID_TRACE_OFF`
 - `CRISPASR_SILERO_LID_TRUNC`
