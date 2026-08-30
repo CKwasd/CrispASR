@@ -6,6 +6,29 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #382 Finnish Chatterbox Nano — registry and live proof, fixed 2026-08-30
+
+Registered `JJarvinen/chatterbox-finnish-nano-GGUF` v0.1.3 with its shared
+Turbo S3Gen companion; wired the CLI factory/list, `-m auto -l fi` routing,
+C ABI aliases, capabilities, docs, and generated feature matrix. The audit
+also found that previously shipped Nano/Turbo/fine-tune aliases appeared in
+the CLI but were not openable through the C ABI, and repaired the whole
+family. Finnish Nano is monolingual: `-l fi` selects it without injecting the
+nonexistent `[fi]` multilingual token. Hosted run 33334395303 passed the
+4,677-assertion registry suite, static/capability tests, full backend-wiring
+audit, both public auto-downloads, and CPU synthesis of a 4.84 s / 24 kHz WAV.
+
+## #410 Chatterbox direct KV-cache views — merged and model-proven 2026-08-30
+
+PR #410 removed redundant `ggml_cont()` copies around each Chatterbox T3
+flash-attention K/V layer view. Audit confirmed that each selected layer is
+logically contiguous and only carries a nonzero base offset. Follow-up
+coverage builds a real CPU ggml graph over a nonzero-offset cache layer and
+compares the direct view with the former materialized path (71 assertions).
+Hosted live run 33333867440 used public Nano Q4_K plus Turbo S3Gen Q4_K: both
+paths emitted the same 40-token trajectory and byte-identical decoded PCM.
+`CRISPASR_CHATTERBOX_KV_CONT=1` retains the old path as a diagnostic A/B.
+
 ## #405 CUDA package on a pre-AVX2 CPU had NO cpu backend — variant CPU modules + graceful no-CPU failure, fixed 2026-08-30
 
 A Tesla P40 user (old pre-AVX2 Xeon) crashed on every run of the
