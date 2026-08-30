@@ -3086,8 +3086,11 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
     }
 #endif
 #ifdef CA_HAVE_CHATTERBOX
-    if (s->backend == "chatterbox" || s->backend == "chatterbox-tts" || s->backend == "kartoffelbox" ||
-        s->backend == "chatterbox_turbo") {
+    if (s->backend == "chatterbox" || s->backend == "chatterbox-tts" || s->backend == "chatterbox-turbo" ||
+        s->backend == "chatterbox_turbo" || s->backend == "chatterbox-nano" || s->backend == "chatterbox_nano" ||
+        s->backend == "chatterbox-finnish-nano" || s->backend == "chatterbox_finnish_nano" ||
+        s->backend == "kartoffelbox" || s->backend == "kartoffelbox-turbo" || s->backend == "kartoffelbox_turbo" ||
+        s->backend == "lahgtna" || s->backend == "lahgtna-chatterbox" || s->backend == "lahgtna-chatterbox-v1") {
         s->backend = "chatterbox";
         chatterbox_context_params p = chatterbox_context_default_params();
         p.n_threads = s->n_threads;
@@ -4368,7 +4371,8 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
     list += ",kokoro";
 #endif
 #ifdef CA_HAVE_CHATTERBOX
-    list += ",chatterbox";
+    list +=
+        ",chatterbox,chatterbox-turbo,chatterbox-nano,chatterbox-finnish-nano,kartoffelbox-turbo,lahgtna-chatterbox";
 #endif
 #ifdef CA_HAVE_BANANAMIND_TTS
     list += ",bananamind-tts";

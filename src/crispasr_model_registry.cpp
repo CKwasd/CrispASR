@@ -939,6 +939,14 @@ constexpr Entry k_registry[] = {
      "chatterbox-turbo-s3gen-q8_0.gguf",
      "https://huggingface.co/cstr/chatterbox-turbo-GGUF/resolve/main/chatterbox-turbo-s3gen-q8_0.gguf",
      "~627 MB"},
+    // Finnish-only Nano fine-tune, published and live-tested by the model
+    // author. It uses the unchanged Turbo MeanFlow S3Gen companion.
+    {"chatterbox-finnish-nano", "chatterbox-finnish-nano-v0.1.3-t3-q8_0.gguf",
+     "https://huggingface.co/JJarvinen/chatterbox-finnish-nano-GGUF/resolve/main/chatterbox-finnish-nano-v0.1.3-t3-q8_0.gguf",
+     "~329 MB",
+     "chatterbox-turbo-s3gen-q8_0.gguf",
+     "https://huggingface.co/cstr/chatterbox-turbo-GGUF/resolve/main/chatterbox-turbo-s3gen-q8_0.gguf",
+     "~627 MB"},
     // Kartoffelbox-Turbo: SebastianBodza's German fine-tune of
     // chatterbox-turbo. Same GPT-2 T3 arch as Turbo; reuses the
     // chatterbox-turbo S3Gen verbatim (companion points at the Turbo

@@ -2890,7 +2890,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
     // PLAN #74a — chatterbox-family auto-route by --language. Pure
     // English variants ("chatterbox" / "chatterbox-turbo" / aliases)
     // get swapped to the language-matching sibling when the user passes
-    // `-l de` (kartoffelbox-turbo) or `-l ar` (lahgtna-chatterbox), but
+    // `-l de` (kartoffelbox-turbo), `-l ar` (lahgtna-chatterbox), or
+    // `-l fi` (chatterbox-finnish-nano), but
     // only when -m auto is in effect — if the user passed an explicit
     // model path they've already picked the variant. Mirrors the kokoro
     // `-l de` German-backbone routing convention. No-op when the user
@@ -2906,6 +2907,8 @@ int crispasr_run_backend(const whisper_params& params_in) {
                 routed = "kartoffelbox-turbo";
             } else if (params.language == "ar") {
                 routed = "lahgtna-chatterbox";
+            } else if (params.language == "fi") {
+                routed = "chatterbox-finnish-nano";
             }
             if (!routed.empty()) {
                 if (!params.no_prints) {

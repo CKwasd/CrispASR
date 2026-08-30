@@ -288,6 +288,11 @@ TEST_CASE("registry: chatterbox family keeps multilingual and finetunes separate
     REQUIRE(e.filename.find("kartoffelbox-turbo-t3") != std::string::npos);
     REQUIRE(e.companion_filename == "chatterbox-turbo-s3gen-f16.gguf");
 
+    REQUIRE(crispasr_registry_lookup("chatterbox-finnish-nano", e));
+    REQUIRE(e.filename == "chatterbox-finnish-nano-v0.1.3-t3-q8_0.gguf");
+    REQUIRE(e.url.find("JJarvinen/chatterbox-finnish-nano-GGUF") != std::string::npos);
+    REQUIRE(e.companion_filename == "chatterbox-turbo-s3gen-q8_0.gguf");
+
     REQUIRE(crispasr_registry_lookup("lahgtna-chatterbox", e));
     REQUIRE(e.filename == "chatterbox-t3-f16.gguf");
     REQUIRE(e.companion_filename == "chatterbox-s3gen-q8_0.gguf");

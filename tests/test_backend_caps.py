@@ -61,6 +61,8 @@ _SRC_TGT_BACKENDS = {
     "cosyvoice3-tts",
     "chatterbox",
     "chatterbox-turbo",
+    "chatterbox-nano",
+    "chatterbox-finnish-nano",
     "kartoffelbox-turbo",
     "lahgtna-chatterbox",
     "qwen3-tts",
@@ -82,6 +84,8 @@ _SRC_TGT_BACKENDS = {
 _VOICE_CLONING_BACKENDS = {
     "chatterbox",
     "chatterbox-turbo",
+    "chatterbox-nano",
+    "chatterbox-finnish-nano",
     "kartoffelbox-turbo",
     "lahgtna-chatterbox",
     "vibevoice-1.5b",
@@ -99,6 +103,7 @@ class TestVoiceCloningSessionDispatch(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         source = (REPO / "src" / "crispasr_c_api.cpp").read_text(encoding="utf-8")
+        cls.c_api_source = source
         cls.set_codec = source.split("CA_EXPORT int crispasr_session_set_codec_path", 1)[1].split(
             "CA_EXPORT int crispasr_session_set_voice", 1
         )[0]
@@ -108,6 +113,19 @@ class TestVoiceCloningSessionDispatch(unittest.TestCase):
         cls.synthesize = source.split("static float* crispasr_session_synthesize_raw_impl", 1)[1].split(
             "static int crispasr_session_set_prompt", 1
         )[0]
+
+    def test_chatterbox_aliases_are_openable_and_advertised_by_the_c_abi(self):
+        for backend in (
+            "chatterbox-turbo",
+            "chatterbox-nano",
+            "chatterbox-finnish-nano",
+            "kartoffelbox-turbo",
+            "lahgtna-chatterbox",
+        ):
+            with self.subTest(backend=backend):
+                self.assertIn(f's->backend == "{backend}"', self.c_api_source)
+                available = self.c_api_source.split("CA_EXPORT int crispasr_session_available_backends", 1)[1]
+                self.assertIn(backend, available)
 
     def test_omnivoice_dispatches_audio_tokenizer(self):
         self.assertIn(

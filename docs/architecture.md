@@ -370,13 +370,13 @@ Drop-in DE checkpoint variants:
 - `--backend kartoffel-orpheus-de-synthetic` — [`cstr/kartoffel-orpheus-3b-german-synthetic-GGUF`](https://huggingface.co/cstr/kartoffel-orpheus-3b-german-synthetic-GGUF), 4 speakers + 12 emotions + 5 outbursts via `{Speaker} - {Emotion}: {text}` syntax
 - `--backend lex-au-orpheus-de` — `lex-au/Orpheus-3b-German-FT-Q8_0.gguf`
 
-### chatterbox / chatterbox-turbo / kartoffelbox-turbo / lahgtna-chatterbox
+### chatterbox / chatterbox-turbo / chatterbox-nano / chatterbox-finnish-nano / kartoffelbox-turbo / lahgtna-chatterbox
 
 Two-GGUF runtime: T3 AR text→speech-tokens + S3Gen flow-matching
 speech-tokens→24 kHz waveform.
 
 **T3 (Text-to-Tokens)**: Llama-30L for base/lahgtna, GPT-2-24L for
-turbo/kartoffelbox-turbo.
+turbo/kartoffelbox-turbo, and GPT-2-small for Nano and its Finnish fine-tune.
 
 **S3Gen (Tokens-to-Speech)**: UpsampleConformerEncoder + UNet1D CFM +
 HiFTGenerator vocoder. Turbo uses 2-step meanflow CFM (vs 10-step cosine
@@ -425,6 +425,8 @@ are rejected at load time. They pin ResembleAI revision
 Variants:
 - [`cstr/chatterbox-GGUF`](https://huggingface.co/cstr/chatterbox-GGUF) — base multilingual v3
 - [`cstr/chatterbox-turbo-GGUF`](https://huggingface.co/cstr/chatterbox-turbo-GGUF) — 350M distilled, meanflow
+- [`cstr/chatterbox-nano-GGUF`](https://huggingface.co/cstr/chatterbox-nano-GGUF) — GPT-2-small T3, reusing Turbo S3Gen
+- [`JJarvinen/chatterbox-finnish-nano-GGUF`](https://huggingface.co/JJarvinen/chatterbox-finnish-nano-GGUF) — Finnish-only Nano v0.1.3 fine-tune, reusing Turbo S3Gen
 - [`cstr/kartoffelbox-turbo-GGUF`](https://huggingface.co/cstr/kartoffelbox-turbo-GGUF) — German fine-tune of turbo
 - [`cstr/lahgtna-chatterbox-v1-GGUF`](https://huggingface.co/cstr/lahgtna-chatterbox-v1-GGUF) — Arabic fine-tune of base
 

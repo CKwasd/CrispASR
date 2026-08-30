@@ -441,6 +441,13 @@ add a hermetic graph regression plus model-backed equivalence/performance proof,
 and merge only after the contributor change and follow-up coverage are green.
 Keep heavyweight live runs on hosted CI/Kaggle rather than this VPS.
 
+## CLAIMED 2026-08-30 — #382 Finnish Chatterbox Nano registry wiring
+
+Worktree: `.claude/worktrees/audit-pr-410`.
+Register the reporter's public Finnish Nano GGUF and shared Turbo S3Gen,
+audit every CLI/C-ABI/documentation surface, and prove `-m auto` synthesis on
+hosted CI with a bounded build rather than loading the maintainer VPS.
+
 ## CLAIMED 2026-08-13 — #344 MOSS valid-frame metadata in stable C ABI
 
 Worktree: `.claude/worktrees/fix-344-moss-valid-frame-metadata`
