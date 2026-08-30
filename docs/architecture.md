@@ -37,12 +37,14 @@ symbols. The CLI keeps only presentation + UX policy.
 │   crispasr_cache.{h,cpp}         HF download + ~/.cache/crispasr  │
 │   crispasr_model_registry.{h,cpp} backend → canonical GGUF URL    │
 ├───────────────────────────────────────────────────────────────────┤
-│ src/{whisper,parakeet,canary,canary_ctc,cohere,qwen3_asr,         │
+│ src/{crispasr,parakeet,canary,canary_ctc,cohere,qwen3_asr,        │
 │      voxtral,voxtral4b,granite_speech,silero_lid,pyannote_seg,    │
-│      lid_fasttext,lid_cld3,text_lid_dispatch}.cpp                 │
-│   Per-model runtimes (public C APIs)                              │
+│      lid_fasttext,lid_cld3,text_lid_dispatch}.cpp + ~65 more      │
+│   Per-model runtimes (public C APIs). `crispasr.cpp` is the       │
+│   whisper runtime (public header `include/crispasr.h`).           │
 ├───────────────────────────────────────────────────────────────────┤
 │ src/core/      — shared model primitives (crispasr-core)          │
+│   ~118 headers; the four load-bearing ones:                       │
 │   mel.{h,cpp}          log-mel spectrogram (NeMo + HF clusters)   │
 │   ffn.h                SwiGLU + SiLU FFN helpers                  │
 │   attention.h          Llama-style self-attention + flash-attn    │
@@ -62,7 +64,7 @@ all consume the same symbols.
 |---|---|
 | `crispasr_c_api.cpp` | The C-ABI. Exports session open/close/transcribe, VAD, diarize, LID, alignment, cache, registry — everything a wrapper needs. |
 | `crispasr_vad.{h,cpp}` | Silero VAD slicing + whisper-style stitching with timestamp remapping. Used by `crispasr_session_transcribe_vad`. |
-| `crispasr_diarize.{h,cpp}` | Four diarizers: energy (stereo), xcorr (stereo, TDOA), vad-turns (mono, timing), pyannote (mono, GGUF; #107 added cross-slice cache + segment splitting + overlap-aware scoring). Both pyannote and sherpa/ecapa now run once globally on the full audio (#110), producing consistent speaker IDs across VAD slices. |
+| `crispasr_diarize.{h,cpp}` | Five diarizers (`CrispasrDiarizeMethod`): energy (stereo), xcorr (stereo, TDOA), vad-turns (mono, timing), pyannote (mono, GGUF; #107 added cross-slice cache + segment splitting + overlap-aware scoring), foxnose (WeSpeaker embeddings + spectral clustering, #324 — see below). Both pyannote and sherpa/ecapa now run once globally on the full audio (#110), producing consistent speaker IDs across VAD slices. |
 | `crispasr_speaker_embedder.{h,cpp}` | Pluggable speaker-embedding interface (`CrispasrSpeakerEmbedder` base class + factory). Concrete adapters: TitaNet-Large (192-d, 16 kHz) and IndexTTS-BigVGAN ECAPA-TDNN (512-d, internally resamples 16→24 kHz). Add a third by subclassing and extending the factory dispatch. |
 | `crispasr_speaker_cluster.{h,cpp}` | Agglomerative single-linkage cosine clustering on speaker embeddings, with both a similarity-threshold stop and a hard `max_speakers` cap. Drives `--diarize-embedder`'s remap of pyannote-local track IDs into globally stable speaker IDs. |
 | `crispasr_lid.{h,cpp}` | whisper-tiny + silero-native **audio**-LID with process-wide whisper-context cache. |
@@ -72,15 +74,15 @@ all consume the same symbols.
 | `crispasr_aligner.{h,cpp}` | canary-CTC + Qwen3-ForcedAligner + wav2vec2 forced alignment behind one entry point; filename-based dispatch. Also the engine behind `--align-only` (standalone alignment without ASR, issue #217). |
 | `crispasr_cache.{h,cpp}` | WinHTTP / curl / wget download into `~/.cache/crispasr/`; zombie-file detection. |
 | `crispasr_model_registry.{h,cpp}` | Backend → canonical GGUF URL table; exact default-bundle enumeration (primary, companion, extras, licence policy); fuzzy filename lookup for "did you mean …?" hints. |
-| `whisper_params.h` | Shared params struct (extracted from cli.cpp, extended). |
 
 ## `examples/cli/` — presentation + policy
 
 | File | Role |
 |---|---|
 | `cli.cpp` | crispasr entry point, extended with `--backend` dispatch branch. |
-| `crispasr_backend.{h,cpp}` | `CrispasrBackend` abstract class, capability bitmask, factory, GGUF auto-detect. |
-| `crispasr_backend_{parakeet,canary,cohere,granite,granite_nle,voxtral,voxtral4b,qwen3,fastconformer_ctc,wav2vec2,glm_asr,kyutai_stt,firered_asr,moonshine,moonshine_streaming,omniasr,gemma4_e2b,mimo_asr,vibevoice,qwen3_tts,orpheus,kokoro,chatterbox,paraformer,sensevoice,funasr,m2m100,t5}.cpp` | Per-backend thin wrapper over each model's C API. ASR backends emit `crispasr_segment`s; TTS backends (`vibevoice`, `qwen3_tts`, `orpheus`, `kokoro`, `chatterbox`) implement `synthesize(text)` instead and write 24 kHz mono WAV via `--tts-output`; the translation backends (`m2m100` for facebook m2m100 + WMT21, `t5` for MADLAD-400 / future T5 translation) implement `translate_text(text, src, tgt)` and write UTF-8 to stdout. |
+| `crispasr_backend.{h,cpp}` | `CrispasrBackend` abstract class, capability bitmask, factory, GGUF auto-detect (`crispasr_detect_backend_from_gguf`). |
+| `crispasr_backend_*.cpp` (75 files) | Per-backend thin wrapper over each model's C API — one file per backend, e.g. `crispasr_backend_parakeet.cpp`, `crispasr_backend_crispasr.cpp` (the whisper adapter). ASR backends emit `crispasr_segment`s; TTS backends (`vibevoice`, `qwen3_tts`, `orpheus`, `kokoro`, `chatterbox`, `moss_tts`, `miotts`, …) implement `synthesize(text)` instead and write 24 kHz mono WAV via `--tts-output`; the translation backends (`m2m100` for facebook m2m100 + WMT21, `t5` for MADLAD-400 / future T5 translation) implement `translate_text(text, src, tgt)` and write UTF-8 to stdout; non-transcribe task backends (`htdemucs`, `mel_band_roformer`, `crepe`, `btc`, `tabcnn`, `beat_this`, `piano_transcription`) go through their own early CLI dispatchers (see below). `ls examples/cli/crispasr_backend_*.cpp` is the live list. |
+| `whisper_params.h` | Shared params struct (extracted from cli.cpp, extended). |
 | `crispasr_output.{h,cpp}` | TXT / SRT / VTT / CSV / JSON / LRC writers on `crispasr_segment`. |
 | `crispasr_vad_cli.{h,cpp}` | Delegates to `src/crispasr_vad`; adds auto-download for the Silero GGUF. |
 | `crispasr_lid_cli.{h,cpp}` | Delegates to `src/crispasr_lid`; adds auto-download + sherpa-ONNX subprocess fallback. |
@@ -94,23 +96,29 @@ all consume the same symbols.
 ## `src/core/` — the shared model primitives
 
 Duplicated scaffolding is bundled in a single static library,
-`crispasr-core`, linked into every non-whisper model target.
+`crispasr-core`, linked into every model target (`crispasr-lib`, the
+whisper runtime, links it too — but only for the non-numeric helpers;
+it keeps its own mel / attention / GGUF code, see below).
+
+Consumer counts below are direct `#include "core/<x>.h"` in `src/*.cpp`
+as of v0.8.30; representative names are listed, not the full set.
+`grep -rl '#include "core/mel.h"' src/*.cpp` is the live answer.
 
 | Header | Replaces | Consumers |
 |---|---|---|
-| `core/mel.{h,cpp}` | 7× copy-pasted STFT + mel filterbank + log + norm | parakeet, canary, canary_ctc, cohere, voxtral, voxtral4b, qwen3 |
-| `core/ffn.h` | 4× inline SwiGLU blocks | qwen3, voxtral, voxtral4b, granite |
-| `core/attention.h` | Llama-style self-attention with NEOX RoPE + GQA + flash-attn | voxtral, granite (via `core_granite_llm`) |
-| `core/gguf_loader.{h,cpp}` | 8× identical two-pass GGUF load + mmap + tensor-map build | all non-whisper models |
-| `core/fft.h` | Radix-2 Cooley-Tukey FFT (4× duplicated) | granite_speech, granite_nle (kokoro/mimo can adopt) |
-| `core/cpu_ops.h` | CPU LayerNorm + matmul fallbacks (when no GPU sched is available) | granite_speech, granite_nle |
-| `core/ctc.h` | `posterior_weighted_pool` + `greedy_decode_with_blank` | granite_nle (any aux-head/CTC variant can adopt) |
-| `core/fastconformer.h` | NeMo-style FastConformer block (conv subsampling + MHA RPE) | parakeet, canary, canary_ctc |
+| `core/mel.{h,cpp}` | 7× copy-pasted STFT + mel filterbank + log + norm | 30 — parakeet, canary, canary_ctc, cohere, voxtral, voxtral4b, qwen3_asr, granite_speech, granite_nle, gigaam, nemotron, ark_asr, higgs_stt, moss_*, glm_asr, lfm2_audio, … |
+| `core/ffn.h` | 4× inline SwiGLU blocks | 36 — qwen3_asr, voxtral, voxtral4b, granite_speech, granite_nle, chatterbox, orpheus, vibevoice, moss_*, omniasr, mimo_asr, csm_tts, … |
+| `core/attention.h` | Llama-style self-attention with NEOX RoPE + GQA + flash-attn | 42 — voxtral, voxtral4b, granite_speech (via `core_granite_llm`), canary, cohere, qwen3_asr, kokoro, moonshine, kyutai_stt, zonos_tts, … |
+| `core/gguf_loader.{h,cpp}` | 8× identical two-pass GGUF load + mmap + tensor-map build | 99 — effectively every non-whisper model |
+| `core/fft.h` | Radix-2 Cooley-Tukey FFT (4× duplicated) | 17 — granite_speech, granite_nle, gigaam, sidon, htdemucs, chatterbox_{ve,s3tok,campplus}, indextts, piano_transcription, beat_this, … (≈28 models still carry a local FFT) |
+| `core/cpu_ops.h` | CPU LayerNorm + matmul fallbacks (when no GPU sched is available) | 17 — granite_speech, granite_nle, canary, cohere, parakeet, sidon, sensevoice, piper_tts, moonshine_streaming, … |
+| `core/ctc.h` | `posterior_weighted_pool` + `greedy_decode_with_blank` | granite_nle, parakeet, sensevoice, wav2vec2-ggml |
+| `core/fastconformer.h` | NeMo-style FastConformer block (conv subsampling + MHA RPE) | parakeet, canary, canary_ctc, canary_qwen, gigaam, nemotron, indextts, firered_asr, lfm2_audio |
 | `core/conformer_ibm.h` | IBM Macaron Conformer block (FFN + Shaw RPE attn + conv module + FFN + Shaw lookup) — **sibling of `fastconformer.h`, intentionally not merged** | granite_speech, granite_nle |
 | `core/granite_llm.h` | Granite-1B 40-block backbone (RMSNorm + GQA(16/4) flash-attn + RoPE + SwiGLU + µP residual scale); `is_causal` flag picks KV-cached prefill+decode (`core_attn::kv_self_attn`) vs non-causal flash (whole-sequence editing) | granite_speech, granite_nle |
 | `core/qformer.h` | Windowed simplified Q-Former: pass A (LayerNorm + concat + linear + GELU) and per-window cross-attn + MLP cgraph builder | granite_nle (NAR-only — granite_speech uses a different full BLIP-2 Q-Former) |
-| `core/bpe.h` | GPT-2 byte-level BPE encode + decode | granite_speech, granite_nle, voxtral, qwen3, glm-asr |
-| `core/greedy_decode.h` | Autoregressive greedy decode loop with EOS handling | qwen3, voxtral, voxtral4b, granite, glm-asr |
+| `core/bpe.h` | GPT-2 byte-level BPE encode + decode | 31 — granite_speech, granite_nle, voxtral, qwen3_asr, glm_asr, ark_asr, chatterbox, orpheus, moss_*, outetts, … |
+| `core/greedy_decode.h` | Autoregressive greedy decode loop with EOS handling | gemma4_e2b (+ `crispasr_c_api.cpp`); the other audio-LLM backends still carry their own decode loops |
 | `core/sanm.h` | FunASR SANM encoder block (MHA + FSMN depthwise conv) | funasr, sensevoice, paraformer |
 | `core/asr_context_bias.h` | Aho-Corasick CTC-WS phrase-boost trie for `--hotwords` (#98). Per-beam state in TDT/RNNT beam search | parakeet (CTC + TDT greedy + TDT beam); extensible to any CTC/TDT backend |
 
@@ -129,11 +137,14 @@ support mmap.
 
 ## Whisper is the reference implementation
 
-`src/crispasr` is **intentionally not migrated** to `src/core/` (yet)
-— it's (for the time being) the battle-tested reference and the
+`src/crispasr.cpp` is **intentionally not migrated** to `src/core/`
+(yet) — it's (for the time being) the battle-tested reference and the
 `crispasr -m ggml-base.en.bin …` code path is byte-identical to
 upstream `whisper.cpp`. This guarantee is a test gate: every
-CrispASR commit that touches the CLI is checked against it.
+CrispASR commit that touches the CLI is checked against it. It does
+pull three *non-numeric* core headers (`core/gpu_backend_pref.h`,
+`core/whisper_special_tokens.h`, `core/ggml_cpu_backend.h`) but none of
+`core/mel.h`, `core/ffn.h`, `core/attention.h` or `core/gguf_loader.h`.
 
 ## Regression discipline
 
@@ -163,34 +174,34 @@ regression test against `samples/jfk.wav`:
 | Backend | Arch pattern | ggml graph | Flash attn | KV cache | GPU | Shared core modules |
 |---|---|:-:|:-:|:-:|---|---|
 | whisper | Enc-dec transformer | ✔ | ✔ | ✔ | CUDA / Metal / Vulkan | (upstream) |
-| parakeet | FastConformer + TDT | ✔ | ✔ | partial | CPU | mel, fastconformer |
-| canary | FastConformer + Transformer dec | ✔ | ✔ | ✔ | CUDA / Metal | mel, fastconformer |
-| canary-qwen | FastConformer + Qwen3-1.7B SALM | ✔ | ✔ | ✔ | CUDA | mel, fastconformer, kv_self_attn, swiglu, bpe |
-| cohere | Conformer + Transformer dec | ✔ | ✔ | ✔ | CUDA / Metal | mel |
-| granite | Conformer + Q-Former + LLM | ✔ | ✔ | ✔ | CPU | mel, kv_self_attn, swiglu, greedy_decode, bpe |
-| voxtral | Whisper enc + Mistral LLM | ✔ | ✔ | ✔ | CUDA / Metal | mel, kv_self_attn, encoder_self_attn, swiglu, greedy_decode, bpe |
-| voxtral4b | RoPE enc + 3.4 B LLM | ✔ | ✔ | ✔ | CUDA / Metal | mel, kv_self_attn, encoder_self_attn, swiglu, greedy_decode, bpe |
-| qwen3 | Whisper enc + Qwen3 LLM | ✔ | ✔ | ✔ | CUDA / Metal | mel, kv_self_attn, swiglu, greedy_decode, bpe |
-| fc-ctc | FastConformer + CTC | ✔ | ✔ | — | CPU | mel, fastconformer |
-| wav2vec2 | CNN + Transformer + CTC | ✔ | — | — | CUDA / Metal | gguf_loader |
-| glm-asr | Whisper enc + Llama LLM | ✔ | ✔ | ✔ | CPU | mel, kv_self_attn, swiglu, greedy_decode, bpe |
-| kyutai-stt | Mimi codec + causal LM (1B + 2.6B) | ✔ | ✔ | ✔ | CPU | gguf_loader |
-| firered-asr | Conformer + CTC + beam dec | ✔ | ✔ | ✔ | CPU | mel, gguf_loader |
-| moonshine | Conv + 6L enc-dec | ✔ | ✔ | ✔ | CPU | (vendored) |
-| moonshine-streaming | Sliding-window enc + dec | ✔ | ✔ | ✔ | CPU | (vendored) |
-| omniasr | wav2vec2 enc + CTC / LLM | ✔ | ✔ | CTC: — / LLM: ✔ | CPU | gguf_loader, kv_self_attn, swiglu |
-| gemma4-e2b | Conformer enc + Gemma4 LLM | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu |
-| mimo-asr | wav2vec2 enc + Qwen2 LM | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu |
-| ark-asr ⚠️*exp/WIP* | Whisper enc (partial RoPE) + Qwen2.5-3B LM | ✔ | — | CPU + GPU | GPU default (Metal-validated; `CRISPASR_ARKASR_CPU=1` forces CPU) | mel, ffn, gguf_loader, kv_self_attn, swiglu, bpe |
-| vibevoice | σ-VAE + Qwen2 (ASR) / TTS LM (synth) | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader |
-| kokoro | StyleTTS2 BERT + ProsodyPredictor + iSTFTNet | ✔ | — | — | CPU | gguf_loader, fft, ffn |
+| parakeet | FastConformer + TDT | ✔ | ✔ | partial | CPU | mel, fastconformer, gguf_loader, ctc, cpu_ops, asr_context_bias |
+| canary | FastConformer + Transformer dec | ✔ | ✔ | ✔ | CUDA / Metal | mel, fastconformer, gguf_loader, attention, cpu_ops |
+| canary-qwen | FastConformer + Qwen3-1.7B SALM | ✔ | ✔ | ✔ | CUDA | mel, fastconformer, gguf_loader, kv_self_attn, swiglu, bpe |
+| cohere | Conformer + Transformer dec | ✔ | ✔ | ✔ | CUDA / Metal | mel, gguf_loader, attention, cpu_ops |
+| granite | Conformer + Q-Former + LLM | ✔ | ✔ | ✔ | CPU | mel, gguf_loader, kv_self_attn, swiglu, bpe, conformer_ibm, granite_llm, cpu_ops, fft |
+| voxtral | Whisper enc + Mistral LLM | ✔ | ✔ | ✔ | CUDA / Metal | mel, gguf_loader, kv_self_attn, encoder_self_attn, swiglu, bpe |
+| voxtral4b | RoPE enc + 3.4 B LLM | ✔ | ✔ | ✔ | CUDA / Metal | mel, gguf_loader, kv_self_attn, encoder_self_attn, swiglu, bpe |
+| qwen3 | Whisper enc + Qwen3 LLM | ✔ | ✔ | ✔ | CUDA / Metal | mel, gguf_loader, kv_self_attn, swiglu, bpe |
+| fc-ctc | FastConformer + CTC | ✔ | ✔ | — | CPU | mel, fastconformer, gguf_loader |
+| wav2vec2 | CNN + Transformer + CTC | ✔ | — | — | CUDA / Metal | gguf_loader, ctc |
+| glm-asr | Whisper enc + Llama LLM | ✔ | ✔ | ✔ | CPU | mel, gguf_loader, kv_self_attn, swiglu, bpe, beam_decode |
+| kyutai-stt | Mimi codec + causal LM (1B + 2.6B) | ✔ | ✔ | ✔ | CPU | gguf_loader, attention, rvq, beam_decode |
+| firered-asr | Conformer + CTC + beam dec | ✔ | ✔ | ✔ | CPU | gguf_loader, fastconformer, cpu_attention, repeat_break (its own mel, not `core/mel.h`) |
+| moonshine | Conv + 6L enc-dec | ✔ | ✔ | ✔ | CPU | gguf_loader, attention, beam_decode, repeat_break |
+| moonshine-streaming | Sliding-window enc + dec | ✔ | ✔ | ✔ | CPU | gguf_loader, cpu_ops, beam_decode |
+| omniasr | wav2vec2 enc + CTC / LLM | ✔ | ✔ | CTC: — / LLM: ✔ | CPU | gguf_loader, kv_self_attn, swiglu, cpu_ops, beam_decode |
+| gemma4-e2b | Conformer enc + Gemma4 LLM | ✔ | ✔ | ✔ | CUDA / Metal | mel, gguf_loader, kv_self_attn, swiglu, bpe, greedy_decode, beam_decode |
+| mimo-asr | wav2vec2 enc + Qwen2 LM | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu, bpe |
+| ark-asr ⚠️*exp/WIP* | Whisper enc (partial RoPE) + Qwen2.5-3B LM | ✔ | ✔ | ✔ | GPU default (Metal-validated; `CRISPASR_ARKASR_CPU=1` forces CPU) | mel, ffn, gguf_loader, kv_self_attn, swiglu, bpe |
+| vibevoice | σ-VAE + Qwen2 (ASR) / TTS LM (synth) | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, attention, ffn, bpe, conv |
+| kokoro | StyleTTS2 BERT + ProsodyPredictor + iSTFTNet | ✔ | — | — | CPU | gguf_loader, attention, conv, lstm, dac_decoder, align |
 | qwen3-tts | Qwen3 talker + 12 Hz codec + code-predictor | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu |
 | orpheus | Llama-3.2 talker + SNAC RVQ codec | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu |
 | chatterbox | T3 (Llama / GPT-2) + S3Gen (Conformer + UNet1D CFM + HiFTGen) | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, swiglu, fft |
-| zonos-tts | 26L GQA transformer + 9-codebook DAC @ 44.1 kHz; CFG; voice cloning from WAV | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, gated_mlp |
-| dots-tts | Qwen2.5-1.5B LLM + 24L VAESemanticEncoder + 18L DiT flow-matching head (CFG Euler) + BigVGAN @ 48 kHz; continuous-latent AR; CAM++ voice cloning; incremental streaming PatchEncoder | ✔ | mixed (DiT must stay F16; LLM+penc Q8) | ✔ | Metal | gguf_loader, kv_self_attn, swiglu, lstm, snake_beta, istft |
-| m2m100 | facebook/m2m100 12L+12L transformer (text-to-text translation; WMT21 4.7B variant via `--backend m2m100-wmt21`) | ✔ | — | ✔ (cross-attn) | CUDA / Metal | gguf_loader, kv_self_attn |
-| madlad / t5 | T5 encoder-decoder (MADLAD-400 12L+12L, gated-GELU, RMSNorm, bucketed rel-pos bias). Tokens match Python SP bit-by-bit; translation outputs match the HF reference. | ✔ | — | ✔ (cross-attn) | CUDA / Metal | gguf_loader, ffn |
+| zonos-tts | 26L GQA transformer + 9-codebook DAC @ 44.1 kHz; CFG; voice cloning from WAV | ✔ | ✔ | ✔ | CUDA / Metal | gguf_loader, kv_self_attn, dac_decoder (its GatedMLP is local, not `core_ffn`) |
+| dots-tts | Qwen2.5-1.5B LLM + 24L VAESemanticEncoder + 18L DiT flow-matching head (CFG Euler) + BigVGAN @ 48 kHz; continuous-latent AR; CAM++ voice cloning; incremental streaming PatchEncoder | ✔ | mixed (DiT must stay F16; LLM+penc Q8) | ✔ | Metal | gguf_loader, kv_self_attn, swiglu, lstm, snake_beta (`core/activation.h`), adaln, conv, cpu_ops, audio_resample |
+| m2m100 | facebook/m2m100 12L+12L transformer (text-to-text translation; WMT21 4.7B variant via `--backend m2m100-wmt21`) | ✔ | — | ✔ (cross-attn) | CUDA / Metal | gguf_loader, sentencepiece, beam_decode |
+| madlad / t5 | T5 encoder-decoder (MADLAD-400 12L+12L, gated-GELU, RMSNorm, bucketed rel-pos bias). Tokens match Python SP bit-by-bit; translation outputs match the HF reference. | ✔ | — | ✔ (cross-attn) | CUDA / Metal | gguf_loader, beam_decode, repeat_break |
 
 ### Architecture families
 
@@ -267,57 +278,21 @@ everything below follows it.
   `crispasr_session_pitch*`. Output is a `crepe_frame` series
   (`{time_ms, f0_hz, voiced_prob}`), laid out to match the CometBeat Dart
   `PitchFrame` record field-for-field so the FFI binding is a reinterpret
-  rather than a marshal. See `### tabcnn
-
-Guitar tablature **emission scorer** (`--tab`). TabCNN (Wiggins & Kim, ISMIR
-2019), 833,982 params — the smallest backend in the tree.
-
-- **Front end:** CQT via `core/cqt.h` — sr 22050, hop 512, 192 bins,
-  24/octave, **fmin C1 (32.70 Hz)** — then `amplitude_to_db(ref = max of the
-  whole clip)` → `[-80, 0]` → `/80 + 1` → `[0, 1]`, framed into 9-frame centred
-  context windows.
-- **Graph:** `Conv2d(1,32,3) ReLU → Conv2d(32,64,3) ReLU → Conv2d(64,64,3) ReLU
-  → MaxPool2d(2,2)` (192×9 → 93×1) → flatten 5952 → `Linear(5952,128) ReLU` →
-  `Linear(128,126)` → reshape `[6, 21]` → per-string softmax.
-- **Output:** `[T, 6, 21]` log-probabilities. **No decoder** — no inter-string
-  coupling, no temporal model, no search.
-
-**⚠️ `fmin` is C1, not the guitar's low E.** Assuming E2 is the obvious guess
-and it is wrong. Every wrong value still *runs*, producing plausible tensors
-that pass shape and cosine checks while the model emits garbage: measured on
-EGSet12 track 01, fmin C1 → tablature F1 **0.771**, E1 → 0.040, E2 at 44.1 kHz
-→ **0.001**. All front-end constants are stored as GGUF metadata and read back
-at load, so the runtime cannot drift from the reference dumper.
-
-**⚠️ Not a streaming surface.** `ref = max of the whole clip` is a per-clip
-normalisation, so features cannot be computed chunked without changing them —
-two-pass by construction. Chunking here would reproduce the BTC chunked-CQT bug.
-
-**Validation.** `crispasr-diff tabcnn` runs the full pipeline **from the
-waveform**, not replayed features: `model.frontend` is empty, the CQT lives
-outside the network, and a feature-replaying diff would never test it. All
-stages pass (`cqt_db` 0.9989 … `logits` 0.9997). End to end against EGSet12
-JAMS ground truth: tablature F1 **0.7732** vs the torch reference's 0.7708
-(Δ +0.0024, argmax agreement 98.57 %); the residual is the front end —
-direct Brown-kernel CQT against librosa's recursive downsampling.
-
-**Quantization.** Only two tensors are quantizable (`dense0.weight` 761 k and
-`head.weight` 16 k); the conv stack is 3×3 so `ne0=3`. K-quants are impossible
-— no tensor is 256-aligned, so `--q4_k` falls back to Q4_0.
-`crispasr-quantize` preserves `head.weight`: quantizing it costs 5.8 F1 points
-at Q4_0, while `dense0` costs nothing.
-
-Weights are CC BY 4.0 (<https://zenodo.org/records/11406378>), attribution
-required. See [docs/cli.md](cli.md#guitar-tablature---tab) and
-[music-transcription/GUITAR_TAB_SPEC.md](music-transcription/GUITAR_TAB_SPEC.md).
-
-### crepe` below and
+  rather than a marshal. See [crepe](#crepe) below and
   `docs/music-transcription/PLAN.md`.
+- **Chords** (`btc`) — `CAP_CHORDS` (bit 25), `--chords`,
+  `crispasr_chords_cli.{h,cpp}`.
+- **Beats / downbeats** (`beat-this`) — `CAP_BEATS` (bit 26), `--beats`,
+  `crispasr_beats_cli.{h,cpp}`.
+- **Piano transcription** (`piano-transcription`) — `CAP_PIANO` (bit 27),
+  `--piano`, `crispasr_piano_cli.{h,cpp}`.
+- **Guitar tablature** (`tabcnn`) — `CAP_TAB` (bit 28), `--tab`,
+  `crispasr_tab_cli.{h,cpp}`. See [tabcnn](#tabcnn) below.
 
-Both are steps in the same music-transcription chain (separate → F0 →
-notes), which is why they share the "early dispatcher, own result type"
-shape. Note that `CAP_SEPARATE` and `CAP_STREAMING` briefly collided on
-bit 22; streaming now owns bit 23.
+These are steps in the same music-transcription chain (separate → F0 →
+chords/beats → notes/tab), which is why they share the "early dispatcher,
+own result type" shape. Note that `CAP_SEPARATE` and `CAP_STREAMING` briefly
+collided on bit 22; streaming now owns bit 23.
 
 ### Optimization opportunities
 
@@ -1347,13 +1322,6 @@ upsample ratios [8,5,5,4,2,2] = 3200×) converts latents to 24 kHz mono
 PCM. Pre-encoded voice embeddings (acoustic connector: FC1→RMSNorm→FC2)
 inject speaker identity into the LM input sequence.
 
-### pocket-tts
-
-Kyutai Pocket TTS: Llama-1B backbone (causal LM) generating Mimi RVQ codec
-tokens + Mimi decoder (SEANet with causal convolutions) @ 24 kHz.
-Streaming-capable architecture. Uses raw tensor operations on CPU (no ggml
-graph), KV-cached AR decode for the Llama backbone, per-frame Mimi decoding.
-
 ### f5-tts
 
 F5-TTS: DiT (Diffusion Transformer) for flow-matching text-to-speech.
@@ -1648,6 +1616,50 @@ Key points:
   test audio (verified on Kaggle, 2026-06-28).
 
 Models at `cstr/parakeet-ctc-1.1b-ja-GGUF`: F16 (2.0 GB), Q8_0 (1.2 GB), Q4_K (631 MB).
+
+### tabcnn
+
+Guitar tablature **emission scorer** (`--tab`). TabCNN (Wiggins & Kim, ISMIR
+2019), 833,982 params — the smallest backend in the tree.
+
+- **Front end:** CQT via `core/cqt.h` — sr 22050, hop 512, 192 bins,
+  24/octave, **fmin C1 (32.70 Hz)** — then `amplitude_to_db(ref = max of the
+  whole clip)` → `[-80, 0]` → `/80 + 1` → `[0, 1]`, framed into 9-frame centred
+  context windows.
+- **Graph:** `Conv2d(1,32,3) ReLU → Conv2d(32,64,3) ReLU → Conv2d(64,64,3) ReLU
+  → MaxPool2d(2,2)` (192×9 → 93×1) → flatten 5952 → `Linear(5952,128) ReLU` →
+  `Linear(128,126)` → reshape `[6, 21]` → per-string softmax.
+- **Output:** `[T, 6, 21]` log-probabilities. **No decoder** — no inter-string
+  coupling, no temporal model, no search.
+
+**⚠️ `fmin` is C1, not the guitar's low E.** Assuming E2 is the obvious guess
+and it is wrong. Every wrong value still *runs*, producing plausible tensors
+that pass shape and cosine checks while the model emits garbage: measured on
+EGSet12 track 01, fmin C1 → tablature F1 **0.771**, E1 → 0.040, E2 at 44.1 kHz
+→ **0.001**. All front-end constants are stored as GGUF metadata and read back
+at load, so the runtime cannot drift from the reference dumper.
+
+**⚠️ Not a streaming surface.** `ref = max of the whole clip` is a per-clip
+normalisation, so features cannot be computed chunked without changing them —
+two-pass by construction. Chunking here would reproduce the BTC chunked-CQT bug.
+
+**Validation.** `crispasr-diff tabcnn` runs the full pipeline **from the
+waveform**, not replayed features: `model.frontend` is empty, the CQT lives
+outside the network, and a feature-replaying diff would never test it. All
+stages pass (`cqt_db` 0.9989 … `logits` 0.9997). End to end against EGSet12
+JAMS ground truth: tablature F1 **0.7732** vs the torch reference's 0.7708
+(Δ +0.0024, argmax agreement 98.57 %); the residual is the front end —
+direct Brown-kernel CQT against librosa's recursive downsampling.
+
+**Quantization.** Only two tensors are quantizable (`dense0.weight` 761 k and
+`head.weight` 16 k); the conv stack is 3×3 so `ne0=3`. K-quants are impossible
+— no tensor is 256-aligned, so `--q4_k` falls back to Q4_0.
+`crispasr-quantize` preserves `head.weight`: quantizing it costs 5.8 F1 points
+at Q4_0, while `dense0` costs nothing.
+
+Weights are CC BY 4.0 (<https://zenodo.org/records/11406378>), attribution
+required. See [docs/cli.md](cli.md#guitar-tablature---tab) and
+[music-transcription/GUITAR_TAB_SPEC.md](music-transcription/GUITAR_TAB_SPEC.md).
 
 ### crepe
 

@@ -83,6 +83,7 @@ int              crispasr_session_n_speakers(CrispasrSession* s);
 const char*      crispasr_session_get_speaker_name(CrispasrSession* s, int i);
 int              crispasr_session_set_instruct(CrispasrSession* s, const char* instruct);
 int              crispasr_session_set_tts_phonemes(CrispasrSession* s, const char* phonemes);
+void             crispasr_session_set_tts_pad_silence_ms(CrispasrSession* s, int ms);
 int              crispasr_session_is_custom_voice(CrispasrSession* s);
 int              crispasr_session_is_voice_design(CrispasrSession* s);
 float*           crispasr_session_synthesize(CrispasrSession* s, const char* text, int* out_n_samples);
@@ -186,6 +187,21 @@ struct crispasr_diarize_opts_abi {
 int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm, int n_samples,
                                   int is_stereo, struct crispasr_diarize_seg_abi* segs, int n_segs,
                                   const struct crispasr_diarize_opts_abi* opts);
+// #395: a speaker turn the METHOD derived from the audio, independent of the
+// caller's segment grid. Same hand-maintained-layout warning as the opts
+// struct above: Go allocates these, so this must match
+// struct crispasr_diarize_turn_abi in src/crispasr_c_api.cpp exactly.
+struct crispasr_diarize_turn_abi {
+    long long t0_cs;
+    long long t1_cs;
+    int       speaker;
+    int       _pad;
+};
+int crispasr_diarize_segments_turns_abi(const float* left_pcm, const float* right_pcm, int n_samples,
+                                        int is_stereo, struct crispasr_diarize_seg_abi* segs, int n_segs,
+                                        const struct crispasr_diarize_opts_abi* opts,
+                                        struct crispasr_diarize_turn_abi* out_turns, int n_turns_cap,
+                                        int* out_n_turns);
 
 // --- Pluggable speaker embedder, clustering, pyannote cache (#107 P6) ---
 void*       crispasr_speaker_embedder_make_abi(const char* model_spec, int n_threads, const char* cache_dir);
@@ -361,6 +377,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"math"
 	"unsafe"
 )
 
@@ -1056,6 +1073,13 @@ func (s *CrispasrSession) SetTTSPhonemes(phonemes string) error {
 	}
 }
 
+// SetTTSPadSilenceMs pads N ms of silence at the beginning of TTS output.
+// Useful to bypass VLC playback bugs where it drops the first ~1.5s of audio
+// while parsing a large C2PA chunk.
+func (s *CrispasrSession) SetTTSPadSilenceMs(ms int) {
+	C.crispasr_session_set_tts_pad_silence_ms(s.handle, C.int(ms))
+}
+
 // IsCustomVoice reports whether the loaded model is a qwen3-tts
 // CustomVoice variant (use SetSpeakerName for it).
 func (s *CrispasrSession) IsCustomVoice() bool {
@@ -1640,17 +1664,45 @@ type FoxNoseOpts struct {
 // DiarizeSegmentsFoxNose adds the #324 options.
 func DiarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
 	method DiarizeMethod, nThreads int, pyannoteModel string) error {
-	return diarizeSegments(leftPCM, rightPCM, isStereo, segs, method, nThreads, pyannoteModel, nil)
+	return diarizeSegments(leftPCM, rightPCM, isStereo, segs, method, nThreads, pyannoteModel, nil, nil)
 }
 
 // DiarizeSegmentsFoxNose runs the WeSpeaker + spectral-clustering diarizer.
 func DiarizeSegmentsFoxNose(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
 	nThreads int, fox *FoxNoseOpts) error {
-	return diarizeSegments(leftPCM, rightPCM, isStereo, segs, DiarizeMethodFoxNose, nThreads, "", fox)
+	return diarizeSegments(leftPCM, rightPCM, isStereo, segs, DiarizeMethodFoxNose, nThreads, "", fox, nil)
+}
+
+// DiarizeTurn is one speaker turn the METHOD derived from the audio, on the
+// caller's absolute timeline (slice_t0_cs already added back), independent of
+// the segment grid that was passed in.
+type DiarizeTurn struct {
+	T0      int64 // centiseconds
+	T1      int64
+	Speaker int32 // dense, zero-based; never -1
+}
+
+// DiarizeSegmentsWithTurns labels segs AND returns the speaker turns the
+// method derived from the audio (#395).
+//
+// Labelling alone can never resolve finer than the segment grid the caller
+// sent in: apply_foxnose awards each segment to the turn it overlaps MOST, so
+// a segment straddling a speaker change goes wholly to the majority speaker.
+// The turns let a caller split such a segment itself. Sending a finer grid is
+// not an alternative — FoxNose skips spans under kMinSegmentSeconds (0.4 s).
+//
+// Only DiarizeMethodFoxNose derives turns; the others return an empty slice,
+// which is not an error.
+func DiarizeSegmentsWithTurns(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
+	method DiarizeMethod, nThreads int, pyannoteModel string, fox *FoxNoseOpts) ([]DiarizeTurn, error) {
+	var turns []DiarizeTurn
+	err := diarizeSegments(leftPCM, rightPCM, isStereo, segs, method, nThreads, pyannoteModel, fox, &turns)
+	return turns, err
 }
 
 func diarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeSeg,
-	method DiarizeMethod, nThreads int, pyannoteModel string, fox *FoxNoseOpts) error {
+	method DiarizeMethod, nThreads int, pyannoteModel string, fox *FoxNoseOpts,
+	outTurns *[]DiarizeTurn) error {
 	if len(segs) == 0 {
 		return nil
 	}
@@ -1693,8 +1745,46 @@ func diarizeSegments(leftPCM, rightPCM []float32, isStereo bool, segs []DiarizeS
 	if isStereo {
 		stereo = 1
 	}
-	rc := C.crispasr_diarize_segments_abi(leftPtr, rightPtr, C.int(nSamples), stereo,
-		&cSegs[0], C.int(len(cSegs)), &opts)
+	var rc C.int
+	if outTurns == nil {
+		rc = C.crispasr_diarize_segments_abi(leftPtr, rightPtr, C.int(nSamples), stereo,
+			&cSegs[0], C.int(len(cSegs)), &opts)
+	} else {
+		// Size the turn buffer the way the Rust wrapper does: FoxNose's
+		// embedding hop is 0.6 s and no turn is shorter than one hop, so one
+		// slot per 0.5 s of audio is an over-estimate. That pair of braces is
+		// the belt; the single retry below is the suspenders — rc 2 means the
+		// buffer was short and n_turns holds the capacity actually needed.
+		turnCap := int(math.Ceil(float64(nSamples)/16000.0/0.5)) + len(segs) + 16
+		for attempt := 0; ; attempt++ {
+			if turnCap < 1 {
+				turnCap = 1
+			}
+			cTurns := make([]C.struct_crispasr_diarize_turn_abi, turnCap)
+			var nTurns C.int
+			rc = C.crispasr_diarize_segments_turns_abi(leftPtr, rightPtr, C.int(nSamples), stereo,
+				&cSegs[0], C.int(len(cSegs)), &opts, &cTurns[0], C.int(turnCap), &nTurns)
+			if rc == 2 && attempt == 0 {
+				turnCap = int(nTurns)
+				continue
+			}
+			if rc == 0 {
+				n := int(nTurns)
+				if n > turnCap {
+					n = turnCap
+				}
+				*outTurns = make([]DiarizeTurn, n)
+				for i := 0; i < n; i++ {
+					(*outTurns)[i] = DiarizeTurn{
+						T0:      int64(cTurns[i].t0_cs),
+						T1:      int64(cTurns[i].t1_cs),
+						Speaker: int32(cTurns[i].speaker),
+					}
+				}
+			}
+			break
+		}
+	}
 	if rc != 0 {
 		return fmt.Errorf("diarize failed (rc=%d)", int(rc))
 	}

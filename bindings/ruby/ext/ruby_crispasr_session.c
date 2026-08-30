@@ -45,6 +45,7 @@ extern const char* crispasr_session_get_speaker_name(struct CrispasrSession* s, 
 extern int crispasr_session_set_instruct(struct CrispasrSession* s, const char* instruct);
 /* #316: synthesize these phonemes verbatim, skipping the G2P. Empty clears. kokoro and piper only (rc=-2 otherwise). */
 extern int crispasr_session_set_tts_phonemes(struct CrispasrSession* s, const char* phonemes);
+extern void crispasr_session_set_tts_pad_silence_ms(struct CrispasrSession* s, int ms);
 extern int crispasr_session_is_custom_voice(struct CrispasrSession* s);
 extern int crispasr_session_is_voice_design(struct CrispasrSession* s);
 extern float* crispasr_session_synthesize(struct CrispasrSession* s, const char* text, int* out_n_samples);
@@ -768,6 +769,12 @@ static VALUE rb_session_set_tts_phonemes(VALUE self, VALUE handle, VALUE phoneme
                  "backend has no phonemes-in entry point; set_tts_phonemes applies to kokoro and piper");
     if (rc != 0)
         rb_raise(rb_eRuntimeError, "set_tts_phonemes failed (rc=%d)", rc);
+    return Qnil;
+}
+
+static VALUE rb_session_set_tts_pad_silence_ms(VALUE self, VALUE handle, VALUE ms) {
+    struct CrispasrSession* s = (struct CrispasrSession*)NUM2ULL(handle);
+    crispasr_session_set_tts_pad_silence_ms(s, NUM2INT(ms));
     return Qnil;
 }
 
@@ -1879,6 +1886,7 @@ void init_ruby_crispasr_session(VALUE* mWhisper) {
     rb_define_singleton_method(mSession, "speakers", rb_session_speakers, 1);
     rb_define_singleton_method(mSession, "set_instruct", rb_session_set_instruct, 2);
     rb_define_singleton_method(mSession, "set_tts_phonemes", rb_session_set_tts_phonemes, 2);
+    rb_define_singleton_method(mSession, "set_tts_pad_silence_ms", rb_session_set_tts_pad_silence_ms, 2);
     rb_define_singleton_method(mSession, "is_custom_voice", rb_session_is_custom_voice, 1);
     rb_define_singleton_method(mSession, "is_voice_design", rb_session_is_voice_design, 1);
     rb_define_singleton_method(mSession, "synthesize", rb_session_synthesize, 2);

@@ -17,6 +17,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "portable_env.h"
 
 static std::string get_env(const char* name, const char* fallback = "") {
     const char* v = std::getenv(name);

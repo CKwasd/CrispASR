@@ -13,6 +13,7 @@
 
 #define _USE_MATH_DEFINES
 #include "chatterbox.h"
+#include "chatterbox_attn_policy.h"
 #include "chatterbox_s3gen.h"
 #include "chatterbox_ve.h"
 #include "chatterbox_text_prep.h"
@@ -2584,6 +2585,19 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
     // you need to compare it against speech_emb(tok) + wpe(pos).
     const bool dump_layers = (std::getenv("CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS") != nullptr);
 
+    // Issue #402: attention-path selection (naive on Vulkan, flash elsewhere;
+    // env-overridable both ways — see chatterbox_attn_policy.h).
+    const bool naive_attn = chatterbox_attn::use_naive_t3(c->backend ? ggml_backend_name(c->backend) : nullptr,
+                                                          std::getenv("CRISPASR_CHATTERBOX_NAIVE_ATTN"),
+                                                          std::getenv("CRISPASR_CHATTERBOX_FLASH_ATTN"));
+    static bool s_attn_logged = false;
+    if (!s_attn_logged) {
+        s_attn_logged = true;
+        fprintf(stderr, "chatterbox: T3 GPT-2 attention = %s (backend %s)\n",
+                naive_attn ? "naive softmax(QK^T)V" : "flash_attn_ext",
+                c->backend ? ggml_backend_name(c->backend) : "none");
+    }
+
     for (uint32_t il = 0; il < hp.n_layers; il++) {
         const auto& b = c->t3.gpt2_blocks[il];
         ggml_tensor* residual = cur;
@@ -2641,9 +2655,14 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
         // Permute Q to (hd, T, n_h)
         Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
 
-        // Attention. CRISPASR_CHATTERBOX_NAIVE_ATTN=1 swaps ggml_flash_attn_ext
-        // for an explicit softmax(QK^T)V path. Useful for isolating flash_attn
-        // accumulator-order differences from other bugs. Layout follows
+        // Attention. Issue #402: the Vulkan FLASH_ATTN_EXT pipeline crashes on
+        // RADV (Radeon 780M) for this geometry while the explicit path runs a
+        // full synthesis correctly, so chatterbox_attn::use_naive_t3() makes
+        // naive attention the DEFAULT on Vulkan backends —
+        // CRISPASR_CHATTERBOX_FLASH_ATTN=1 opts back in, and the pre-existing
+        // CRISPASR_CHATTERBOX_NAIVE_ATTN=1 debug gate still forces the naive
+        // path on every backend (for isolating flash_attn accumulator-order
+        // differences from other bugs). Layout follows
         // src/qwen3_asr.cpp:895-924: scores = mul_mat(K, Q); soft_max_ext
         // (fused scale + mask + softmax); V is permuted (Lk, hd, n_h) for the
         // attn = mul_mat(V', scores) step that contracts over Lk. The result
@@ -2653,7 +2672,7 @@ static ggml_cgraph* build_graph_t3_gpt2_kv(chatterbox_context* c, int n_past, in
         // ggml.h docs, so skipping the permute here gave wrong outputs in an
         // earlier attempt.
         ggml_tensor* attn;
-        if (std::getenv("CRISPASR_CHATTERBOX_NAIVE_ATTN")) {
+        if (naive_attn) {
             ggml_tensor* scores = ggml_mul_mat(ctx0, Kfull, Q);
             scores = ggml_soft_max_ext(ctx0, scores, (T > 1) ? causal_mask : nullptr, attn_scale, 0.0f);
             ggml_tensor* Vp = ggml_cont(ctx0, ggml_permute(ctx0, Vfull, 1, 0, 2, 3));

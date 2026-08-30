@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.8.30
+
+* **Audio input**: files whose sample rate differs from the backend's are no
+  longer resampled by linear interpolation. A 10 kHz tone decoded to 16 kHz,
+  where it must vanish, previously survived at -10.3 dB and folded down into
+  the speech band; every 44.1/48 kHz recording carried that alias. Decoding now
+  happens at the file's own rate and resamples with the Kaiser-windowed
+  polyphase sinc (-89 dB on the same test). `CRISPASR_HQ_RESAMPLE=0` restores
+  the old path.
+* **GPU binaries**: the v0.8.29 GPU artifacts were built with `-march=native`
+  against a runner that has AVX-512, so the official Windows CUDA build died
+  with SIGILL on any CPU without it (#374). Nine of eleven GPU jobs were
+  affected. Replace any v0.8.29 GPU build.
+* A build/host CPU ISA mismatch now fails fast with a message naming the right
+  download, instead of an illegal-instruction fault the Windows console
+  swallows (#380).
+* **Windows**: cached GGUFs larger than 2 GiB were reported missing and
+  re-downloaded on every run, because MSVC's `stat` uses a 32-bit size field
+  and fails outright above 2 GiB (#393).
+* Punctuation restoration returned an empty string — not degraded output,
+  nothing — for every SentencePiece `fireredpunc` model (`fullstop-punc`,
+  `punctuate-all`).
+* VibeVoice-ASR answered in the wrong language: the input was never normalised
+  to -25 dBFS before the VAE encoders, and the 1.5B model was sent the 7B's
+  prompt format (#369). The model's own `[Silence]` marker no longer leaks into
+  transcripts and SRT files.
+* Canary long-form seam artifacts are gone — the real dynamic chunking from
+  canary-1b-v2 replaces the parakeet-shaped machinery (#375), with opt-in seam
+  dedup at chunk boundaries (#365).
+* New backend: **Confucius4-TTS** (#377), with native voice cloning via
+  `--voice`.
+* `/v1/realtime` Nemotron sessions are genuinely incremental — the stream now
+  owns frontend, encoder and predictor state across appends instead of
+  recomputing the whole buffer every 500 ms (#383).
+* New endpoint: `POST /v1/audio/separation` (#381).
+* Bare voice names resolve against `--voice-dir` in five TTS adapters, over
+  HTTP as well as the CLI (#384).
+* Long-form progress is reported on the chunk-encoded, JA-sliced and unified
+  dispatch routes, not only the common one (#385).
+* Diarization forwards FoxNose speaker turns across the C ABI (#395), and the
+  minimum speaker count is clamped to the distinct pyannote tracks (#368).
+* f5-tts counts UTF-8 characters, not bytes, in its duration estimate (#372);
+  kyutai `stt-1b-en_fr` no longer claims to be English-only (#366); omnivoice
+  matches upstream's target-token arithmetic exactly (#363).
+* `--align-only` accepts JSON input, for a JSON-to-JSON pipeline (#317).
+
 ## 0.8.29
 
 * **Dart binding**: `inputSampleRate` and `outputSampleRate` are now bound

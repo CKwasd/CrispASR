@@ -20,8 +20,9 @@ ffmpeg -i audio.wav -f s16le -ar 16000 -ac 1 - | \
     crispasr --stream -m model.gguf
 ```
 
-Sliding-window chunking, default 10 s window with 3 s step and 200 ms
-overlap. Tune via `--stream-step`, `--stream-length`, `--stream-keep`.
+Sliding-window chunking, default 10 s rolling window with a 3 s step. Tune
+via `--stream-step` and `--stream-length`; `--stream-keep` is still parsed
+but is a no-op (see [the note on issue #84](#tuning-the-sliding-window)).
 
 Quality-control flags supported in streaming mode:
 
@@ -186,10 +187,13 @@ gap between `final` and `partial` is FireRedPunc on the 36 partials.
 On longer audio or shorter `--stream-step` (more partials per second)
 the `partial`-vs-`final` gap widens proportionally.
 
-`--stream-punc` is a no-op without `--punc-model`. Combine with the
-truecasers (`--truecase-model`, `--truecase-crf-model`,
-`--truecase-lstm-model`) and PCS (`--pcs-model`) post-steps as usual
-— those run on every mode (only the FireRedPunc step is gated).
+`--stream-punc` is a no-op without `--punc-model`, and it gates **only** the
+FireRedPunc step. The truecasers (`--truecase-model auto|crf|lstm|<path>`)
+and PCS run on every mode. Note that both variants are selected by the value
+passed to a single flag — there are no separate `--truecase-crf-model`,
+`--truecase-lstm-model` or `--pcs-model` flags, and PCS is
+`--punc-model pcs`, which loads PCS *instead of* FireRedPunc (so on a PCS
+server `--stream-punc` has nothing to gate).
 
 ## Microphone (`--mic`)
 
@@ -279,7 +283,7 @@ the full decode to finish:
 
 | Backend | Token decode type | Notes |
 |---|---|---|
-| `granite-speech` | LLM greedy (Granite LLM) | Standard `run_with_probs_cb` |
+| `granite` (granite-speech) | LLM greedy (Granite LLM) | Standard `run_with_probs_cb` |
 | `voxtral4b` | LLM greedy (Mistral LLM) | Per-step encoder-frame injection via `pre_hook` |
 | `glm-asr` | LLM greedy (GLM BPE) | Adapter-side greedy loop using exported step APIs |
 | `moss-audio` | LLM greedy (GPT-2 BPE) | Via `moss_audio_process_cb` |
@@ -289,7 +293,7 @@ the full decode to finish:
 | `kyutai-stt` | LLM greedy (SentencePiece) | Via `kyutai_stt_transcribe_cb`; padding tokens filtered in C lib |
 | `mimo-asr` | LLM greedy (GPT-2 BPE) | Via `mimo_asr_transcribe_cb` |
 | `nemotron` | RNN-T (per non-blank frame) | Via `nemotron_transcribe_cb`; fires per emitted frame |
-| `qwen3-asr` | LLM greedy (Qwen3) | Native |
+| `qwen3` (Qwen3-ASR; alias `mega-asr`) | LLM greedy (Qwen3) | Native |
 | `voxtral` | LLM greedy (Mistral LLM) | Native |
 
 For these backends, `--stream` output grows one token at a time. For batch
@@ -433,14 +437,29 @@ crispasr --backend irodori-tts -m model.gguf --codec-model dacvae-ja-32dim-f16.g
 ```
 
 The spoken AI-disclosure (voice-cloned output) is emitted first, each chunk is
-watermarked before emit (unless disabled process-wide via `--no-watermark` /
-`CRISPASR_NO_WATERMARK`), and a 200 ms gap separates chunks. Works with every
-TTS backend.
+watermarked before emit, and a 200 ms gap separates chunks. Accepted on every
+TTS backend, but the granularity is always **one sentence** — unlike the
+server's `stream: true`, this path calls `synthesize()` per chunk and does not
+use a backend's `CAP_STREAMING` sub-sentence emit. The backends the chunker
+treats as single-shot (`vibevoice*`, `qwen3-tts*`, `tada*`, `dots-tts*`,
+`omnivoice*` — see
+[server.md](server.md#long-form-chunking-for-v1audiospeech)) therefore produce
+exactly one chunk, i.e. no early audio at all.
+
+Note that the watermark is **forced on** here regardless of `--no-watermark` /
+`CRISPASR_NO_WATERMARK`: a raw PCM stream has no container, so no C2PA manifest
+can ride along and the watermark is the only machine-readable mark available.
 
 ### Server (`stream: true`)
 
 `POST /v1/audio/speech` with `"stream": true` and a PCM `response_format`
-(`pcm`, `wav`, or `f32`) streams each sentence as chunked transfer encoding:
+(`pcm`, `wav`, or `f32` — `mp3`/`aac`/`opus` return `400`) streams the audio
+back with chunked transfer encoding. On a backend with `CAP_STREAMING` the
+chunks are the backend's own codec chunks, so time-to-first-audio is roughly
+one chunk; on every other backend it is one chunk per sentence. The body is
+always raw **int16 LE mono PCM at the backend's native rate**, served as
+`Content-Type: audio/pcm` — there is no RIFF header even when you asked for
+`wav`, so the client must know the rate out-of-band:
 
 ```bash
 curl -N http://localhost:8080/v1/audio/speech \
@@ -460,6 +479,12 @@ other bindings, this path watermarks unconditionally; the `--no-watermark` /
 void on_chunk(const float* pcm, int n, int is_final, void* user) { /* play/queue */ }
 crispasr_session_synthesize_streaming(session, "…", on_chunk, user);
 ```
+
+This path has its own splitter, not the server/CLI one: it breaks on ASCII
+`.`, `!`, `?` and **newline**, plus CJK `。`, `！`, `？` — no Devanagari danda,
+no 600-char run-on cap, and no per-backend single-shot exemption. It also
+inserts no silence between chunks (the caller concatenates), and applies
+`--tts-pad-silence-ms` only to the first chunk.
 
 Note: for diffusion backends (e.g. irodori) the per-*sentence* granularity above
 is the real latency win — a diffusion utterance is generated in full before it is

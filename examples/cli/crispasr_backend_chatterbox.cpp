@@ -57,7 +57,8 @@ static std::string discover_s3gen(const whisper_params& p) {
     }
 
     const bool turbo_like = contains_ci(p.backend, "turbo") || contains_ci(p.backend, "kartoffel") ||
-                            contains_ci(p.model, "turbo") || contains_ci(p.model, "kartoffel");
+                            contains_ci(p.backend, "nano") || contains_ci(p.model, "turbo") ||
+                            contains_ci(p.model, "kartoffel") || contains_ci(p.model, "nano");
     const char* const* candidates = nullptr;
     static const char* turbo_candidates[] = {
         "chatterbox-turbo-s3gen-f16.gguf",

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
+#include "portable_env.h"
 
 namespace {
 

@@ -153,6 +153,22 @@ pub struct CrispasrDiarizeSegAbi {
     pub _pad: c_int,
 }
 
+/// ABI speaker turn for [`crispasr_diarize_segments_turns_abi`] (#395).
+///
+/// A turn the METHOD derived from the audio, independent of the caller's
+/// segment grid — only FoxNose produces them. `t0_cs` / `t1_cs` are
+/// centiseconds on the same absolute timeline as [`CrispasrDiarizeSegAbi`]
+/// (`slice_t0_cs` already added back), so turns and caller segments compare
+/// directly. `speaker` is dense and zero-based, never -1.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CrispasrDiarizeTurnAbi {
+    pub t0_cs: i64,
+    pub t1_cs: i64,
+    pub speaker: c_int,
+    pub _pad: c_int,
+}
+
 /// ABI options for [`crispasr_diarize_segments_abi`]. `method` is a
 /// value in 0..4: 0 = Energy, 1 = Xcorr, 2 = VadTurns, 3 = Pyannote,
 /// 4 = FoxNose. `pyannote_model_path` is required for Pyannote,
@@ -314,6 +330,40 @@ extern "C" {
         segs: *mut CrispasrDiarizeSegAbi,
         n_segs: c_int,
         opts: *const CrispasrDiarizeOptsAbi,
+    ) -> c_int;
+
+    /// Diarize AND hand back the speaker turns the method derived from the
+    /// audio (0.8.30+, issue #395). Identical to
+    /// [`crispasr_diarize_segments_abi`] plus the three trailing turn
+    /// parameters; passing `null` / `0` / `null` for them is exactly the
+    /// older call.
+    ///
+    /// Callers need this because labelling alone can never resolve finer
+    /// than the segment grid they sent in: a segment straddling a speaker
+    /// change is silently awarded to whoever holds the majority of it.
+    /// Only FoxNose derives turns; the other methods report 0, which is not
+    /// an error.
+    ///
+    /// `out_n_turns`, when non-null, always receives the TOTAL turn count —
+    /// also when it exceeds `n_turns_cap`, so a caller can size and retry
+    /// (at the cost of a second full pass; the ABI keeps no state).
+    /// `out_turns`, when non-null, receives up to `n_turns_cap` of them.
+    ///
+    /// Returns 0 on success, 2 when a turn buffer was given and could not
+    /// hold every turn (the segments are still fully labelled and the first
+    /// `n_turns_cap` turns are still written), 1 on model load failure, -1
+    /// on invalid args.
+    pub fn crispasr_diarize_segments_turns_abi(
+        left_pcm: *const c_float,
+        right_pcm: *const c_float,
+        n_samples: c_int,
+        is_stereo: c_int,
+        segs: *mut CrispasrDiarizeSegAbi,
+        n_segs: c_int,
+        opts: *const CrispasrDiarizeOptsAbi,
+        out_turns: *mut CrispasrDiarizeTurnAbi,
+        n_turns_cap: c_int,
+        out_n_turns: *mut c_int,
     ) -> c_int;
 
     /// Shared language identification (0.4.6+). `method` is 0 for
@@ -532,6 +582,10 @@ extern "C" {
         s: *mut CrispasrSession,
         phonemes: *const c_char,
     ) -> c_int;
+    pub fn crispasr_session_set_tts_pad_silence_ms(
+        s: *mut CrispasrSession,
+        ms: c_int,
+    );
     // qwen3-tts variant detection (returns 0/1; 0 also covers "not qwen3-tts").
     pub fn crispasr_session_is_custom_voice(s: *mut CrispasrSession) -> c_int;
     pub fn crispasr_session_is_voice_design(s: *mut CrispasrSession) -> c_int;
@@ -1288,6 +1342,9 @@ mod tests {
     fn diarize_abi_layout() {
         use std::mem::{offset_of, size_of};
         assert_eq!(size_of::<CrispasrDiarizeSegAbi>(), 24);
+        assert_eq!(size_of::<CrispasrDiarizeTurnAbi>(), 24);
+        assert_eq!(offset_of!(CrispasrDiarizeTurnAbi, t1_cs), 8);
+        assert_eq!(offset_of!(CrispasrDiarizeTurnAbi, speaker), 16);
         assert_eq!(size_of::<CrispasrDiarizeOptsAbi>(), 48);
         assert_eq!(offset_of!(CrispasrDiarizeOptsAbi, slice_t0_cs), 8);
         assert_eq!(offset_of!(CrispasrDiarizeOptsAbi, pyannote_model_path), 16);

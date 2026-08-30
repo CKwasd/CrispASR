@@ -285,7 +285,7 @@ extern "C" struct glm_asr_context* glm_asr_init_from_file(const char* path_model
         gguf_context* gctx = core_gguf::open_metadata(path_model);
         if (!gctx) {
             fprintf(stderr, "glm_asr: failed to open '%s'\n", path_model);
-            delete ctx;
+            glm_asr_free(ctx); // frees the backends this ctx already owns
             return nullptr;
         }
         hp.enc_hidden = core_gguf::kv_u32(gctx, "glmasr.audio.hidden_size", hp.enc_hidden);
@@ -358,7 +358,7 @@ extern "C" struct glm_asr_context* glm_asr_init_from_file(const char* path_model
         if (!core_gguf::load_weights_split(path_model, ctx->backend, ctx->backend_cpu,
                                            core_gguf::is_gpu_tensor_with_prefix, &cfg, "glm_asr", wl)) {
             fprintf(stderr, "glm_asr: split load failed from '%s'\n", path_model);
-            delete ctx;
+            glm_asr_free(ctx); // frees the backends this ctx already owns
             return nullptr;
         }
         fprintf(stderr, "glm_asr: layer offload: gpu=[0,%d), cpu=[%d,%d) (CRISPASR_N_GPU_LAYERS=%d)\n",
@@ -366,7 +366,7 @@ extern "C" struct glm_asr_context* glm_asr_init_from_file(const char* path_model
     } else {
         if (!core_gguf::load_weights(path_model, ctx->backend, "glm_asr", wl)) {
             fprintf(stderr, "glm_asr: failed to load weights from '%s'\n", path_model);
-            delete ctx;
+            glm_asr_free(ctx); // frees the backends this ctx already owns
             return nullptr;
         }
     }

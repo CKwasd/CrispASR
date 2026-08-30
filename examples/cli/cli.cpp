@@ -731,6 +731,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.g2p_dict = ARGV_NEXT;
     } else if (arg == "--tts-trim-silence") {
         params.tts_trim_silence = true;
+    } else if (arg == "--tts-pad-silence-ms") {
+        params.tts_pad_silence_ms = std::stoi(ARGV_NEXT);
     } else if (arg == "--tts-play") {
         params.tts_play = true;
     } else if (arg == "--tts-play-device") {
@@ -1478,6 +1480,9 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.tts_speed);
     fprintf(stderr, "             --tts-trim-silence       [%-7s] trim leading silence from TTS output\n",
             params.tts_trim_silence ? "true" : "false");
+    fprintf(stderr,
+            "             --tts-pad-silence-ms N   [%-7d] prepend N ms of silence (useful for VLC C2PA buffer drop)\n",
+            params.tts_pad_silence_ms);
     fprintf(stderr, "             --tts-play               [%-7s] play synthesised audio on the local speaker\n",
             params.tts_play ? "true" : "false");
     fprintf(stderr, "             --tts-play-device N      [%-7d] speaker device index (-1 = default)\n",

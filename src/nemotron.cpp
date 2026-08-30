@@ -2402,7 +2402,7 @@ extern "C" struct nemotron_context* nemotron_init_from_file(const char* path_mod
     // Load model
     if (!nemotron_load_model(ctx->model, ctx->vocab, ctx->lang_to_prompt, path_model, ctx->backend)) {
         fprintf(stderr, "nemotron: failed to load model from '%s'\n", path_model);
-        delete ctx;
+        nemotron_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 
@@ -3033,4 +3033,28 @@ extern "C" int nemotron_n_mels(struct nemotron_context* ctx) {
 
 extern "C" int nemotron_sample_rate(struct nemotron_context* ctx) {
     return ctx ? (int)ctx->model.hparams.sample_rate : 0;
+}
+
+extern "C" float* nemotron_compute_mel(struct nemotron_context* ctx, const float* samples, int n_samples, int* out_n_mels, int* out_T_mel) {
+    if (!ctx || !samples || n_samples <= 0) return nullptr;
+    int T_mel = 0;
+    std::vector<float> mel = nemotron_compute_mel_impl(ctx, samples, n_samples, T_mel);
+    if (mel.empty() || T_mel <= 0) return nullptr;
+    if (out_n_mels) *out_n_mels = ctx->model.hparams.n_mels;
+    if (out_T_mel) *out_T_mel = T_mel;
+    float* ret = (float*)malloc(mel.size() * sizeof(float));
+    memcpy(ret, mel.data(), mel.size() * sizeof(float));
+    return ret;
+}
+
+extern "C" float* nemotron_run_encoder_ext(struct nemotron_context* ctx, const float* mel, int n_mels, int T_mel, int* out_T_enc, int* out_d_model) {
+    if (!ctx || !mel || T_mel <= 0) return nullptr;
+    std::vector<float> enc_out;
+    int T_enc = 0, d_model = 0;
+    if (!nemotron_run_encoder(ctx, mel, n_mels, T_mel, enc_out, T_enc, d_model)) return nullptr;
+    if (out_T_enc) *out_T_enc = T_enc;
+    if (out_d_model) *out_d_model = d_model;
+    float* ret = (float*)malloc(enc_out.size() * sizeof(float));
+    memcpy(ret, enc_out.data(), enc_out.size() * sizeof(float));
+    return ret;
 }

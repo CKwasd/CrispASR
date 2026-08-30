@@ -5,12 +5,72 @@ isn't here, open an issue with the [checklist at the bottom](#what-to-put-in-a-b
 
 ## Table of contents
 
+- [Get more output first](#get-more-output-first)
 - [It printed the banner, then nothing happened](#it-printed-the-banner-then-nothing-happened)
 - [Is it the GPU?](#is-it-the-gpu)
 - [`model '...' not found locally`](#model--not-found-locally)
 - [Windows: which download, and the CUDA DLLs](#windows-which-download-and-the-cuda-dlls)
 - [A backend refuses to start](#a-backend-refuses-to-start)
 - [What to put in a bug report](#what-to-put-in-a-bug-report)
+
+---
+
+## Get more output first
+
+Before anything else, make the tool tell you more. Cheapest lever first.
+
+**`-v` — verbose.** Prints the build banner, the GPU devices it found, the
+resolved model path, and per-stage progress. Put it on every run you intend to
+report. For library / bindings use, where there is no CLI flag to pass, set
+`CRISPASR_VERBOSE=1` instead.
+
+**`--dry-run-resolve` — which files, without opening them.** This prints every
+path CrispASR *would* use and then exits. Nothing is loaded, so it still works
+when the real run crashes:
+
+```console
+$ crispasr --backend kokoro -m auto --tts "x" --tts-output y.wav --dry-run-resolve
+model:
+  requested: auto
+  backend:   kokoro
+  registry:  kokoro-82m-q8_0.gguf
+  url:       https://huggingface.co/cstr/kokoro-82m-GGUF/resolve/main/kokoro-82m-q8_0.gguf
+  size:      ~135 MB
+  status:    cached/local
+  path:      /home/you/.cache/crispasr/kokoro-82m-q8_0.gguf
+companion:
+  ...
+```
+
+Read the `status:` and `path:` lines. This separates *finding* a file from
+*loading* it — which is the key split when a run dies during startup — and it
+also catches the case where a companion file (codec, voice pack) is the one
+actually missing. Compare the `size:` against the file on disk: a truncated or
+half-downloaded GGUF is a common and completely silent cause of trouble.
+
+**Capture the whole log.** Almost all diagnostic output goes to **stderr**, and
+a bare `>` redirect captures only stdout — so "there was no output" is sometimes
+a capture problem rather than a program problem. Grab both streams:
+
+```powershell
+crispasr ...args... *> crispasr-log.txt          # PowerShell 7+
+```
+
+```bat
+crispasr ...args... > crispasr-log.txt 2>&1      REM cmd.exe
+```
+
+```bash
+crispasr ...args... > crispasr-log.txt 2>&1      # Linux / macOS
+```
+
+**Deeper levers**, when the above isn't enough:
+
+| Lever | What it adds |
+|---|---|
+| `-debug` / `--debug-mode` | Extra decoder-level diagnostics (whisper-family backends). |
+| `GGML_SCHED_DEBUG=2` | Which backend each graph node was placed on — for "correct on CPU, wrong on GPU". |
+| `CRISPASR_<BACKEND>_DEBUG=1` | Per-backend step diagnostics. See [environment-variables.md](environment-variables.md). |
 
 ---
 
@@ -71,7 +131,10 @@ reporting. Add `-v` and note the last line printed:
 | `backend '...' initialised OK` | After load — during synthesis or transcription. |
 | nothing past the banner | Startup, before any model work. Usually the CPU-ISA case above. |
 
-Then try [`--no-gpu`](#is-it-the-gpu) to tell a GPU fault from a model fault.
+Two follow-ups narrow it further, and neither can crash the way the real run
+does: [`--dry-run-resolve`](#get-more-output-first) confirms the files it was
+about to open really are on disk and the expected size, and
+[`--no-gpu`](#is-it-the-gpu) tells a GPU fault from a model fault.
 
 **On Windows, a minidump pins it exactly.** The repo has a ProcDump recipe:
 [windows-illegal-instruction-dumps.md](windows-illegal-instruction-dumps.md).
@@ -92,8 +155,9 @@ crispasr --backend kokoro -m auto --tts "test" --tts-output out.wav --no-gpu
   your GPU, driver version, and which zip/tarball you downloaded.
 - **Fails both ways** → not the GPU. The model, the file, or the CLI arguments.
 
-Note that the `-cuda` / `-hip` / `-vulkan` builds **require** the matching GPU
-driver and do *not* silently fall back to CPU — see
+Note that the `-hip` / `-vulkan` builds **require** the matching GPU driver and
+do *not* silently fall back to CPU. The Linux `-cuda` / `-cuda13` tarballs *do*
+fall back since v0.8.30 (dynamic backend loading) — see
 [install.md](install.md#prebuilt-linux-tarballs--which-one-to-download-355).
 Passing `--no-gpu` to such a build is fine; it just uses the CPU path.
 
@@ -134,25 +198,37 @@ diagnosing a crash: it means the problem is in loading the file, not locating it
 |---|---|
 | `crispasr-windows-x86_64-cpu.zip` | Default. Needs AVX2 + FMA (2013+ Intel / 2015+ AMD). |
 | `crispasr-windows-x86_64-cpu-legacy.zip` | Older CPU, or the AVX2 build died with `0xC000001D`. |
-| `crispasr-windows-x86_64-cuda.zip` | NVIDIA GPU. Self-contained. |
-| `crispasr-windows-x86_64-cuda-non-cuda.zip` | NVIDIA GPU, and you already have the three runtime DLLs. |
+| `crispasr-windows-x86_64-cuda.zip` | NVIDIA GPU. Self-contained, CUDA 12 runtime. Any GPU from Pascal (GTX 10xx) up. |
+| `crispasr-windows-x86_64-cuda13.zip` | NVIDIA GPU, Turing (GTX 16xx/RTX 20xx) or newer. Self-contained, CUDA 13 runtime (#400). |
+| `crispasr-windows-x86_64-cuda-non-cuda.zip` | As `-cuda.zip`, and you already have the three CUDA 12 runtime DLLs. |
+| `crispasr-windows-x86_64-cuda13-non-cuda.zip` | As `-cuda13.zip`, and you already have the three CUDA 13 runtime DLLs. |
 | `crispasr-windows-x86_64-vulkan.zip` | Cross-vendor GPU (AMD/Intel/NVIDIA). |
 
-The CUDA packages bundle **CUDA 12** runtime DLLs — `cudart64_12.dll`,
-`cublas64_12.dll`, `cublasLt64_12.dll`. They are published once per release and
-shared by both CUDA zips; see
+Each CUDA package bundles the runtime DLLs of its own major — the `-cuda` zips
+ship `cudart64_12.dll` / `cublas64_12.dll` / `cublasLt64_12.dll`, the `-cuda13`
+zips ship the `*64_13.dll` trio. Each trio is published once per release and
+shared by that major's zips; see
 [install.md § Windows CUDA: split downloads](install.md#windows-cuda-split-downloads-342)
-and check the `-runtime-sha256.txt` manifest before reusing DLLs from an older
-download.
+and check the matching `-runtime-sha256.txt` manifest before reusing DLLs from
+an older download.
 
-Two consequences worth knowing:
+Consequences worth knowing:
 
-- A separate CUDA Toolkit install is **not** required — the self-contained zip
-  ships what it needs. Having CUDA 13.x installed system-wide neither helps nor
-  is used by these binaries.
-- If you took the `-non-cuda` zip, the three DLLs must sit next to
-  `crispasr.exe`. A CUDA 13 toolkit does not provide them (its runtime is
-  `cudart64_13.dll`), so `-non-cuda` + "only CUDA 13 installed" will not work.
+- A separate CUDA Toolkit install is **not** required — a self-contained zip
+  ships what it needs, and either zip runs fine regardless of which (or no)
+  CUDA toolkit is installed system-wide. All that matters is the NVIDIA
+  **driver**: the `-cuda13` zip needs a CUDA-13-capable driver (r580+), the
+  `-cuda` zip runs on anything r525+.
+- The two runtimes are **not** interchangeable: `*64_12.dll` files do not
+  satisfy the `-cuda13` build and vice versa — the DLL names carry the major
+  precisely so a mismatch fails loudly instead of misloading.
+- Picking between them: `-cuda13` covers Turing (sm_75) through Blackwell —
+  CUDA 13 dropped Maxwell/Pascal/Volta entirely, so GTX 10xx / P100 / V100
+  users must take the CUDA 12 `-cuda.zip`. On hardware both support, either
+  works; prefer `-cuda13` on a current driver stack.
+- If you took a `-non-cuda` zip, the three matching DLLs must sit next to
+  `crispasr.exe` — take them from the release assets or from the `bin`
+  directory of an installed toolkit of the same major.
 
 On some Windows laptops the Vulkan device `0` is the Intel iGPU and the NVIDIA
 GPU is `1`; if Vulkan looks unexpectedly slow, rerun with `-dev 1`.
@@ -178,12 +254,15 @@ These are *normal* error returns — CrispASR prints a reason and exits non-zero
 Paste all of this — it is usually enough to diagnose without a round trip:
 
 1. **The full command**, verbatim.
-2. **The complete output** with `-v` added (the build-info banner at the top is
-   the important part — it names the version, the backends compiled in, and
-   your GPU).
+2. **The complete output** with `-v` added, captured with
+   [both streams redirected](#get-more-output-first) (the build-info banner at
+   the top is the important part — it names the version, the backends compiled
+   in, and your GPU).
 3. **The exit code** (`$LASTEXITCODE` / `echo $?`).
-4. **Which download** you used — the exact zip/tarball filename, or the
+4. **The `--dry-run-resolve` output** for the same command — it shows which
+   files were going to be opened and whether each is actually on disk.
+5. **Which download** you used — the exact zip/tarball filename, or the
    `cmake` line if you built it yourself.
-5. **Whether `--no-gpu` changes anything.**
-6. **Model files**: which GGUFs, from which HuggingFace repo, and their sizes
+6. **Whether `--no-gpu` changes anything.**
+7. **Model files**: which GGUFs, from which HuggingFace repo, and their sizes
    on disk (a truncated download is a real and common cause).

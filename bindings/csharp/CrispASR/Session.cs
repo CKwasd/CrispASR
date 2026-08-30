@@ -23,6 +23,20 @@ namespace CrispASR
     {
         private IntPtr _handle;
 
+        // The session C ABI reports every time in centiseconds; this binding
+        // exposes seconds throughout (issue #291). ONE constant, used by every
+        // conversion site, so a future time-bearing accessor cannot pick a
+        // different unit by accident.
+        internal const double CentisecondsPerSecond = 100.0;
+
+        // The C ABI uses -1 for "this backend produced no timing for this
+        // unit" — moonshine sets every token t0/t1 to -1, exactly as p = -1
+        // means "no per-word confidence". Dividing that sentinel by 100 would
+        // hand the caller -0.01, which reads like a real timestamp; keep it
+        // recognisable instead.
+        internal static double Seconds(long centiseconds)
+            => centiseconds < 0 ? -1.0 : centiseconds / CentisecondsPerSecond;
+
         private Session(IntPtr handle) => _handle = handle;
 
         private IntPtr Handle
@@ -161,6 +175,12 @@ namespace CrispASR
             int rc = NativeMethods.crispasr_session_set_tts_phonemes(Handle, phonemes ?? "");
             if (rc == -2) throw new InvalidOperationException("Backend has no phonemes-in entry point (kokoro and piper do)");
             if (rc != 0) throw new InvalidOperationException($"set_tts_phonemes failed (rc={rc})");
+        }
+
+        /// <summary>Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs where it drops the first ~1.5s of audio while parsing a large C2PA chunk.</summary>
+        public void SetTtsPadSilenceMs(int ms)
+        {
+            NativeMethods.crispasr_session_set_tts_pad_silence_ms(Handle, ms);
         }
 
         /// <summary>Whether the loaded model is a qwen3-tts CustomVoice variant.</summary>
@@ -529,8 +549,27 @@ namespace CrispASR
         // ----------------------------------------------------------------
 
         /// <summary>Transcribe 16 kHz mono float32 PCM.</summary>
+        /// <remarks>
+        /// Long audio is auto-chunked natively (30 s windows), so a full
+        /// recording can be passed in one call.
+        /// </remarks>
         public Segment[] Transcribe(float[] pcm)
             => TranscribeLang(pcm, null);
+
+        /// <summary>
+        /// Decode an audio file and transcribe it — the binding equivalent of
+        /// <c>crispasr -m model.gguf -f audio.wav</c> (issue #291). Handles any
+        /// format and sample rate the CLI handles; see <see cref="Audio.Load(string)"/>.
+        /// </summary>
+        /// <example>
+        /// <code>
+        /// using var s = Session.Open("moonshine-base-de-fidoriel-q4_k.gguf");
+        /// foreach (var seg in s.TranscribeFile("speech.wav"))
+        ///     Console.WriteLine($"[{seg.T0:F2}-{seg.T1:F2}] {seg.Text}");
+        /// </code>
+        /// </example>
+        public Segment[] TranscribeFile(string path, string? language = null)
+            => TranscribeLang(Audio.Load(path), language);
 
         /// <summary>Transcribe with explicit language hint.</summary>
         public Segment[] TranscribeLang(float[] pcm, string? language)
@@ -625,8 +664,10 @@ namespace CrispASR
             {
                 string text = NativeMethods.PtrToUtf8(
                     NativeMethods.crispasr_session_result_segment_text(r, i)) ?? "";
-                long t0 = NativeMethods.crispasr_session_result_segment_t0(r, i);
-                long t1 = NativeMethods.crispasr_session_result_segment_t1(r, i);
+                // The C ABI reports centiseconds; every public time value in this
+                // binding is seconds (issue #291), so convert once, here.
+                double t0 = Seconds(NativeMethods.crispasr_session_result_segment_t0(r, i));
+                double t1 = Seconds(NativeMethods.crispasr_session_result_segment_t1(r, i));
 
                 int nWords = NativeMethods.crispasr_session_result_n_words(r, i);
                 var words = new Word[nWords];
@@ -642,8 +683,8 @@ namespace CrispASR
                     }
                     words[j] = new Word(
                         NativeMethods.PtrToUtf8(NativeMethods.crispasr_session_result_word_text(r, i, j)) ?? "",
-                        NativeMethods.crispasr_session_result_word_t0(r, i, j),
-                        NativeMethods.crispasr_session_result_word_t1(r, i, j),
+                        Seconds(NativeMethods.crispasr_session_result_word_t0(r, i, j)),
+                        Seconds(NativeMethods.crispasr_session_result_word_t1(r, i, j)),
                         NativeMethods.crispasr_session_result_word_p(r, i, j),
                         alts);
                 }
@@ -732,8 +773,9 @@ namespace CrispASR
 
         /// <summary>Run CTC forced alignment on transcript + audio.</summary>
         public static AlignedWord[] AlignWords(string alignerModel, string transcript,
-                                                float[] pcm, long tOffsetCs = 0, int nThreads = 4)
+                                                float[] pcm, double tOffsetSeconds = 0.0, int nThreads = 4)
         {
+            long tOffsetCs = (long)Math.Round(tOffsetSeconds * CentisecondsPerSecond);
             var r = NativeMethods.crispasr_align_words_abi(alignerModel, transcript, pcm, pcm.Length, tOffsetCs, nThreads);
             if (r == IntPtr.Zero) throw new InvalidOperationException("Alignment failed");
             try
@@ -744,8 +786,8 @@ namespace CrispASR
                 {
                     words[i] = new AlignedWord(
                         NativeMethods.PtrToUtf8(NativeMethods.crispasr_align_result_word_text(r, i)) ?? "",
-                        NativeMethods.crispasr_align_result_word_t0(r, i),
-                        NativeMethods.crispasr_align_result_word_t1(r, i));
+                        Seconds(NativeMethods.crispasr_align_result_word_t0(r, i)),
+                        Seconds(NativeMethods.crispasr_align_result_word_t1(r, i)));
                 }
                 return words;
             }
@@ -863,18 +905,23 @@ namespace CrispASR
     public readonly struct Word
     {
         public string Text { get; }
-        public long T0 { get; }
-        public long T1 { get; }
+        /// <summary>Word start, in SECONDS, or -1 when the backend produced no
+        /// word timing (moonshine, and any other token-only decoder). (Issue #291:
+        /// was raw centiseconds through v0.8.29 while the binding documented
+        /// seconds everywhere else.)</summary>
+        public double T0 { get; }
+        /// <summary>Word end, in SECONDS, or -1 when the backend produced no word timing.</summary>
+        public double T1 { get; }
         public float P { get; }
         public AltToken[] Alts { get; }
 
-        public Word(string text, long t0, long t1, float p, AltToken[]? alts = null)
+        public Word(string text, double t0, double t1, float p, AltToken[]? alts = null)
         {
             Text = text; T0 = t0; T1 = t1; P = p;
             Alts = alts ?? Array.Empty<AltToken>();
         }
 
-        public override string ToString() => $"{T0}-{T1} {Text}";
+        public override string ToString() => FormattableString.Invariant($"{T0:F2}-{T1:F2} {Text}");
     }
 
     /// <summary>Alternative token candidate.</summary>
@@ -885,15 +932,19 @@ namespace CrispASR
 
         public AltToken(string text, float p) { Text = text; P = p; }
 
-        public override string ToString() => $"{Text}({P * 100:F1}%)";
+        public override string ToString() => FormattableString.Invariant($"{Text}({P * 100:F1}%)");
     }
 
     /// <summary>One segment from a transcription result.</summary>
     public readonly struct Segment
     {
         public string Text { get; }
-        public long T0 { get; }
-        public long T1 { get; }
+        /// <summary>Segment start, in SECONDS, or -1 when the backend produced no
+        /// timing. (Issue #291: was raw centiseconds through v0.8.29 while the
+        /// binding documented seconds everywhere else.)</summary>
+        public double T0 { get; }
+        /// <summary>Segment end, in SECONDS, or -1 when the backend produced no timing.</summary>
+        public double T1 { get; }
         public Word[] Words { get; }
         /// <summary>Whisper's per-segment no-speech probability (the &lt;|nospeech|&gt;
         /// posterior) in [0, 1]. Whisper-only; other backends leave -1.0 ("no data").</summary>
@@ -905,13 +956,13 @@ namespace CrispASR
         /// necessarily the same voice as "Speaker 1" from the next.</summary>
         public string Speaker { get; }
 
-        public Segment(string text, long t0, long t1, Word[] words, float noSpeechProb = -1.0f,
+        public Segment(string text, double t0, double t1, Word[] words, float noSpeechProb = -1.0f,
                        string speaker = "")
         {
             Text = text; T0 = t0; T1 = t1; Words = words; NoSpeechProb = noSpeechProb; Speaker = speaker ?? "";
         }
 
-        public override string ToString() => $"[{T0}-{T1}] {Text}";
+        public override string ToString() => FormattableString.Invariant($"[{T0:F2}-{T1:F2}] {Text}");
     }
 
     /// <summary>
@@ -944,10 +995,12 @@ namespace CrispASR
     public readonly struct AlignedWord
     {
         public string Text { get; }
-        public long T0 { get; }
-        public long T1 { get; }
+        /// <summary>Word start, in SECONDS (issue #291 — was raw centiseconds).</summary>
+        public double T0 { get; }
+        /// <summary>Word end, in SECONDS.</summary>
+        public double T1 { get; }
 
-        public AlignedWord(string text, long t0, long t1) { Text = text; T0 = t0; T1 = t1; }
+        public AlignedWord(string text, double t0, double t1) { Text = text; T0 = t0; T1 = t1; }
     }
 
     /// <summary>One speech span from VAD (seconds).</summary>
@@ -969,7 +1022,7 @@ namespace CrispASR
 
         public bool Ok => !string.IsNullOrEmpty(Code) && Probability >= 0f;
 
-        public override string ToString() => $"LanguageDetection({Code}, {Probability * 100:F1}%)";
+        public override string ToString() => FormattableString.Invariant($"LanguageDetection({Code}, {Probability * 100:F1}%)");
     }
 
     /// <summary>Result of <see cref="Session.KokoroResolveForLang"/>.</summary>

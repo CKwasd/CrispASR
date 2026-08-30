@@ -40,8 +40,9 @@ Use `--host 0.0.0.0` to accept remote connections.
 ## API keys
 
 To require API keys, set the `CRISPASR_API_KEYS` env var
-(comma-separated). **Do not** pass keys as CLI arguments — they would
-be visible in `ps` / `top`. Protected endpoints accept either
+(comma-separated). An `--api-keys` CLI flag also exists and its keys are
+merged with the env var's, but **do not** use it — CLI arguments are
+visible in `ps` / `top`. Protected endpoints accept either
 `Authorization: Bearer <key>` or `X-API-Key: <key>`. `/health`
 remains public for container health checks.
 
@@ -105,7 +106,7 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `target_lang` | Target language for AST backends |
 | `punctuation` | `true`/`false` — enable/disable punctuation (default: `true`; `false` strips punctuation from output) |
 | `diarize` | `true`/`false` — enable speaker diarization |
-| `diarize_method` | `energy`, `xcorr`, `vad-turns`, `pyannote`, `sherpa` (default: `energy`) |
+| `diarize_method` | `energy`, `xcorr`, `vad-turns`, `sherpa`, `pyannote`, `ecapa`, `foxnose` (default: `energy`) |
 | `diarize_embedder` | Speaker-embedding model for cross-slice clustering (path or `auto`) |
 | `diarize_cluster_threshold` | Cosine merge threshold for embedding clustering (default: 0.5) |
 | `diarize_max_speakers` | Upper bound on speaker cluster count (default: 8) |
@@ -142,8 +143,21 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `max_len` | Maximum segment length in characters |
 | `chunk_seconds` | Maximum chunk duration for long audio (default: 30) |
 | `chunk_overlap` | Overlap context (seconds) around chunk boundaries |
+| `split_on_punct` | `true`/`false` — split segments on punctuation (default: `false`) |
+| `max_context` | Maximum decoder text-context tokens carried across chunks (default: `-1` = model default) |
+| `audio_ctx` | Truncated audio context (whisper; default: `0` = full) |
+| `word_thold` | Word-timestamp probability threshold (default: 0.01) |
+| `carry_initial_prompt` | `true`/`false` — re-inject the initial prompt on every chunk (default: `false`) |
+| `lcs_dedup` | NeMo-style LCS hypothesis stitching at chunk boundaries: `auto` (default, fires when chunking with overlap is active), `on`, `off` |
+| `lcs_min_length` | Lower bound on LCS match length to act on (default: 1) |
+| `parakeet_decoder` | Parakeet decode head: `tdt` (default) or `ctc` |
+| `att_context` | Parakeet/canary local-attention window as `"L,R"` encoder frames (1 ≈ 80 ms) — NeMo `rel_pos_local_attn`, bounds long-audio encoder memory (#257). Unset = model default |
+| `no_auto_aligner` | `true`/`false` — suppress the automatic forced-aligner pass (default: `false`) |
+| `show_alternatives` | `true`/`false` — emit per-token alternative candidates (default: `false`) |
+| `alt_n` | Number of alternatives to emit with `show_alternatives` (default: 3) |
+| `stream` | `true`/`false` — for backends with `CAP_STREAMING`, stream partial text as Server-Sent Events (`data: {"text": "<delta>"}` … `data: [DONE]`, `Content-Type: text/event-stream`) instead of a buffered response. Ignored on backends without `CAP_STREAMING` |
 | `strict_pipeline` | `true`/`false` — #311: fail the request (HTTP 400) if an explicitly-requested aux stage (VAD, forced aligner, punctuation) could not load or produce its output, instead of degrading silently (default: `false`) |
-| `require_vad` | `true`/`false` — force the VAD-load-success requirement (needs `vad`/`vad_model`) |
+| `require_vad` | `true`/`false` — force the VAD-load-success requirement (needs `vad=true` in the request, or a server started with `--vad` / `-vm`; there is no per-request `vad_model` field) |
 | `require_word_timestamps` | `true`/`false` — fail unless every non-empty segment carries word timestamps (native or aligned) |
 | `require_punctuation` | `true`/`false` — fail unless a punctuation model is loaded (start the server with `--punc-model`) |
 
@@ -247,8 +261,9 @@ curl http://localhost:8080/v1/audio/transcriptions \
 ### Diarized JSON format (#206)
 
 `response_format=diarized_json` returns OpenAI-compatible verbose JSON
-extended with per-segment speaker labels. Speaker strings are normalised
-to single letters (`A`, `B`, `C`, …). Each segment includes a `type`
+extended with per-segment speaker labels. `(speaker N)` labels are
+normalised to letters (`A`, `B`, `C`, … and `AA`, `AB`, … past 26); a
+label in any other shape is passed through trimmed. Each segment includes a `type`
 field for compatibility with transcription clients that expect the
 diarized schema.
 
@@ -345,6 +360,7 @@ curl http://localhost:8080/v1/audio/speech \
 | `min_speech_tokens` | backend default | MOSS-TTS / moss-tts-local minimum number of generated audio frames (~12.5 frames/sec). The decode loop is forbidden from ending until this many frames are produced. **Setting `min_speech_tokens == max_speech_tokens` yields exact-duration synthesis** — the model generates precisely that window of audio (within one frame ≈ 80 ms) with no post-hoc tempo change, which is what game-dubbing / lip-sync work needs. Per request. |
 | `frequency_penalty` | `0.0` | Opt-in repeated generated-token penalty for AR TTS backends. `0.0` disabled. |
 | `top_p` | backend default | Nucleus-sampling cutoff for AR TTS backends (tada, chatterbox). Applied per request; omit to keep the backend default. |
+| `min_p` | backend default | Min-p sampling cutoff for AR TTS backends. Per request. |
 | `top_k` | backend default | Top-k sampling cutoff (`0` = disabled). Honoured by tada. Per request. |
 | `repetition_penalty` | backend default | Talker repetition penalty (`1.0` = none). Honoured by tada, chatterbox. Per request. |
 | `do_sample` | backend default | `true`/`false` — enable/disable talker sampling (`false` = greedy). Honoured by tada. Per request. |
@@ -352,6 +368,13 @@ curl http://localhost:8080/v1/audio/speech \
 | `num_steps` | backend default | Flow-matching ODE steps. For tada this is the primary "quick and dirty" vs "slow and accurate" lever (Python `num_flow_matching_steps`, default 10): more steps = slower, higher acoustic fidelity. Also honoured by chatterbox/f5. Per request. |
 | `cfg_scale` | backend default | Classifier-free-guidance scale. For tada the acoustic CFG (Python `acoustic_cfg`, default 1.6). Also chatterbox/f5. Per request. |
 | `noise_temp` | backend default | tada flow-matching noise temperature (Python `noise_temp`, default 0.9). Per request. |
+| `noise_scale` | backend default | piper VITS variance. Per request. |
+| `noise_w` | backend default | piper stochastic duration-predictor noise. Per request. |
+| `exaggeration` | backend default | chatterbox expressiveness. Per request. |
+| `speaker_id` | backend default | Speaker index for a piper multi-speaker model. Per request. |
+| `phonemes` | empty | #316: drive the acoustic model with these IPA phonemes, skipping the G2P. **kokoro and piper only** — any other backend is a `400` with `code=unsupported_phonemes` rather than a silent fallback to synthesizing `input`. |
+| `pad_silence_ms` | `0` | Pad this many ms of silence at the start of the output (per-request form of `--tts-pad-silence-ms`). |
+| `stream` | `false` | Stream the audio back with chunked transfer encoding instead of buffering the whole clip. See [Streaming synthesized audio](streaming.md#server-stream-true). Only the PCM formats are accepted (`wav`/`pcm`/`f32`); `mp3`/`aac`/`opus` return `400`. The body is always raw int16 LE PCM at the backend's native rate with `Content-Type: audio/pcm` — no RIFF header even when `response_format` was `wav`. |
 | `speed` | `1.0` | Tempo multiplier `0.25 .. 4.0` (OpenAI range). Applied as a post-synth linear resampler. Out-of-range returns 400 with `code=invalid_speed`. |
 | `response_format` | `"wav"` | `wav` (16-bit PCM RIFF, 24 kHz mono — default), `pcm` (OpenAI spec: 24 kHz signed 16-bit LE raw, no header), `f32` (crispasr-specific raw float32 for downstream DSP), or the compressed containers `mp3` / `aac` / `opus` — all encoded in-tree by [glint](https://github.com/CrispStrobe/glint), no build deps. `opus` returns a standard **Ogg Opus** file (`audio/ogg`); set `CRISPASR_OPUS_ENCODER=libopus` (build with libopus) to fall back to the legacy raw-packet framing (`audio/opus`) instead. |
 | `consent_attestation` | empty | Required when `voice` is a **clone**: a `.wav` reference, or a `.gguf` pack stamped `crispasr.voice.cloned_from_recording` by the baker that derived it from a real recording. The name is resolved against `--voice-dir` first, so a bare `"victim"` is treated exactly like `"victim.wav"`. A free-text statement attesting speaker consent, e.g. `"I have the speaker's consent"`. Logged for audit, with the reason the voice was classified a clone. Preset packs (kokoro, vibevoice, `tada-ref-<lang>`, …) carry no stamp and need no attestation — see [`eu-ai-act.md` §6.2](eu-ai-act.md#62-art-504--deepfake-disclosure). Note that "no attestation" is not "nothing to disclose": a preset whose voice is a real person still owes the audible label, via `speaker_identity` below. |
@@ -365,8 +388,11 @@ curl http://localhost:8080/v1/audio/speech \
 > **Watermarking.** Every response is watermarked by default. There is **no
 > per-request watermark toggle** — the mark is disabled only at the process
 > level by starting the server with `--no-watermark` (or `CRISPASR_NO_WATERMARK=1`),
-> which turns it off for **all** responses and logs a one-time warning that the
-> AI-content marking responsibility then rests with the operator. See
+> which turns it off for **all** responses. `--no-watermark` (like `--no-c2pa`)
+> **requires `--accept-marking-responsibility`**: without it the server refuses
+> to start rather than silently serving unmarked audio. With it, startup logs a
+> `[MARKING] scope=server` line recording that the AI-content marking
+> responsibility rests with the operator. See
 > [`tts.md`](tts.md#disabling-the-watermark-operator-opt-out).
 >
 > **The floor that opt-out cannot cross.** A response may lose the watermark
@@ -386,9 +412,15 @@ curl http://localhost:8080/v1/audio/speech \
 | 200 | `audio/pcm` | Raw int16 LE bytes (OpenAI `pcm`) |
 | 200 | `application/octet-stream` | Raw float32 PCM (`f32`) |
 | 200 | `audio/mpeg` / `audio/aac` / `audio/ogg` | Compressed `mp3` / `aac` / `opus` (Ogg Opus) via glint |
-| 400 | `application/json` | OpenAI error shape: `{"error": {"message", "type", "code", "param"}}`. Codes: `missing_required_field`, `input_too_long`, `invalid_json`, `invalid_speed`, `unsupported_response_format`. |
-| 500 | `application/json` | Synthesis returned empty (e.g. unknown voice). `code=synthesis_failed`. |
+| 400 | `application/json` | OpenAI error shape: `{"error": {"message", "type", "code", "param"}}`. Codes: `missing_required_field`, `input_too_long`, `invalid_json`, `invalid_speed`, `unsupported_response_format`, `consent_required`, `invalid_voice`, `invalid_speaker_identity`, `invalid_instructions`, `unsupported_phonemes`. Also plain (code-less) 400s for a backend without `CAP_TTS` and for `stream=true` with a compressed `response_format`. |
+| 500 | `application/json` | Synthesis returned empty (e.g. unknown voice) — `code=synthesis_failed`; or the chosen container failed to encode — `code=encoding_failed`. |
 | 503 | `application/json` | Model still loading. |
+
+Every response carries `X-Crispasr-Request-Id` — the per-request correlation
+id that also appears as `req=…` in the `[CONSENT]` / `[MARKING]` audit lines.
+When a spoken disclosure was owed (a clone, or a `real_person` preset) the
+response also carries `X-Crispasr-Spoken-Disclaimer: applied|skipped`, plus
+`X-Crispasr-Marking-Warning` when an unattested opt-out was denied.
 
 **Voice listing:**
 
@@ -398,6 +430,8 @@ curl http://localhost:8080/v1/voices
 ```
 
 `GET /v1/voices` enumerates `*.wav` and `*.gguf` stems in `--voice-dir`.
+It is also served on `GET /voices` and `GET /v1/audio/voices` as aliases for
+llama-swap / OpenAI-client compatibility (#264).
 The listing reflects the filesystem; whether a particular backend
 actually accepts a given voice depends on the backend's own resolution
 (e.g. CustomVoice models only accept names baked into the GGUF
@@ -450,20 +484,29 @@ to their own conventions — see `docs/tts.md` for per-backend specifics.
 
 ### Long-form chunking for /v1/audio/speech
 
-The talker LM in every TTS backend has a finite training horizon
-(qwen3-tts-1.7b-base degrades past ~600 chars / 200 codec frames and
-silently truncates trailing text at MAX_FRAMES). The route
-auto-chunks `input` on sentence boundaries before dispatching to the
+Some talker LMs have a finite training horizon and degrade (or silently
+truncate at MAX_FRAMES) past a few hundred characters. For those backends the
+route auto-chunks `input` on sentence boundaries before dispatching to the
 backend, then concatenates per-chunk PCM with a 200 ms silence pad.
 
 - Recognises ASCII `.!?`, CJK ideographic full stop `。` (U+3002), and
   Devanagari danda `।` (U+0964).
 - Decimal-aware: `1.5` stays intact (period is followed by a digit).
-- Run-on input with no punctuation falls back to whitespace-boundary
-  split at `--tts-max-input-chars`.
-- Voice consistency holds across chunks because the talker re-prefills
-  with the same ICL ref each call (and the per-call setup is amortised
-  by qwen3-tts's `last_voice_key_` cache).
+- Run-on input with no punctuation falls back to a whitespace-boundary
+  split at the chunker's own **600-char** cap (`crispasr_tts_split_sentences`),
+  not at `--tts-max-input-chars` — the latter only decides whether the
+  request is accepted at all.
+- **Not every backend is chunked.** `vibevoice*`, `qwen3-tts*`, `tada*`,
+  `dots-tts*` and `omnivoice*` are dispatched as **one** synthesis call
+  whatever the length: they generate multi-sentence utterances in a single
+  pass and rely on the continuous prompt / generated-text context to hold
+  speaker identity, prosody and trailing-pause timing (splitting them
+  re-runs the per-sentence pause over-prediction, and on a cloning request
+  re-emits the spoken AI-disclaimer once per chunk). Set
+  `CRISPASR_OMNIVOICE_CHUNK=1` to force the legacy sentence-split path on
+  omnivoice.
+- Where chunking does apply, voice consistency holds across chunks because
+  the talker re-prefills with the same ICL ref each call.
 - Server log line reports `chunks=N` for observability.
 
 Single-sentence input is a 1-element vector — per-call overhead is
@@ -482,8 +525,10 @@ crispasr --server --backend qwen3-tts-customvoice -m model.gguf \
 ```
 
 When set, every response carries `Access-Control-Allow-Origin`,
-`-Methods`, and `-Headers`; preflight `OPTIONS` requests get a 204 with
-the same. Default-empty stays default-locked.
+`-Methods` (`GET, POST, OPTIONS, DELETE`), `-Headers`
+(`Content-Type, Authorization, X-API-Key`) and `-Max-Age` (86400);
+preflight `OPTIONS` requests get a 204 with the same. Default-empty
+stays default-locked.
 
 ### Speed
 
@@ -535,7 +580,7 @@ curl http://localhost:8080/v1/audio/speech-to-speech \
 |---|---|---|
 | `file` | (required) | Audio file upload (multipart). Decoded to 16 kHz mono float32 internally. |
 | `language` | `en` | Language hint passed to the backend. |
-| `response_format` | `wav` | Output encoding: `wav`, `pcm` (int16 LE), `f32` (raw float32), `mp3`, `opus`. |
+| `response_format` | `wav` | Output encoding: `wav`, `pcm` (int16 LE), `f32` (raw float32), `mp3`, `aac`, `opus` (Ogg Opus). Same per-response marking floor as `/v1/audio/speech`: containers that cannot carry a C2PA manifest get the watermark forced on. |
 
 The intermediate ASR transcript (if the backend produces one) is
 returned in the `X-Transcript` response header (URL-encoded). Output
@@ -546,7 +591,8 @@ audio is watermarked by default, same as TTS (process-level opt-out via
 
 | Feature | Status |
 |---|---|
-| Streaming response (chunked / SSE) | Pending — see PLAN §70 (couples with chunked-VAE for the full latency win). |
+| Streaming response for `/v1/audio/speech` | **Done** — `"stream": true` returns chunked `audio/pcm`. On a `CAP_STREAMING` backend the chunks are the backend's own codec chunks (time-to-first-audio ≈ one chunk); otherwise one chunk per sentence. Sub-sentence chunked-VAE for the remaining backends is still pending — see PLAN §70. |
+| Streaming response for `/v1/audio/speech-to-speech` | Pending — the S2S route is buffered end-to-end (couples with chunked-VAE for the full latency win, PLAN §70). |
 | `mp3` / `aac` / `opus` encoding | **Done** — encoded in-tree by glint, no build deps (`response_format=mp3\|aac\|opus`; `opus` = Ogg Opus). `flac` output still pending. |
 | `POST /v1/voices` (multipart upload for runtime provisioning) | **Done** — gated on `consent_attestation` (see above). Disk quota and content-type validation still pending. |
 | `DELETE /v1/voices/{name}` | **Done**. |
@@ -612,6 +658,96 @@ curl http://localhost:8080/v1/translate \
 
 Returns `400` if the loaded backend lacks `CAP_TRANSLATE` or `input` is missing.
 
+## Chat endpoint
+
+`POST /v1/chat/completions` is an OpenAI-compatible text-LLM chat endpoint,
+backed by a **second** GGUF loaded at startup with `--chat-model` — independent
+of the primary ASR/TTS model, so one server can host ASR + chat off two
+different files. Without `--chat-model` the route returns `503` with
+`code=chat_disabled`.
+
+```bash
+crispasr --server -m parakeet-q4_k.gguf \
+  --chat-model qwen3-1.7b-q4_k.gguf --chat-ctx 4096 --chat-gpu-layers 99
+```
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Summarise the transcript."}]}'
+# {"id": "chatcmpl-…", "object": "chat.completion", "created": …,
+#  "model": "…", "choices": [{"index": 0,
+#  "message": {"role": "assistant", "content": "…"}, "finish_reason": "stop"}]}
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `messages` | (required) | OpenAI message array. `content` may be a string or an array of content parts — multimodal arrays are collapsed to their joined text. |
+| `model` | (ignored) | Read but not validated; the server answers with whatever `--chat-model` loaded. |
+| `temperature` | `0.8` | Sampling temperature. |
+| `top_p` | `0.95` | Nucleus-sampling cutoff. |
+| `top_k` | `40` | Top-k cutoff (CrispASR extension). |
+| `max_tokens` | `256` | Generated-token cap. |
+| `seed` | `0` | RNG seed. |
+| `stop` | — | A string or an array of strings. |
+| `stream` | `false` | `true` → `text/event-stream` with `chat.completion.chunk` deltas terminated by `data: [DONE]`. Note the framing is SSE but the delivery is not yet incremental: generation runs to completion first and the assembled event stream is sent as one response, so `stream: true` buys correct parsing, not lower time-to-first-token. |
+
+Each request is treated as a **stateless** conversation: the session's KV cache
+is reset before generation, and the whole reset-then-generate transaction takes
+one lock, so overlapping requests queue rather than interleave on the shared
+session.
+
+Every response (buffered and SSE) carries the EU AI Act Art. 50(2) synthetic-text
+markers `X-Crispasr-Ai-Generated: true` and `X-Crispasr-Ai-Disclosure: <text>`.
+A client that drops the headers publishes unmarked text — marking what you do
+with it stays the deployer's duty (see [`eu-ai-act.md`](eu-ai-act.md) §6.6).
+
+Error codes: `chat_disabled` (503), `chat_init_failed`, `chat_reset_failed`,
+`chat_generate_failed`, `chat_stream_failed` (500), `invalid_json`,
+`missing_required_field`, `invalid_message` (400).
+
+## Progress endpoint (#408)
+
+`GET /progress` lets a client poll the progress of the transcription job the
+server is currently running, so a UI can show a real 0–100 bar instead of a
+heartbeat while a long synchronous `POST` is in flight:
+
+```bash
+curl -H "Authorization: Bearer $KEY" http://localhost:8080/progress
+# idle:            {"busy": false, "progress": -1}
+# job running:     {"busy": true,  "progress": 42}
+# post-processing: {"busy": true,  "progress": 100}   (diarization/punctuation tail)
+```
+
+`progress` advances per chunk of the server's chunk loop, reaches 100 when the
+last chunk has decoded, and stays there while post-steps (diarization,
+punctuation, truecasing) finish; it returns to `-1` when the job completes.
+Requests queued behind a running job do not disturb its reading. With
+`--server-workers > 1`, `busy` counts every in-flight job but concurrent jobs
+share the single `progress` slot (last writer wins) — per-request progress
+would need job ids and is out of scope for now. The endpoint requires an API
+key when keys are configured (only `/health` is public).
+
+## Request limits & error handling
+
+- **Upload cap: 512 MB.** A larger `Content-Length` is rejected with `413`
+  before the body is buffered (so an oversized multipart cannot OOM the
+  process ahead of auth/routing).
+- **Chunked uploads are refused.** cpp-httplib's chunked reader does not honour
+  the payload cap, so a `POST`/`PUT` carrying `Transfer-Encoding` gets `411
+  Length Required` — resend with a `Content-Length`.
+- An unmatched route returns `{"error": "not found. Use POST /v1/audio/transcriptions"}`;
+  an exception inside a handler returns a structured `500` naming the reason
+  rather than being mislabelled as a 404.
+- `GET /health` answers `503 {"status": "loading"}` until the model is
+  resident, then `200 {"status": "ok", "backend": "…"}`. It is the only
+  endpoint exempt from API-key auth.
+- `POST /load` returns `409` while a `--server-workers` pool is active
+  (pooled workers would keep serving the old model — restart instead).
+- Requests asking for `vad` or `diarize` on a host whose CPU lacks the
+  instruction set this build was compiled for return `400` rather than
+  SIGILL-ing the server (#261).
+
 ## Real-time streaming (WebSocket)
 
 Pass `--ws-port N` to expose a real-time streaming-ASR WebSocket alongside the
@@ -638,7 +774,7 @@ Whisper-only today. (Each connection opens its own streaming session.)
 When `--ws-port` is enabled, the server also exposes a **vLLM Realtime API** compatible WebSocket endpoint on `ws_port + 1`. This endpoint accepts standard JSON-encoded `input_audio_buffer.append` events (base64 PCM16) and streams back `conversation.item.input_audio_transcription.delta` events incrementally.
 
 ```bash
-crispasr --server -m qwen3-asr.gguf --backend qwen3-asr --ws-port 8081
+crispasr --server -m qwen3-asr.gguf --backend qwen3 --ws-port 8081
 # → WS ws://127.0.0.1:8081 (Raw PCM)
 # → WS ws://127.0.0.1:8082/v1/realtime (vLLM Realtime API)
 ```
@@ -747,14 +883,19 @@ docker pull ghcr.io/crispstrobe/crispasr:main-cuda-12   # legacy driver
 ## Wyoming protocol (Home Assistant Assist)
 
 Pass `--wyoming-port N` to start a Wyoming peer-to-peer JSONL/TCP server
-alongside the HTTP API. One `crispasr-server` instance then replaces both
+alongside the HTTP API. One CrispASR server instance then replaces both
 `wyoming-faster-whisper` (STT) and `wyoming-piper` (TTS) in a Home Assistant
 Assist pipeline — no extra containers needed.
 
 ```bash
 # Start server with Wyoming on port 10300 (HA default)
-crispasr-server -m model.gguf --port 8080 --wyoming-port 10300
+crispasr --server -m model.gguf --port 8080 --wyoming-port 10300
 ```
+
+> `--wyoming-port` belongs to the multi-backend `crispasr --server` binary.
+> The separate legacy `crispasr-server` executable (built from
+> `examples/server/server.cpp`) is whisper-only, serves just `/`,
+> `/inference`, `/load` and `/health`, and does not accept this flag.
 
 ### Wire format
 
@@ -822,6 +963,12 @@ You can override the loaded model and startup flags through `.env`:
 | `CRISPASR_API_KEYS` | Comma-separated API keys (see [API keys](#api-keys)) |
 | `CRISPASR_EXTRA_ARGS` | Forwarded verbatim to the server CLI (e.g. `--no-punctuation`) |
 | `CRISPASR_SERVER_WORKERS` | `N>1` loads N independent ASR backend instances so **pure-ASR** requests (explicit `language`, no aligner, no punctuation/truecaser) run concurrently instead of serializing on the single model. Costs N× model memory. Only a throughput win where a single request under-utilises the box (spare cores, a GPU not saturated by one stream, smaller models); a *net loss* on a saturated memory-bandwidth-bound CPU model, where the instances contend. Requests using shared LID/aligner/post-processing stay serialized. `/load` is disabled while a pool is active (restart to change models). Default `1` = single instance. Equivalent to the `--server-workers N` CLI flag (this env var overrides the flag when both are set). Full guidance: **[docs/concurrency.md](concurrency.md)**. |
+
+Only the variables listed in the compose service's `environment:` block reach
+the container. `CRISPASR_SERVER_WORKERS` is **not** one of them, so putting it
+in `.env` alone has no effect under Docker — either add it to the `environment:`
+block, or pass the equivalent flag through the variable that *is* forwarded:
+`CRISPASR_EXTRA_ARGS=--server-workers 4`.
 
 The service is configured to avoid serving as root by default:
 - `user: "${CRISPASR_UID:-1000}:${CRISPASR_GID:-1000}"`

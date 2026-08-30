@@ -22,10 +22,14 @@ Enforced, per bundling job:
      `-ErrorAction SilentlyContinue`, so a wrong CUDA_PATH yields a silently
      CPU-only package named "cuda"; a job must therefore assert it ended up
      with exactly three DLLs.
-  4. All bundling jobs pin the SAME CUDA version. The three DLLs are published
-     once and shared across packages, which is only sound while every producer
-     builds against the same toolkit — bumping one job alone would leave the
-     other's users installing mismatched DLLs.
+  4. All bundling jobs on the SAME CUDA major pin the SAME CUDA version. The
+     three DLLs are published once per major and shared across that major's
+     packages, which is only sound while every producer in the major builds
+     against the same toolkit — bumping one job alone would leave the other's
+     users installing mismatched DLLs. Different majors are fine (#400 added
+     CUDA 13 packages next to the CUDA 12 ones): the DLL file names carry the
+     major (cudart64_12.dll vs cudart64_13.dll), so the assets cannot collide
+     or be cross-installed silently.
 
 Usage:
     python tools/check-cuda-split-packaging.py [WORKFLOW ...]
@@ -125,14 +129,21 @@ def main() -> int:
         )
         return 2
 
-    versions = {v for v in bundling.values() if v}
-    if len(versions) > 1:
-        detail = ", ".join(f"{k}={v}" for k, v in sorted(bundling.items()))
-        problems.append(
-            f"CUDA versions differ across bundling jobs ({detail}). The three DLLs are "
-            f"published once and shared between packages, which only holds while every "
-            f"producer builds against the same toolkit."
-        )
+    # Lockstep is per CUDA major: the runtime DLL names carry the major
+    # (cudart64_12.dll vs cudart64_13.dll), so majors publish disjoint assets,
+    # but within a major every producer must pin the identical toolkit.
+    by_major: dict[str, dict[str, str]] = {}
+    for where, ver in bundling.items():
+        if ver:
+            by_major.setdefault(ver.split(".")[0], {})[where] = ver
+    for major, group in sorted(by_major.items()):
+        if len(set(group.values())) > 1:
+            detail = ", ".join(f"{k}={v}" for k, v in sorted(group.items()))
+            problems.append(
+                f"CUDA {major}.x versions differ across bundling jobs ({detail}). The three "
+                f"DLLs are published once per major and shared between that major's packages, "
+                f"which only holds while every producer builds against the same toolkit."
+            )
     if None in bundling.values():
         missing = ", ".join(sorted(k for k, v in bundling.items() if v is None))
         problems.append(f"could not determine the pinned CUDA version for: {missing}")
@@ -143,8 +154,8 @@ def main() -> int:
         print(f"\n{len(problems)} problem(s) across {examined} CUDA-bundling job(s).", file=sys.stderr)
         return 1
 
-    ver = versions.pop() if versions else "?"
-    print(f"RESULT: PASS — {examined} CUDA-bundling job(s), all split and attached, all on CUDA {ver}")
+    vers = ", ".join(sorted({v for g in by_major.values() for v in g.values()})) or "?"
+    print(f"RESULT: PASS — {examined} CUDA-bundling job(s), all split and attached, on CUDA {vers}")
     return 0
 
 

@@ -677,7 +677,7 @@ extern "C" sensevoice_context* sensevoice_init_from_file(const char* path, sense
         core_cpu_backend::set_n_threads(ctx->backend, ctx->n_threads);
 
     if (!sensevoice_load_model(ctx->model, ctx->vocab, path, ctx->backend, ctx->backend_cpu)) {
-        delete ctx;
+        sensevoice_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
 

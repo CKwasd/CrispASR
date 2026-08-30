@@ -153,6 +153,76 @@ jobs:
           fail_on_unmatched_files: true
 
   # ── WebAssembly build (browser: ASR + TTS, all backends) ─────────────────────
+  build-linux-cpu-legacy:
+    if: ${{ !inputs.only || inputs.only == 'build-linux-cpu-legacy' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ patchelf libopenblas-dev
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCRISPASR_C2PA_FETCH=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_OPENBLAS=ON \
+            -DCRISPASR_PORTABLE_CPU=ON \
+            -DCRISPASR_OPUS_FETCH=ON
+          cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
+
+      - name: Package
+        run: |
+          mkdir -p release/crispasr-linux-x86_64-cpu-legacy
+          cp build/bin/crispasr release/crispasr-linux-x86_64-cpu-legacy/
+          cp build/bin/crispasr-quantize release/crispasr-linux-x86_64-cpu-legacy/
+          bash scripts/bundle-c2pa.sh release/crispasr-linux-x86_64-cpu-legacy || true
+          # Self-contained: rewrite RUNPATH to $ORIGIN (v0.8.25 shipped a leaked
+          # /home/runner/... path, and crispasr-quantize had no $ORIGIN at all, so it
+          # could not find its own bundled libc2pa_c.so) and copy in the non-system
+          # dependency closure — libopenblas AND libgomp, per CrispASR #296.
+          bash scripts/bundle-linux-runtime.sh release/crispasr-linux-x86_64-cpu-legacy
+          # #296: the binary carries `NEEDED libopenblas.so.0` (apt ships a
+          # dynamic OpenBLAS), so without this the tarball does not START on a
+          # machine that lacks it. RUNPATH is $ORIGIN, so a copy beside the
+          # binary resolves. Verified against the published v0.8.25 artifact.
+          # Assert the SHIPPED artifact, not the configure log: a silent scalar
+          # fallback used to be indistinguishable from a green run.
+          # MUST run AFTER bundle-linux-runtime.sh — that is the step that copies
+          # libopenblas in. Asserting first made this gate fail on every
+          # dynamically-linked build (#339, all of v0.8.26's Linux tarballs).
+          if objdump -p release/crispasr-linux-x86_64-cpu-legacy/crispasr | grep -q 'NEEDED.*libopenblas'; then
+            test -f release/crispasr-linux-x86_64-cpu-legacy/libopenblas.so.0 || {
+              echo "::error::crispasr needs libopenblas.so.0 but it is not bundled — the tarball will not run without OpenBLAS installed"; exit 1; }
+          fi
+          # Then assert the rest: any DT_NEEDED that is neither bundled nor
+          # base-system means the loader dies before main() and the process
+          # exits 127 silently.
+          python3 scripts/check-bundled-deps.py release/crispasr-linux-x86_64-cpu-legacy
+          # Ship the licence text with the binaries. Every Windows, Android and
+          # libcrispasr artifact already did; no CLI tarball did, and these bundle
+          # third-party shared libraries (libgomp, and libomp on HIP) whose terms
+          # require the notice to travel with them.
+          cp LICENSE release/crispasr-linux-x86_64-cpu-legacy/
+          cp THIRD_PARTY_NOTICES.txt release/crispasr-linux-x86_64-cpu-legacy/
+          cd release && tar czf crispasr-linux-x86_64-cpu-legacy.tar.gz crispasr-linux-x86_64-cpu-legacy/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-linux-x86_64-cpu-legacy
+          path: release/crispasr-linux-x86_64-cpu-legacy.tar.gz
+
+      - name: Attach crispasr-linux-x86_64-cpu-legacy.tar.gz to release
+        if: inputs.tag != '' || startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: release/crispasr-linux-x86_64-cpu-legacy.tar.gz
+          fail_on_unmatched_files: true
+
+  # ── WebAssembly build (browser: ASR + TTS, all backends) ─────────────────────
   build-wasm:
     if: ${{ !inputs.only || inputs.only == 'build-wasm' }}
     runs-on: ubuntu-latest
@@ -2083,6 +2153,137 @@ jobs:
             release/crispasr-windows-x86_64-cuda-runtime-sha256.txt
           fail_on_unmatched_files: true
 
+  # ── Windows CUDA 13 (dynamic, requires NVIDIA driver on target machine) ──────
+  # #400: CUDA-13-native companion to build-windows-cuda above. CUDA 13 ships
+  # cudart64_13.dll / cublas64_13.dll / cublasLt64_13.dll — NOT ABI-compatible
+  # with the *_12 runtime — so users on a CUDA-13-era driver/toolkit get a
+  # package whose bundled runtime matches their stack instead of carrying a
+  # parallel CUDA 12 runtime. Floors at sm_75: CUDA 13 REMOVED offline codegen
+  # for Maxwell/Pascal/Volta (sm_50-70), so Pascal (GTX 10xx/P100) and Volta
+  # (V100) users must take crispasr-windows-x86_64-cuda.zip above. The arch
+  # list is kept in lockstep with build-linux-x86_64-cuda13. The build+package
+  # recipe (and CPU fallback of the packaged exe on a GPU-less host) is proven
+  # by .github/workflows/win-cuda13-verify.yml — keep the two in lockstep.
+  build-windows-cuda13:
+    if: ${{ !inputs.only || inputs.only == 'build-windows-cuda13' }}
+    # Pin to windows-2022 — CUDA 13.0 supports VS 2022 (MSVC 14.3x/14.4x),
+    # not the newer MSVC on windows-latest.
+    runs-on: windows-2022
+    env:
+      CUDA_VERSION: "13.0.0"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install CUDA Toolkit 13.0.0
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '13.0.0'
+          method: 'network'
+          # "crt" and "nvvm" are NEW in the CUDA 13 Windows installer: crt/host_config.h
+          # and cicc.exe moved out of the nvcc component into their own sub-packages;
+          # without them every nvcc compile dies (C1083 on cuda_runtime.h / cicc not found).
+          sub-packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "nvrtc", "nvrtc_dev", "nvtx", "cuda_profiler_api", "visual_studio_integration"]'
+
+      - name: Build
+        shell: cmd
+        run: |
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S . -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGGML_CUDA=ON ^
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120a-real;120-virtual" ^
+            -DCRISPASR_OPUS_FETCH=ON
+          cmake --build build --target crispasr-cli crispasr-quantize -j %NUMBER_OF_PROCESSORS%
+
+      - name: Package (complete and split CUDA 13 assets)
+        shell: pwsh
+        run: |
+          $full = "release\crispasr-windows-x86_64-cuda13"
+          $split = "release\crispasr-windows-x86_64-cuda13-non-cuda"
+          $runtime = "release\cuda13-runtime"
+          New-Item -ItemType Directory -Force $full, $split, $runtime | Out-Null
+
+          # Keep the complete archive as the one-click/self-contained install.
+          Copy-Item build\bin\crispasr.exe          $full\
+          Copy-Item build\bin\crispasr-quantize.exe $full\
+          $appDlls = Get-ChildItem build\bin\*.dll | Where-Object { $_.Name -notlike 'Catch2*' }
+          $appDlls | Copy-Item -Destination $full\
+
+          # CUDA 13.0 moved the Windows runtime DLLs from bin\ to bin\x64\ —
+          # search recursively so either layout works, dedupe by file name.
+          $cudaDlls = @('cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll') |
+            ForEach-Object { Get-ChildItem "$env:CUDA_PATH\bin" -Recurse -Filter $_ } |
+            Group-Object Name | ForEach-Object { $_.Group[0] }
+          if ($cudaDlls.Count -ne 3) {
+            throw "Expected exactly three CUDA runtime DLLs (cudart, cublas, cublasLt), found $($cudaDlls.Count)"
+          }
+          $notMajor13 = @($cudaDlls | Where-Object { $_.Name -notmatch '64_13\.dll$' })
+          if ($notMajor13.Count -ne 0) {
+            throw "CUDA 13 job picked up non-13 runtime DLLs: $($notMajor13.Name -join ', ')"
+          }
+          $cudaDlls | Copy-Item -Destination $full
+          $cudaDlls | Copy-Item -Destination $runtime
+
+          Copy-Item LICENSE $full\
+          Copy-Item THIRD_PARTY_NOTICES.txt $full\
+          Compress-Archive -Path $full -DestinationPath release\crispasr-windows-x86_64-cuda13.zip -CompressionLevel Optimal
+
+          # The split archive contains the executable and CrispASR DLLs, but
+          # deliberately omits the three CUDA runtime DLLs below. Users can
+          # install these beside the executable, or use the complete archive.
+          Copy-Item build\bin\crispasr.exe          $split\
+          Copy-Item build\bin\crispasr-quantize.exe $split\
+          $appDlls | Where-Object {
+            $_.Name -notmatch '^(cudart|cublas|cublasLt)64_.*\.dll$'
+          } | Copy-Item -Destination $split\
+          @'
+          This archive intentionally excludes the CUDA 13 runtime DLLs.
+          For a self-contained install, use crispasr-windows-x86_64-cuda13.zip.
+          For an incremental install, copy the three separate CUDA 13 *64_13.dll
+          release assets into this directory: cudart64_13.dll, cublas64_13.dll,
+          and cublasLt64_13.dll. The *_12 DLLs from the CUDA 12 package do NOT
+          work with this build.
+          '@ | Set-Content $split\README-CUDA.txt
+          Copy-Item LICENSE $split\
+          Copy-Item THIRD_PARTY_NOTICES.txt $split\
+          Compress-Archive -Path $split -DestinationPath release\crispasr-windows-x86_64-cuda13-non-cuda.zip -CompressionLevel Optimal
+
+          $hashLines = $cudaDlls | ForEach-Object {
+            $hash = (Get-FileHash (Join-Path $runtime $_.Name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          }
+          $hashLines | Set-Content release\crispasr-windows-x86_64-cuda13-runtime-sha256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-windows-x86_64-cuda13
+          path: release/crispasr-windows-x86_64-cuda13.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-windows-x86_64-cuda13-split
+          path: |
+            release/crispasr-windows-x86_64-cuda13-non-cuda.zip
+            release/cuda13-runtime/*.dll
+            release/crispasr-windows-x86_64-cuda13-runtime-sha256.txt
+
+      - name: Attach crispasr-windows-x86_64-cuda13.zip to release
+        if: inputs.tag != '' || startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            release/crispasr-windows-x86_64-cuda13.zip
+            release/crispasr-windows-x86_64-cuda13-non-cuda.zip
+            release/cuda13-runtime/*.dll
+            release/crispasr-windows-x86_64-cuda13-runtime-sha256.txt
+          fail_on_unmatched_files: true
+
   # ── Windows Vulkan (dynamic, works on NVIDIA/AMD/Intel with a Vulkan driver) ─
   build-windows-vulkan:
     if: ${{ !inputs.only || inputs.only == 'build-windows-vulkan' }}
@@ -2239,7 +2440,7 @@ jobs:
   # to transient permission issues). softprops won't clobber files that
   # already exist on the release.
   publish:
-    needs: [validate-version, build-linux, build-linux-x86_64-avx512, build-linux-x86_64-cuda, build-linux-x86_64-cuda13, build-linux-x86_64-hip, build-linux-arm64, build-python-linux, build-python-linux-arm64, build-macos, build-libs-macos-arm64, build-libs-linux-x86_64, build-libs-linux-x86_64-avx512, build-libs-linux-x86_64-hip, build-libs-linux-arm64, build-libs-linux-x86_64-cuda, build-libs-windows-x86_64, build-libs-windows-x86_64-vulkan, build-libs-windows-x86_64-cuda, build-libs-windows-x86_64-cpu-legacy, build-windows-cpu, build-windows-cpu-legacy, build-windows-cuda, build-windows-vulkan, build-android-arm64]
+    needs: [validate-version, build-linux, build-linux-cpu-legacy, build-linux-x86_64-avx512, build-linux-x86_64-cuda, build-linux-x86_64-cuda13, build-linux-x86_64-hip, build-linux-arm64, build-python-linux, build-python-linux-arm64, build-macos, build-libs-macos-arm64, build-libs-linux-x86_64, build-libs-linux-x86_64-avx512, build-libs-linux-x86_64-hip, build-libs-linux-arm64, build-libs-linux-x86_64-cuda, build-libs-windows-x86_64, build-libs-windows-x86_64-vulkan, build-libs-windows-x86_64-cuda, build-libs-windows-x86_64-cpu-legacy, build-windows-cpu, build-windows-cpu-legacy, build-windows-cuda, build-windows-cuda13, build-windows-vulkan, build-android-arm64]
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:

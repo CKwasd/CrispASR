@@ -1216,6 +1216,38 @@ extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const f
         if (logits[i] > logits[best])
             best = i;
 
+    // Softmax the raw classifier logits so out_confidence is a probability in
+    // [0, 1], matching the whisper LID arm's contract. Callers (CLI "p=",
+    // the C ABI, CrisperWeaver's 0.35 floor) all treat it as one; before
+    // this the silero arm handed back the raw top logit (e.g. -0.79 for a
+    // 99.8%-confident answer), which every probability threshold rejected.
+    double denom = 0.0;
+    for (float l : logits)
+        denom += std::exp((double)l - (double)logits[best]);
+    const float best_p = (float)(1.0 / denom);
+
+    // #409 evidence floor, gated on the RAW top logit — deliberately not on
+    // best_p. On out-of-domain audio (codec artifacts, wrong-language edge
+    // cases) the head's logits deflate wholesale and softmax renormalizes
+    // noise into fake confidence (jfk.mp3 decodes to 'yo' at p=0.578).
+    // The raw magnitude separates cleanly: every verified-correct case sits
+    // at logit >= ~-1.1, every observed failure at <= -3.35 (measured
+    // against the upstream ONNX as well — the model itself does this).
+    // Below the floor the answer is a guess: refuse it so callers fall back
+    // (the CLI falls back to whisper LID). Tune or disable via
+    // CRISPASR_SILERO_LID_MIN_LOGIT (e.g. -999 to disable).
+    float min_logit = -2.0f;
+    if (const char* e = crispasr_env::get("CRISPASR_SILERO_LID_MIN_LOGIT"))
+        min_logit = strtof(e, nullptr);
+    if (logits[best] < min_logit) {
+        fprintf(stderr,
+                "silero_lid: rejecting low-evidence answer '%s' (top logit %.2f < floor %.2f, p=%.3f) — "
+                "out-of-domain audio; caller should fall back\n",
+                best < (int)ctx->lang_strs.size() ? ctx->lang_strs[best].c_str() : "?", logits[best], min_logit,
+                best_p);
+        return nullptr;
+    }
+
     if (crispasr_env::get("CRISPASR_SILERO_LID_DEBUG")) {
         std::vector<int> order(logits.size());
         for (int i = 0; i < (int)order.size(); i++)
@@ -1231,7 +1263,7 @@ extern "C" const char* silero_lid_detect(struct silero_lid_context* ctx, const f
     }
 
     if (out_confidence)
-        *out_confidence = logits[best];
+        *out_confidence = best_p;
 
     if (best < (int)ctx->lang_strs.size())
         return ctx->lang_strs[best].c_str();

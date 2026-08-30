@@ -1994,6 +1994,18 @@ class Session:
         if rc != 0:
             raise RuntimeError(f"set_tts_phonemes failed (rc={rc})")
 
+    def set_tts_pad_silence_ms(self, ms: int) -> None:
+        """Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs where it drops the first ~1.5s of audio while parsing a large C2PA chunk.
+
+        Args:
+            ms: Milliseconds of silence to pad (e.g. 1500).
+        """
+        if not hasattr(self._lib, "crispasr_session_set_tts_pad_silence_ms"):
+            raise RuntimeError("set_tts_pad_silence_ms API not present in this libcrispasr build")
+        self._lib.crispasr_session_set_tts_pad_silence_ms.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._lib.crispasr_session_set_tts_pad_silence_ms.restype = None
+        self._lib.crispasr_session_set_tts_pad_silence_ms(self._session, int(ms))
+
     def clear_phoneme_cache(self) -> None:
         """Drop the kokoro per-session phoneme cache.
 

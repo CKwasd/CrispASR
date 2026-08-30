@@ -3414,7 +3414,7 @@ static std::vector<float> s2a_flow_matching(confucius4_tts_context* ctx, const s
     // NB: ggml names the Metal DEVICE "MTL0" — match on the registry name via
     // core_cpu_backend::is_metal (the ggml_backend_name("Metal") form never
     // fires; red-verified 2026-08-25).
-    bool cfg_fuse = ctx->backend && !ggml_backend_is_cpu(ctx->backend) && core_cpu_backend::is_metal(ctx->backend);
+    bool cfg_fuse = ctx->backend && !core_cpu_backend::is_cpu(ctx->backend) && core_cpu_backend::is_metal(ctx->backend);
     if (const char* env_fuse = std::getenv("CRISPASR_CONFUCIUS4_CFG_FUSE"))
         if (*env_fuse)
             cfg_fuse = atoi(env_fuse) != 0;

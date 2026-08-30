@@ -47,8 +47,20 @@ struct diarize_opts_abi {
     int32_t num_speakers;
     int32_t _pad2;
 };
+// #395: the turn struct is NOT append-only-shared with the opts struct — it is
+// its own 24-byte POD, mirrored here for the same reason as the others.
+struct diarize_turn_abi {
+    int64_t t0_cs;
+    int64_t t1_cs;
+    int32_t speaker;
+    int32_t _pad;
+};
 int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm, int32_t n_samples, int32_t is_stereo,
                                   diarize_seg_abi* segs, int32_t n_segs, const diarize_opts_abi* opts);
+int crispasr_diarize_segments_turns_abi(const float* left_pcm, const float* right_pcm, int32_t n_samples,
+                                        int32_t is_stereo, diarize_seg_abi* segs, int32_t n_segs,
+                                        const diarize_opts_abi* opts, diarize_turn_abi* out_turns, int32_t n_turns_cap,
+                                        int32_t* out_n_turns);
 }
 
 namespace {
@@ -154,4 +166,90 @@ TEST_CASE("FoxNose with a missing embedder fails with 1, not a crash", "[unit][d
     diarize_opts_abi opts = default_opts(4); // FoxNose
     opts.foxnose_embedder_path = "/nonexistent/wespeaker.gguf";
     CHECK(crispasr_diarize_segments_abi(pcm.data(), nullptr, 16000, 0, &seg, 1, &opts) == 1);
+}
+
+// ── #395: the turn-forwarding entry point ────────────────────────────────────
+//
+// The turns themselves need the FoxNose embedder, so what is model-free here
+// is the CONTRACT: the same argument validation, the same labelling as the
+// older symbol when no turn buffer is asked for, and 0 turns (not an error)
+// from the methods that don't derive any.
+
+TEST_CASE("turns ABI rejects the same invalid arguments, plus a negative cap", "[unit][diarize]") {
+    std::vector<float> pcm(16000, 0.01f);
+    diarize_seg_abi seg = {0, 100, -1, 0};
+    diarize_opts_abi opts = default_opts(2); // VadTurns
+    diarize_turn_abi turns[4] = {};
+    int32_t n_turns = -7;
+
+    CHECK(crispasr_diarize_segments_turns_abi(nullptr, nullptr, 16000, 0, &seg, 1, &opts, turns, 4, &n_turns) == -1);
+    CHECK(crispasr_diarize_segments_turns_abi(pcm.data(), nullptr, 16000, 0, nullptr, 1, &opts, turns, 4, &n_turns) ==
+          -1);
+    CHECK(crispasr_diarize_segments_turns_abi(pcm.data(), nullptr, 16000, 0, &seg, 0, &opts, turns, 4, &n_turns) == -1);
+    CHECK(crispasr_diarize_segments_turns_abi(pcm.data(), nullptr, 16000, 0, &seg, 1, nullptr, turns, 4, &n_turns) ==
+          -1);
+    CHECK(crispasr_diarize_segments_turns_abi(pcm.data(), nullptr, 16000, 0, &seg, 1, &opts, turns, -1, &n_turns) ==
+          -1);
+
+    diarize_opts_abi bad_method = default_opts(5); // one past FoxNose
+    CHECK(crispasr_diarize_segments_turns_abi(pcm.data(), nullptr, 16000, 0, &seg, 1, &bad_method, turns, 4,
+                                              &n_turns) == -1);
+
+    // A rejected call writes nothing — not even the count.
+    CHECK(n_turns == -7);
+}
+
+TEST_CASE("turns ABI with no turn buffer is the older symbol", "[unit][diarize]") {
+    // Same input as "VadTurns alternates speakers across a >600 ms gap", run
+    // through both entry points: the labels must agree exactly.
+    std::vector<float> pcm(16000 * 4, 0.01f);
+    diarize_seg_abi old_segs[2] = {{0, 100, -1, 0}, {200, 300, -1, 0}};
+    diarize_seg_abi new_segs[2] = {{0, 100, -1, 0}, {200, 300, -1, 0}};
+    diarize_opts_abi opts = default_opts(2);
+
+    REQUIRE(crispasr_diarize_segments_abi(pcm.data(), nullptr, (int32_t)pcm.size(), 0, old_segs, 2, &opts) == 0);
+    REQUIRE(crispasr_diarize_segments_turns_abi(pcm.data(), nullptr, (int32_t)pcm.size(), 0, new_segs, 2, &opts,
+                                                nullptr, 0, nullptr) == 0);
+    CHECK(new_segs[0].speaker == old_segs[0].speaker);
+    CHECK(new_segs[1].speaker == old_segs[1].speaker);
+}
+
+TEST_CASE("a method that derives no turns reports 0, not an error", "[unit][diarize]") {
+    // Energy labels caller segments directly; only FoxNose derives turns.
+    const int sr = 16000;
+    std::vector<float> left(sr, 0.5f), right(sr, 0.05f);
+    diarize_seg_abi seg = {0, 100, -1, 0};
+    diarize_opts_abi opts = default_opts(0); // Energy
+    diarize_turn_abi turns[4] = {};
+    int32_t n_turns = -7;
+
+    // With a buffer: 0 turns can never overflow it, so no truncation code.
+    REQUIRE(crispasr_diarize_segments_turns_abi(left.data(), right.data(), sr, 1, &seg, 1, &opts, turns, 4, &n_turns) ==
+            0);
+    CHECK(n_turns == 0);
+    CHECK(seg.speaker == 0); // labelling still happened
+
+    // Count-only query (no buffer) is legal and returns 0 as well.
+    seg.speaker = -1;
+    n_turns = -7;
+    REQUIRE(crispasr_diarize_segments_turns_abi(left.data(), right.data(), sr, 1, &seg, 1, &opts, nullptr, 0,
+                                                &n_turns) == 0);
+    CHECK(n_turns == 0);
+    CHECK(seg.speaker == 0);
+
+    // A zero cap is not truncation when there is nothing to truncate.
+    REQUIRE(crispasr_diarize_segments_turns_abi(left.data(), right.data(), sr, 1, &seg, 1, &opts, turns, 0, &n_turns) ==
+            0);
+    CHECK(n_turns == 0);
+}
+
+TEST_CASE("turns ABI: FoxNose with a missing embedder still fails with 1", "[unit][diarize]") {
+    std::vector<float> pcm(16000, 0.01f);
+    diarize_seg_abi seg = {0, 100, -1, 0};
+    diarize_opts_abi opts = default_opts(4); // FoxNose
+    opts.foxnose_embedder_path = "/nonexistent/wespeaker.gguf";
+    diarize_turn_abi turns[4] = {};
+    int32_t n_turns = -7;
+    CHECK(crispasr_diarize_segments_turns_abi(pcm.data(), nullptr, 16000, 0, &seg, 1, &opts, turns, 4, &n_turns) == 1);
+    CHECK(n_turns == -7); // a failed run writes no count
 }

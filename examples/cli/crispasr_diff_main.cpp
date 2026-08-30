@@ -142,8 +142,28 @@ static char* portable_mkdtemp(char* tpl) {
     tpl[strlen(unique)] = '\0';
     return tpl;
 }
+// setenv/unsetenv are POSIX; MSVC has only _putenv_s. Two of the ~10 call
+// sites in this file wrapped that by hand in #ifdef _WIN32 / #else, and the
+// rest did not — so crispasr-diff did not compile on MSVC at all
+// (error C3861: 'setenv': identifier not found). Nothing noticed, because
+// ci.yml's Windows job builds only crispasr-cli plus three named tests;
+// build.yml's msbuild ALL_BUILD is the only thing that compiles this file on
+// Windows, and it has been red since 2026-08-18.
+//
+// Shim it the same way mkdtemp and rmdir already are, so every call site
+// works unchanged. _putenv_s always overwrites, which matches every call
+// here (they all pass overwrite=1).
+static int portable_setenv(const char* name, const char* value, int overwrite) {
+    (void)overwrite;
+    return _putenv_s(name, value);
+}
+static int portable_unsetenv(const char* name) {
+    return _putenv_s(name, "");
+}
 #define mkdtemp portable_mkdtemp
 #define rmdir _rmdir
+#define setenv portable_setenv
+#define unsetenv portable_unsetenv
 #else
 #include <unistd.h>
 #endif
@@ -7663,10 +7683,26 @@ int main(int argc, char** argv) {
         }
 
         // Compare encoder_output if present in ref
-        // TODO: expose nemotron_run_encoder as a stage API for per-stage comparison.
-        // For now, only transcript-level regression is checked.
         if (ref.has("encoder_output")) {
-            printf("[SKIP] encoder_output          (stage API not yet wired — transcript-only regression)\n");
+            int n_mels = 0, T_mel = 0;
+            float* mel = nemotron_compute_mel(ctx, samples.data(), (int)samples.size(), &n_mels, &T_mel);
+            if (mel) {
+                int T_enc = 0, d_model = 0;
+                float* enc = nemotron_run_encoder_ext(ctx, mel, n_mels, T_mel, &T_enc, &d_model);
+                free(mel);
+                if (enc) {
+                    auto rep = ref.compare("encoder_output", enc, (size_t)T_enc * d_model);
+                    print_row("encoder_output", rep, COS_THRESHOLD);
+                    record(rep);
+                    free(enc);
+                } else {
+                    printf("[ERR ] encoder_output          nemotron_run_encoder_ext returned null\n");
+                    n_fail++;
+                }
+            } else {
+                printf("[ERR ] encoder_output          nemotron_compute_mel returned null\n");
+                n_fail++;
+            }
         }
 
         nemotron_result_free(r);
@@ -7805,8 +7841,9 @@ int main(int argc, char** argv) {
 
         // conv_stem_out: dump via env, compare against ref
         {
-            std::string conv_dump = "/mnt/volume1/tmp-overflow/moss_diarize_conv_stem.bin";
-            setenv("CRISPASR_MOSS_DIARIZE_CONV_DUMP", conv_dump.c_str(), 1);
+            // Scratch file next to the reference, not a hardcoded machine path.
+            std::string conv_dump = dirname_of(ref_path) + "/.moss-diarize-conv-stem.bin";
+            setenv("CRISPASR_MOSS_DIARIZE_DUMP_CONV", conv_dump.c_str(), 1);
         }
 
         // encoder_output + audio_embeds: full chunked pipeline
@@ -7840,7 +7877,8 @@ int main(int argc, char** argv) {
 
         // conv_stem_out: read dumped file and compare
         {
-            std::string conv_dump = "/mnt/volume1/tmp-overflow/moss_diarize_conv_stem.bin";
+            // Scratch file next to the reference, not a hardcoded machine path.
+            std::string conv_dump = dirname_of(ref_path) + "/.moss-diarize-conv-stem.bin";
             FILE* f = fopen(conv_dump.c_str(), "rb");
             if (f) {
                 fseek(f, 0, SEEK_END);

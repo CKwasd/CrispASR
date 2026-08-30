@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <string>
+#include "portable_env.h"
 
 namespace {
 

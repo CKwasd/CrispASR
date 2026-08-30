@@ -21,6 +21,7 @@
 
 #include <string>
 #include <vector>
+#include "portable_env.h"
 
 using core_ngram::fix_loops;
 

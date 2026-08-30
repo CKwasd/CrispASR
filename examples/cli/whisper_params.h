@@ -445,6 +445,7 @@ struct whisper_params {
     // CLI: --tts-phonemes "<IPA>"
     std::string tts_phonemes;
     bool tts_trim_silence = false;
+    int tts_pad_silence_ms = 0;
 
     // --make-ref: create a TADA voice reference GGUF from --voice <audio.wav>
     // + --ref-text "transcript". Requires tada-encoder.gguf + tada-aligner-*.gguf.

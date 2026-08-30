@@ -146,7 +146,7 @@ jobs:
   # "Adding a new backend"). Heavy backends (vibevoice 7 GB,
   # voxtral4b 4 GB) that don't fit reliably on the GitHub free-tier
   # 14 GB ubuntu-latest scratch should go through the weekly Kaggle
-  # full-sweep job (`tools/kaggle-regression.py`) instead.
+  # full-sweep job (`tools/test-all-backends.py` on a Kaggle kernel) instead.
   regression:
     if: github.event_name != 'pull_request'
     needs: preflight

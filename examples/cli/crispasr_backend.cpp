@@ -179,9 +179,9 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         name == "kartoffel-orpheus-synthetic" || name == "lex-au-orpheus-de" || name == "lex-au-orpheus")
         return crispasr_make_orpheus_backend();
     if (name == "chatterbox" || name == "chatterbox-tts" || name == "chatterbox-base" || name == "chatterbox-turbo" ||
-        name == "chatterbox_turbo" || name == "kartoffelbox" || name == "kartoffelbox-turbo" ||
-        name == "kartoffelbox_turbo" || name == "lahgtna" || name == "lahgtna-chatterbox" ||
-        name == "lahgtna-chatterbox-v1")
+        name == "chatterbox_turbo" || name == "chatterbox-nano" || name == "chatterbox_nano" ||
+        name == "kartoffelbox" || name == "kartoffelbox-turbo" || name == "kartoffelbox_turbo" || name == "lahgtna" ||
+        name == "lahgtna-chatterbox" || name == "lahgtna-chatterbox-v1")
         return crispasr_make_chatterbox_backend();
     if (name == "tada" || name == "tada-tts" || name == "tada-1b" || name == "tada-tts-1b" || name == "tada-3b" ||
         name == "tada-3b-ml")
@@ -342,6 +342,7 @@ std::vector<std::string> crispasr_list_backends() {
         "kartoffel-orpheus-de-synthetic",
         "chatterbox",
         "chatterbox-turbo",
+        "chatterbox-nano",
         "kartoffelbox-turbo",
         "lahgtna-chatterbox",
         "tada",

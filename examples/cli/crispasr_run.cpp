@@ -3661,6 +3661,16 @@ int crispasr_run_backend(const whisper_params& params_in) {
             }
         }
 
+        // Optional leading-silence padding. Useful to bypass VLC playback bugs
+        // where it drops the first ~1.5s of audio while parsing a large C2PA chunk.
+        if (params.tts_pad_silence_ms > 0) {
+            size_t pad_samples = (size_t)((double)params.tts_pad_silence_ms / 1000.0 * sr_in);
+            audio.insert(audio.begin(), pad_samples, 0.0f);
+            if (!params.no_prints)
+                fprintf(stderr, "crispasr: padded %.2fs of leading silence\n",
+                        (double)params.tts_pad_silence_ms / 1000.0);
+        }
+
         // Resolve the output path first so we can enforce the watertight floor
         // BEFORE embedding: if this container can't carry C2PA, --no-watermark is
         // overridden so the file is never fully unmarked.

@@ -21,6 +21,13 @@
 #include <process.h>
 #include <sys/stat.h>
 #include <windows.h>
+// MinGW's mkdir takes only a path — no mode — so the POSIX two-argument calls
+// below are a hard error there ("too many arguments to function
+// 'int mkdir(const char*)'"). Same shim src/crispasr_cache.cpp already carries
+// for exactly this reason; MSVC does not declare mkdir at all, so it needs it
+// too. Only build.yml's msbuild ALL_BUILD compiles the tests on Windows, which
+// is why this went unnoticed.
+#define mkdir(d, m) _mkdir(d)
 static std::string make_temp_dir() {
     char buf[MAX_PATH];
     GetTempPathA(MAX_PATH, buf);

@@ -1683,6 +1683,12 @@ impl Session {
         Ok(())
     }
 
+    /// Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs
+    /// where it drops the first ~1.5s of audio while parsing a large C2PA chunk.
+    pub fn set_tts_pad_silence_ms(&self, ms: i32) {
+        unsafe { crispasr_sys::crispasr_session_set_tts_pad_silence_ms(self.handle, ms as std::os::raw::c_int) };
+    }
+
     /// Select + load a punctuation-restoration model (`auto`/`firered`/`fullstop`/
     /// `punctuate-all`/`pcs`/path; `"none"`/`""` unloads). Auto-downloads on first use.
     pub fn set_punc_model(&self, punc_model: &str) -> Result<(), String> {
@@ -2709,6 +2715,22 @@ impl Default for DiarizeOptions {
     }
 }
 
+/// A speaker turn the diarizer derived from the AUDIO, independent of the
+/// caller's segment grid (#395).
+///
+/// Only [`DiarizeMethod::FoxNose`] produces these; the other methods label
+/// the caller's segments directly and yield none. `t0` / `t1` are seconds on
+/// the same absolute timeline as [`DiarizeSegment`] (i.e.
+/// [`DiarizeOptions::slice_t0`] is already accounted for), so a turn and a
+/// segment compare directly. `speaker` is dense and zero-based — a turn is
+/// always labelled, unlike a segment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DiarizeTurn {
+    pub t0: f64,
+    pub t1: f64,
+    pub speaker: i32,
+}
+
 /// Assign a speaker index to each of `segs`, mutating each
 /// [`DiarizeSegment::speaker`] in place.
 ///
@@ -2720,6 +2742,11 @@ impl Default for DiarizeOptions {
 /// Returns `Ok(())` on success. Only the model-backed methods
 /// ([`DiarizeMethod::Pyannote`], [`DiarizeMethod::FoxNose`]) can fail
 /// (model load failure).
+///
+/// Labelling alone can never resolve finer than the grid you pass in: a
+/// segment that straddles a speaker change is silently awarded to whoever
+/// holds the majority of it. Use [`diarize_segments_with_turns`] when you
+/// have word timings and want to split such a segment.
 pub fn diarize_segments(
     segs: &mut [DiarizeSegment],
     left: &[f32],
@@ -2727,8 +2754,40 @@ pub fn diarize_segments(
     is_stereo: bool,
     opts: &DiarizeOptions,
 ) -> Result<(), String> {
+    diarize_inner(segs, left, right, is_stereo, opts, false).map(|_| ())
+}
+
+/// Same as [`diarize_segments`], and additionally returns the speaker turns
+/// the method derived from the audio (#395).
+///
+/// The turns are what let a caller resolve a speaker change INSIDE one of its
+/// own segments — split a merged run wherever the turn id changes, instead of
+/// accepting the majority label for the whole span. Only
+/// [`DiarizeMethod::FoxNose`] derives turns; every other method returns an
+/// empty `Vec`, which is not an error.
+///
+/// The segments are labelled exactly as [`diarize_segments`] would label
+/// them; asking for turns changes nothing about the labels.
+pub fn diarize_segments_with_turns(
+    segs: &mut [DiarizeSegment],
+    left: &[f32],
+    right: Option<&[f32]>,
+    is_stereo: bool,
+    opts: &DiarizeOptions,
+) -> Result<Vec<DiarizeTurn>, String> {
+    diarize_inner(segs, left, right, is_stereo, opts, true)
+}
+
+fn diarize_inner(
+    segs: &mut [DiarizeSegment],
+    left: &[f32],
+    right: Option<&[f32]>,
+    is_stereo: bool,
+    opts: &DiarizeOptions,
+    want_turns: bool,
+) -> Result<Vec<DiarizeTurn>, String> {
     if segs.is_empty() || left.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let path_c = match (&opts.pyannote_model_path, opts.method) {
@@ -2779,26 +2838,95 @@ pub fn diarize_segments(
         _ => left.as_ptr(),
     };
 
-    let rc = unsafe {
-        crispasr_sys::crispasr_diarize_segments_abi(
-            left.as_ptr(),
-            right_ptr,
-            left.len() as i32,
-            if is_stereo { 1 } else { 0 },
-            abi_segs.as_mut_ptr(),
-            abi_segs.len() as i32,
-            &abi_opts,
-        )
-    };
+    if !want_turns {
+        let rc = unsafe {
+            crispasr_sys::crispasr_diarize_segments_abi(
+                left.as_ptr(),
+                right_ptr,
+                left.len() as i32,
+                if is_stereo { 1 } else { 0 },
+                abi_segs.as_mut_ptr(),
+                abi_segs.len() as i32,
+                &abi_opts,
+            )
+        };
+        return finish(rc, segs, &abi_segs, &[], 0).map(|_| Vec::new());
+    }
+
+    // The ABI keeps no state between calls, so a buffer that turns out to be
+    // too small costs a SECOND full diarization pass. Size the first attempt
+    // so that can't happen: turns are merged embedding windows, the hop is
+    // 0.6 s, and no turn is shorter than one hop — so one slot per 0.5 s of
+    // audio (plus one per segment, plus slack) is comfortably above the
+    // ceiling. The retry below is the belt to that pair of braces.
+    let mut cap = (left.len() as f64 / 16_000.0 / 0.5).ceil() as usize + segs.len() + 16;
+    let mut turns: Vec<crispasr_sys::CrispasrDiarizeTurnAbi> = Vec::new();
+    for attempt in 0..2 {
+        turns.clear();
+        turns.resize(
+            cap,
+            crispasr_sys::CrispasrDiarizeTurnAbi {
+                t0_cs: 0,
+                t1_cs: 0,
+                speaker: -1,
+                _pad: 0,
+            },
+        );
+        let mut n_turns: i32 = 0;
+        let rc = unsafe {
+            crispasr_sys::crispasr_diarize_segments_turns_abi(
+                left.as_ptr(),
+                right_ptr,
+                left.len() as i32,
+                if is_stereo { 1 } else { 0 },
+                abi_segs.as_mut_ptr(),
+                abi_segs.len() as i32,
+                &abi_opts,
+                turns.as_mut_ptr(),
+                cap as i32,
+                &mut n_turns,
+            )
+        };
+        // rc 2 = the buffer was short; n_turns is the required capacity.
+        if rc == 2 && attempt == 0 {
+            cap = n_turns.max(1) as usize;
+            continue;
+        }
+        return finish(rc, segs, &abi_segs, &turns, n_turns);
+    }
+    unreachable!("the retry loop returns on its second pass")
+}
+
+/// Shared tail of both diarize entry points: map the ABI return code, copy the
+/// labels back, and convert the turns out of centiseconds.
+fn finish(
+    rc: i32,
+    segs: &mut [DiarizeSegment],
+    abi_segs: &[crispasr_sys::CrispasrDiarizeSegAbi],
+    abi_turns: &[crispasr_sys::CrispasrDiarizeTurnAbi],
+    n_turns: i32,
+) -> Result<Vec<DiarizeTurn>, String> {
     match rc {
         0 => {
             for (i, s) in segs.iter_mut().enumerate() {
                 s.speaker = abi_segs[i].speaker;
             }
-            Ok(())
+            let n = (n_turns.max(0) as usize).min(abi_turns.len());
+            Ok(abi_turns[..n]
+                .iter()
+                .map(|t| DiarizeTurn {
+                    t0: t.t0_cs as f64 / 100.0,
+                    t1: t.t1_cs as f64 / 100.0,
+                    speaker: t.speaker,
+                })
+                .collect())
         }
         1 => Err("diarize model load failed (pyannote / foxnose embedder)".to_string()),
         -1 => Err("invalid arguments to crispasr_diarize_segments_abi".to_string()),
+        2 => Err(format!(
+            "diarize turn buffer too small — {n_turns} turns needed; this is a \
+             crispasr bug, please report it with the audio length and segment count"
+        )),
         other => Err(format!("crispasr_diarize_segments_abi returned {other}")),
     }
 }

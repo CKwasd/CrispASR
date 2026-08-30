@@ -6,6 +6,7 @@
 // Phase 4: Full forward + overlap-add chunking.
 
 #include "htdemucs.h"
+#include "htdemucs_ggml_util.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -3819,10 +3820,12 @@ static ggml_tensor* g_dconv_groupnorm(ggml_context* g, ggml_tensor* x, ggml_tens
                                       float eps) {
     ggml_tensor* p = ggml_cont(g, ggml_permute(g, x, 0, 2, 1, 3)); // (T, C, Fq)
     p = ggml_group_norm(g, p, n_bands, eps);
+    // The affine weights here are the issue-#398 offenders: the F16 GGUF
+    // stores `*.dconv.layers.N.4.weight` as F16 (see htdemucs_ggml_util.h).
     if (w)
-        p = ggml_mul(g, p, ggml_reshape_3d(g, w, 1, (int)w->ne[0], 1));
+        p = ggml_mul(g, p, ggml_reshape_3d(g, htd_bcast_f32(g, w), 1, (int)w->ne[0], 1));
     if (b)
-        p = ggml_add(g, p, ggml_reshape_3d(g, b, 1, (int)b->ne[0], 1));
+        p = ggml_add(g, p, ggml_reshape_3d(g, htd_bcast_f32(g, b), 1, (int)b->ne[0], 1));
     return ggml_cont(g, ggml_permute(g, p, 0, 2, 1, 3)); // back to (T, Fq, C)
 }
 
@@ -3849,7 +3852,7 @@ static ggml_tensor* g_dconv(ggml_context* g, ggml_tensor* x, const htdemucs_dcon
         ggml_tensor* w1 = ggml_reshape_4d(g, sl.conv1_w, K, 1, C, hidden);
         ggml_tensor* h = ggml_conv_2d(g, w1, x, 1, 1, dilation * (K / 2), 0, dilation, 1);
         if (sl.conv1_b)
-            h = ggml_add(g, h, ggml_reshape_3d(g, sl.conv1_b, 1, 1, hidden));
+            h = ggml_add(g, h, ggml_reshape_3d(g, htd_bcast_f32(g, sl.conv1_b), 1, 1, hidden));
         if (sl.norm1_w)
             h = g_dconv_groupnorm(g, h, sl.norm1_w, sl.norm1_b, n_bands, 1e-5f);
         h = ggml_gelu(g, h);
@@ -3858,13 +3861,13 @@ static ggml_tensor* g_dconv(ggml_context* g, ggml_tensor* x, const htdemucs_dcon
         ggml_tensor* w2 = ggml_reshape_4d(g, sl.conv2_w, 1, 1, hidden, out2C);
         ggml_tensor* h2 = ggml_conv_2d(g, w2, h, 1, 1, 0, 0, 1, 1);
         if (sl.conv2_b)
-            h2 = ggml_add(g, h2, ggml_reshape_3d(g, sl.conv2_b, 1, 1, out2C));
+            h2 = ggml_add(g, h2, ggml_reshape_3d(g, htd_bcast_f32(g, sl.conv2_b), 1, 1, out2C));
         if (sl.norm2_w)
             h2 = g_dconv_groupnorm(g, h2, sl.norm2_w, sl.norm2_b, n_bands, 1e-5f);
 
         ggml_tensor* y = g_glu_c(g, h2);
         if (sl.scale)
-            y = ggml_mul(g, y, ggml_reshape_3d(g, sl.scale, 1, 1, (int)sl.scale->ne[0]));
+            y = ggml_mul(g, y, ggml_reshape_3d(g, htd_bcast_f32(g, sl.scale), 1, 1, (int)sl.scale->ne[0]));
         x = ggml_add(g, x, y);
     }
     return x;
@@ -3891,7 +3894,7 @@ static bool htdemucs_enc_freq_ggml(htdemucs_context* ctx, const htdemucs_enc_lay
     ggml_tensor* x = ggml_conv_2d(g, enc.conv_w, X, 1, stride, 0, pad, 1, 1);
     const int OC = (int)enc.conv_w->ne[3];
     if (enc.conv_b)
-        x = ggml_add(g, x, ggml_reshape_3d(g, enc.conv_b, 1, 1, OC));
+        x = ggml_add(g, x, ggml_reshape_3d(g, htd_bcast_f32(g, enc.conv_b), 1, 1, OC));
 
     ggml_tensor* INJ = nullptr;
     if (inject) {
@@ -3926,7 +3929,8 @@ static bool htdemucs_enc_freq_ggml(htdemucs_context* ctx, const htdemucs_enc_lay
         if (enc.rewrite_w) {
             ggml_tensor* rw = ggml_conv_2d(g, enc.rewrite_w, x, 1, 1, 0, 0, 1, 1);
             if (enc.rewrite_b)
-                rw = ggml_add(g, rw, ggml_reshape_3d(g, enc.rewrite_b, 1, 1, (int)enc.rewrite_w->ne[3]));
+                rw = ggml_add(g, rw,
+                              ggml_reshape_3d(g, htd_bcast_f32(g, enc.rewrite_b), 1, 1, (int)enc.rewrite_w->ne[3]));
             x = g_glu_c(g, rw);
         }
         if (cap0) {
@@ -4016,7 +4020,8 @@ static bool htdemucs_dec_freq_ggml(htdemucs_context* ctx, const htdemucs_dec_lay
             // 3x3 Conv2d with context padding on the freq axis.
             ggml_tensor* rw = ggml_conv_2d(g, dec.rewrite_w, y, 1, 1, 1, 1, 1, 1);
             if (dec.rewrite_b)
-                rw = ggml_add(g, rw, ggml_reshape_3d(g, dec.rewrite_b, 1, 1, (int)dec.rewrite_w->ne[3]));
+                rw = ggml_add(g, rw,
+                              ggml_reshape_3d(g, htd_bcast_f32(g, dec.rewrite_b), 1, 1, (int)dec.rewrite_w->ne[3]));
             y = g_glu_c(g, rw);
         }
         if (!dec.dconv.layers.empty())
@@ -4044,7 +4049,7 @@ static bool htdemucs_dec_freq_ggml(htdemucs_context* ctx, const htdemucs_dec_lay
                        (size_t)x_T * fq_raw * ct_OC * sizeof(float), (size_t)kh * x_T * sizeof(float));
     }
     if (dec.conv_tr_b)
-        acc = ggml_add(g, acc, ggml_reshape_3d(g, dec.conv_tr_b, 1, 1, ct_OC));
+        acc = ggml_add(g, acc, ggml_reshape_3d(g, htd_bcast_f32(g, dec.conv_tr_b), 1, 1, ct_OC));
 
     // Crop `pad` frequency rows from each side: z[..., pad:-pad, :].
     const int fq_out = fq_raw - 2 * pad;
@@ -4123,9 +4128,9 @@ static bool htdemucs_dec_freq_ggml(htdemucs_context* ctx, const htdemucs_dec_lay
 static ggml_tensor* g_layernorm(ggml_context* g, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, float eps) {
     ggml_tensor* y = ggml_norm(g, x, eps);
     if (w)
-        y = ggml_mul(g, y, ggml_reshape_2d(g, w, (int)w->ne[0], 1));
+        y = ggml_mul(g, y, ggml_reshape_2d(g, htd_bcast_f32(g, w), (int)w->ne[0], 1));
     if (b)
-        y = ggml_add(g, y, ggml_reshape_2d(g, b, (int)b->ne[0], 1));
+        y = ggml_add(g, y, ggml_reshape_2d(g, htd_bcast_f32(g, b), (int)b->ne[0], 1));
     return y;
 }
 
@@ -4139,9 +4144,9 @@ static ggml_tensor* g_groupnorm1(ggml_context* g, ggml_tensor* x, ggml_tensor* w
     flat = ggml_group_norm(g, flat, 1, eps);
     ggml_tensor* y = ggml_reshape_2d(g, flat, dim, seq);
     if (w)
-        y = ggml_mul(g, y, ggml_reshape_2d(g, w, dim, 1));
+        y = ggml_mul(g, y, ggml_reshape_2d(g, htd_bcast_f32(g, w), dim, 1));
     if (b)
-        y = ggml_add(g, y, ggml_reshape_2d(g, b, dim, 1));
+        y = ggml_add(g, y, ggml_reshape_2d(g, htd_bcast_f32(g, b), dim, 1));
     return y;
 }
 
@@ -4165,14 +4170,14 @@ static ggml_tensor* g_mha(ggml_context* g, ggml_tensor* Q, ggml_tensor* K, ggml_
 static ggml_tensor* g_linear(ggml_context* g, ggml_tensor* w, ggml_tensor* b, ggml_tensor* x) {
     ggml_tensor* y = ggml_mul_mat(g, w, x);
     if (b)
-        y = ggml_add(g, y, ggml_reshape_2d(g, b, (int)b->ne[0], 1));
+        y = ggml_add(g, y, ggml_reshape_2d(g, htd_bcast_f32(g, b), (int)b->ne[0], 1));
     return y;
 }
 
 // x = x + gamma * y   (LayerScale is per-channel)
 static ggml_tensor* g_layerscale_add(ggml_context* g, ggml_tensor* x, ggml_tensor* y, ggml_tensor* gamma, int dim) {
     if (gamma)
-        y = ggml_mul(g, y, ggml_reshape_2d(g, gamma, dim, 1));
+        y = ggml_mul(g, y, ggml_reshape_2d(g, htd_bcast_f32(g, gamma), dim, 1));
     return ggml_add(g, x, y);
 }
 
@@ -4219,9 +4224,13 @@ static ggml_tensor* g_cross_attn_layer(ggml_context* g, ggml_tensor* x, ggml_ten
     if (ca.cross_attn_in_proj_b) {
         ggml_tensor* b = ca.cross_attn_in_proj_b;
         const size_t es = ggml_element_size(b);
-        Q = ggml_add(g, Q, ggml_reshape_2d(g, ggml_cont(g, ggml_view_1d(g, b, dim, 0)), dim, 1));
-        K = ggml_add(g, K, ggml_reshape_2d(g, ggml_cont(g, ggml_view_1d(g, b, dim, (size_t)dim * es)), dim, 1));
-        V = ggml_add(g, V, ggml_reshape_2d(g, ggml_cont(g, ggml_view_1d(g, b, dim, (size_t)2 * dim * es)), dim, 1));
+        Q = ggml_add(g, Q, ggml_reshape_2d(g, htd_bcast_f32(g, ggml_cont(g, ggml_view_1d(g, b, dim, 0))), dim, 1));
+        K = ggml_add(
+            g, K,
+            ggml_reshape_2d(g, htd_bcast_f32(g, ggml_cont(g, ggml_view_1d(g, b, dim, (size_t)dim * es))), dim, 1));
+        V = ggml_add(
+            g, V,
+            ggml_reshape_2d(g, htd_bcast_f32(g, ggml_cont(g, ggml_view_1d(g, b, dim, (size_t)2 * dim * es))), dim, 1));
     }
 
     ggml_tensor* att = g_mha(g, Q, K, V, dim, n_heads, q_seq, k_seq);
@@ -4520,7 +4529,7 @@ static bool htdemucs_fused_ggml(htdemucs_context* ctx, std::vector<float>& x_buf
 
         x = ggml_conv_2d(g, enc.conv_w, x, 1, stri, 0, pad_val, 1, 1);
         if (enc.conv_b)
-            x = ggml_add(g, x, ggml_reshape_3d(g, enc.conv_b, 1, 1, (int)enc.conv_w->ne[3]));
+            x = ggml_add(g, x, ggml_reshape_3d(g, htd_bcast_f32(g, enc.conv_b), 1, 1, (int)enc.conv_w->ne[3]));
         const int nb = (int)x->ne[1];
         if (!enc.empty) {
             x = ggml_gelu(g, x);
@@ -4529,7 +4538,8 @@ static bool htdemucs_fused_ggml(htdemucs_context* ctx, std::vector<float>& x_buf
             if (enc.rewrite_w) {
                 ggml_tensor* rw = ggml_conv_2d(g, enc.rewrite_w, x, 1, 1, 0, 0, 1, 1);
                 if (enc.rewrite_b)
-                    rw = ggml_add(g, rw, ggml_reshape_3d(g, enc.rewrite_b, 1, 1, (int)enc.rewrite_w->ne[3]));
+                    rw = ggml_add(g, rw,
+                                  ggml_reshape_3d(g, htd_bcast_f32(g, enc.rewrite_b), 1, 1, (int)enc.rewrite_w->ne[3]));
                 x = g_glu_c(g, rw);
             }
         }
@@ -4619,7 +4629,8 @@ static bool htdemucs_fused_ggml(htdemucs_context* ctx, std::vector<float>& x_buf
             if (dec.rewrite_w) {
                 ggml_tensor* rw = ggml_conv_2d(g, dec.rewrite_w, y, 1, 1, hp.context, hp.context, 1, 1);
                 if (dec.rewrite_b)
-                    rw = ggml_add(g, rw, ggml_reshape_3d(g, dec.rewrite_b, 1, 1, (int)dec.rewrite_w->ne[3]));
+                    rw = ggml_add(g, rw,
+                                  ggml_reshape_3d(g, htd_bcast_f32(g, dec.rewrite_b), 1, 1, (int)dec.rewrite_w->ne[3]));
                 y = g_glu_c(g, rw);
             }
             if (!dec.dconv.layers.empty())
@@ -4644,7 +4655,7 @@ static bool htdemucs_fused_ggml(htdemucs_context* ctx, std::vector<float>& x_buf
                            (size_t)x_T * fq_raw * ct_OC * sizeof(float), (size_t)kh * x_T * sizeof(float));
         }
         if (dec.conv_tr_b)
-            acc = ggml_add(g, acc, ggml_reshape_3d(g, dec.conv_tr_b, 1, 1, ct_OC));
+            acc = ggml_add(g, acc, ggml_reshape_3d(g, htd_bcast_f32(g, dec.conv_tr_b), 1, 1, ct_OC));
         x = ggml_cont(g, ggml_view_3d(g, acc, x_T, fq_raw - 2 * pad, ct_OC, acc->nb[1], acc->nb[2],
                                       (size_t)pad * x_T * sizeof(float)));
         if (idx != hp.depth - 1)

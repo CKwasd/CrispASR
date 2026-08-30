@@ -364,9 +364,17 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
     // (70ms/step vs 587ms with F32 dequant or 2600ms with per-call CUDA graphs).
     // The encoder uses ggml_backend_sched which auto-copies CPU weights to GPU.
     ctx->backend_cpu = core_cpu_backend::init();
-    ctx->backend = params.use_gpu ? crispasr_init_gpu_backend() : ctx->backend_cpu;
-    if (!ctx->backend || core_cpu_backend::is_cpu(ctx->backend))
-        ctx->backend = ctx->backend_cpu;
+    // crispasr_init_gpu_backend() falls back to ggml_backend_init_best(), which
+    // on a GPU-less host hands back a CPU backend — a SEPARATE instance from
+    // backend_cpu above. Overwriting the pointer without freeing it leaked one
+    // ggml backend per init (152 bytes; ASan caught it once the sanitizer job
+    // stopped being a no-op). Free it before choosing, so nothing dangles.
+    ggml_backend_t gpu = params.use_gpu ? crispasr_init_gpu_backend() : nullptr;
+    if (gpu && core_cpu_backend::is_cpu(gpu)) {
+        ggml_backend_free(gpu);
+        gpu = nullptr;
+    }
+    ctx->backend = gpu ? gpu : ctx->backend_cpu;
     if (params.verbosity >= 1)
         fprintf(stderr, "firered_asr: backend ready (compute=%s, weights=CPU)\n",
                 core_cpu_backend::is_cpu(ctx->backend) ? "CPU" : "GPU");
@@ -393,7 +401,7 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
         gguf_context* gctx = core_gguf::open_metadata(path_model);
         if (!gctx) {
             fprintf(stderr, "firered_asr: failed to open '%s'\n", path_model);
-            delete ctx;
+            firered_asr_free(ctx); // frees the backends this ctx already owns
             return nullptr;
         }
         hp.d_model = core_gguf::kv_u32(gctx, "firered.d_model", hp.d_model);
@@ -457,7 +465,7 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
                 : core_gguf::load_weights(path_model, ctx->backend_cpu, "firered_asr", wl);
     if (!loaded) {
         fprintf(stderr, "firered_asr: failed to load weights from '%s'\n", path_model);
-        delete ctx;
+        firered_asr_free(ctx); // frees the backends this ctx already owns
         return nullptr;
     }
     m.ctx = wl.ctx;

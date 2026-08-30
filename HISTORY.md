@@ -6,6 +6,56 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #398 htdemucs GPU path aborted in ggml-cuda binbcast — F32-cast broadcast weights, fixed 2026-08-29
+
+The first `/v1/audio/separation` under `CRISPASR_HTDEMUCS_GGML=1` +
+`CRISPASR_HTDEMUCS_GPU=1` hard-aborted the server:
+`ggml-cuda/binbcast.cu:293: GGML_ASSERT(nb10 % sizeof(src1_t) == 0)`. Root
+cause: the F16 GGUF ships sixteen 1-D F16 DConv GroupNorm affines
+(`*.dconv.layers.N.4.weight`, 384/768 elements — a bare nn.Sequential index,
+so the converter's ".norm"/".bias"/"scale"/size<256 keep-F32 rules all missed
+them), and the per-layer encoder/decoder graphs fed them as src1 of broadcast
+`ggml_mul`/`ggml_add`. ggml's binary-broadcast family supports F32⊙F32 but not
+F32⊙F16 on ANY backend — CUDA asserts on the stride, the CPU graph path aborts
+with `binary-ops.cpp:135: unsupported types` (the legacy CPU/BLAS path
+converts per element, which is why only GPU users saw it; quantized files
+inherit the F16 tensors verbatim, hence q8_0 crashing identically). The
+CrossTransformer-only graph that had been verified 45/45 has no such tensors;
+the enc/dec graphs added later inherited that claim without re-running it.
+
+Fix: `htd_bcast_f32()` (src/htdemucs_ggml_util.h) casts any non-F32 weight to
+F32 in-graph at every broadcast site; pre-fix graph reachable via
+`CRISPASR_HTDEMUCS_NO_BCAST_CAST=1`; the converter now keeps all 1-D tensors
+F32; `htd_first_bad_binbcast()` walks a built graph for the whole defect class
+and anchors the hermetic unit test (tests/test-htdemucs-binbcast.cpp). Proof
+on a Kaggle P100 (`chr1s4/crispasr-issue398-htdemucs-cuda`, single build,
+gate-off as the repro arm): repro rc=134 with the exact binbcast assert and 0
+stems; fix writes 4 stems for f16 AND q8_0; per-stem parity vs the CPU/BLAS
+reference cos 0.9997–1.000000 with |gpu|/|cpu| magnitude ratio 1.000. Local
+VPS: full unit suite 1742/1742; CPU ggml-vs-BLAS stems cos 0.996–1.000000,
+ratio ≈1.000 (drums/bass at the F16 noise floor of near-silent stems).
+
+## #402 chatterbox-turbo/Nano Vulkan T3 flash_attn_ext crash — naive-attention default on Vulkan, fixed 2026-08-29
+
+On AMD Radeon 780M / RADV, forcing the GPT-2 T3 onto Vulkan
+(`CRISPASR_CHATTERBOX_T3_GPU=1`) crashed in the Vulkan `FLASH_ATTN_EXT`
+pipeline for both F16 and Q4_K weights, while the reporter's A/B showed the
+explicit softmax(QK^T)V path (`CRISPASR_CHATTERBOX_NAIVE_ATTN=1`) completing a
+full 431-step synthesis with plausible first-divergence-at-step-3 float
+ordering vs CPU. With no RADV hardware to bisect the shader, the fix is the
+policy the evidence supports: `chatterbox_attn_policy.h` makes naive attention
+the default whenever the T3 backend is Vulkan; `CRISPASR_CHATTERBOX_FLASH_ATTN=1`
+opts back in for fixed drivers, and the pre-existing `..._NAIVE_ATTN=1` debug
+gate outranks both. The decision table is a weight-free header with a hermetic
+unit test (`tests/test-chatterbox-attn-policy.cpp`) because on non-RADV boxes
+both paths sound identical — a wrong default is invisible to numeric checks.
+Kaggle proof on a Tesla P100 Vulkan ICD (`chr1str/crispasr-issue402-t3-vulkan`):
+the load log prints `T3 GPT-2 attention = naive softmax(QK^T)V (backend
+Vulkan0)`, and the default, flash-opt-in, and CPU arms all round-trip
+"The quick brown fox jumps over the lazy dog." through whisper-tiny at word
+overlap 1.0 (NVIDIA's Vulkan doesn't crash — consistent with a RADV-specific
+pipeline bug, which the opt-in gate leaves reachable for retesting).
+
 ## #383 Nemotron `/v1/realtime` progressive lag — native streaming + VAD, fixed 2026-08-27
 
 The realtime JSON WebSocket re-ran ASR over the entire growing turn every 0.5

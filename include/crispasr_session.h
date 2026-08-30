@@ -39,6 +39,8 @@ struct crispasr_diarize_opts_abi;
 typedef struct crispasr_diarize_opts_abi crispasr_diarize_opts_abi;
 struct crispasr_diarize_seg_abi;
 typedef struct crispasr_diarize_seg_abi crispasr_diarize_seg_abi;
+struct crispasr_diarize_turn_abi;
+typedef struct crispasr_diarize_turn_abi crispasr_diarize_turn_abi;
 struct crispasr_open_params_v1;
 typedef struct crispasr_open_params_v1 crispasr_open_params_v1;
 struct crispasr_session;
@@ -282,6 +284,35 @@ CRISPASR_SESSION_API crispasr_session_result* crispasr_session_transcribe_vad(
 CRISPASR_SESSION_API int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm, int32_t n_samples,
                                                        int32_t is_stereo, crispasr_diarize_seg_abi* segs,
                                                        int32_t n_segs, const crispasr_diarize_opts_abi* opts);
+// 0.8.30+ (issue #395): diarize AND hand back the speaker turns the method
+// derived from the audio, so a caller can split one of its own segments that
+// spans a speaker change — labelling alone can never resolve finer than the
+// segment grid the caller sent in. Only FoxNose (method 4) derives turns; the
+// other methods report 0, which is not an error.
+//
+// A NEW SYMBOL rather than a signature change, so the existing ABI stays
+// stable (same append-only convention as crispasr_diarize_opts_abi).
+// `out_turns == NULL, n_turns_cap == 0, out_n_turns == NULL` behaves exactly
+// like crispasr_diarize_segments_abi.
+//
+// `out_n_turns`, when non-NULL, always receives the TOTAL turn count — also
+// when it exceeds n_turns_cap, so a caller can size and retry (at the cost of
+// a second full pass: the ABI keeps no state between calls). `out_turns`,
+// when non-NULL, receives up to n_turns_cap turns.
+//
+// Turn timestamps are centiseconds on the SAME absolute timeline as
+// crispasr_diarize_seg_abi (i.e. `opts->slice_t0_cs` is already added back),
+// so turns and caller segments compare directly.
+//
+// Returns 0 on success, 2 when a turn buffer was given and could not hold
+// every turn (the segments are still fully labelled and the first n_turns_cap
+// turns are still written), 1 on model load failure, -1 on invalid arguments.
+CRISPASR_SESSION_API int crispasr_diarize_segments_turns_abi(const float* left_pcm, const float* right_pcm,
+                                                             int32_t n_samples, int32_t is_stereo,
+                                                             crispasr_diarize_seg_abi* segs, int32_t n_segs,
+                                                             const crispasr_diarize_opts_abi* opts,
+                                                             crispasr_diarize_turn_abi* out_turns, int32_t n_turns_cap,
+                                                             int32_t* out_n_turns);
 CRISPASR_SESSION_API int crispasr_detect_language_pcm(const float* samples, int32_t n_samples, int32_t method,
                                                       const char* model_path, int32_t n_threads, int32_t use_gpu,
                                                       int32_t gpu_device, int32_t flash_attn, char* out_lang_buf,
@@ -398,8 +429,13 @@ CRISPASR_SESSION_API int crispasr_session_set_instruct(crispasr_session* s, cons
 // seam between text processing and the acoustic model. Use it to reproduce
 // another implementation's pronunciation exactly, or to separate "the G2P is
 // wrong" from "the model is wrong". Empty clears. Returns -2 (soft no-op) when
-// the active backend exposes no phonemes-in call; kokoro and piper do.
+// phonemes-in call; kokoro and piper do.
 CRISPASR_SESSION_API int crispasr_session_set_tts_phonemes(crispasr_session* s, const char* phonemes);
+
+// Pad N ms of silence at the beginning of TTS output. Useful to bypass VLC playback bugs
+// where it drops the first ~1.5s of audio while parsing a large C2PA chunk.
+CRISPASR_SESSION_API void crispasr_session_set_tts_pad_silence_ms(crispasr_session* s, int ms);
+
 CRISPASR_SESSION_API int crispasr_session_is_custom_voice(crispasr_session* s);
 CRISPASR_SESSION_API int crispasr_session_is_voice_design(crispasr_session* s);
 // UNMARKED synthesis — hard-refused unless crispasr_session_accept_marking_responsibility() was called first.

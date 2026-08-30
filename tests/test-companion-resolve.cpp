@@ -159,7 +159,17 @@ TEST_CASE("companion: empty cache_dir means companion not found", "[unit][compan
     CrispasrRegistryEntry entry;
     REQUIRE(crispasr_registry_lookup("mimo-asr", entry));
 
-    const std::string found = crispasr_cache::probe_cached_file(entry.companion_filename, cache_dir);
+    // Probe for a name that CANNOT be on this machine, not the real companion.
+    // probe_cached_file searches more than the directory it is handed — the
+    // CRISPASR_MODELS_DIR env var, the platform default cache and other
+    // well-known model locations. So asking for the genuine
+    // companion asserts "this developer has never downloaded mimo-asr", which
+    // is not the contract under test and fails on any populated machine (it
+    // passes in CI only because a runner's cache is empty). The contract is
+    // "an empty cache_dir yields no hit", and a unique suffix tests exactly
+    // that, on every machine.
+    const std::string absent = std::string(entry.companion_filename) + ".absent-9d3f1c07";
+    const std::string found = crispasr_cache::probe_cached_file(absent, cache_dir);
     REQUIRE(found.empty());
 
     remove_dir(cache_dir);

@@ -37,6 +37,9 @@
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "core/dac_decoder.h" // core_dac::fastconv_cache (FASTCONV kernel bake)
+#include "core/cpu_ops.h"     // core_cpu::to_f32 (SIMDCONV load-time pack)
+#include "core/cosyvoice3_hift_simdconv.h"
+#include "core/hift_simdconv.h"
 #include "core/audio_resample.h"
 #include "core/fft.h"
 #include "core/mel.h"
@@ -313,6 +316,12 @@ struct cv3_hift_resblock {
     ggml_tensor* c2_b[3] = {nullptr, nullptr, nullptr};
     ggml_tensor* a1_alpha[3] = {nullptr, nullptr, nullptr};
     ggml_tensor* a2_alpha[3] = {nullptr, nullptr, nullptr};
+
+    // SIMDCONV: CPU-only, load-time packed output-channel SIMD kernels.
+    // c1[j] carries dilation {1,3,5}; c2[j] is always dilation 1. The
+    // original ggml tensors stay bound above for the default/GPU fallback.
+    core_cv3_hift_simdconv::PackedConv c1_simd[3];
+    core_cv3_hift_simdconv::PackedConv c2_simd[3];
 };
 
 // Qwen2 BPE vocab loaded from the LLM GGUF's
@@ -383,6 +392,11 @@ struct cv3_hift {
     // FASTCONV: baked F32 copies of the F16 hift conv kernels (cast-kill).
     // Owns its own ctx+buffer; freed in cosyvoice3_tts_free before the backend.
     core_dac::fastconv_cache hift_fc;
+
+    // SIMDCONV is deliberately opt-in: it changes the reduction tree versus
+    // ggml_conv_1d, so PCM is expected to be numerically close but not hash-equal.
+    // Enabled only when HiFT itself is resident/dispatched on the CPU.
+    bool simdconv_enabled = false;
 };
 
 } // namespace
@@ -3978,8 +3992,44 @@ ggml_tensor* cv3_nearest_upsample_t(ggml_context* ctx, ggml_tensor* x, int scale
     return ggml_reshape_2d(ctx, y, T * scale, C);
 }
 
-// HiFT main ResBlock forward. 3 sub-blocks (snake1 → c1@dil → snake2 → c2 → residual).
-// x (T, C). Returns (T, C). c1 uses per-sub-block dilation; c2 always dilation=1.
+// Model-specific ResBlock logic; layout conversion + custom Conv1d execution
+// live in core_hift_simdconv and are shared with Chatterbox S3Gen.
+ggml_tensor* cv3_hift_simd_to_tm(ggml_context* ctx, ggml_tensor* x) {
+    return core_hift_simdconv::to_time_major(ctx, x);
+}
+
+ggml_tensor* cv3_hift_simd_from_tm(ggml_context* ctx, ggml_tensor* x_tm) {
+    return core_hift_simdconv::from_time_major(ctx, x_tm);
+}
+
+// Snake on ne=(C,T): alpha is (C,1), broadcast over time. Keeping Snake in
+// the island avoids four extra layout conversions per sub-block.
+ggml_tensor* cv3_snake_tm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* alpha) {
+    ggml_tensor* a = ggml_reshape_2d(ctx, alpha, (int)alpha->ne[0], 1);
+    ggml_tensor* ax = ggml_mul(ctx, x, a);
+    ggml_tensor* s = ggml_sin(ctx, ax);
+    ggml_tensor* s2 = ggml_mul(ctx, s, s);
+    ggml_tensor* a_safe = ggml_scale_bias(ctx, a, 1.0f, 1e-9f);
+    return ggml_add(ctx, x, ggml_div(ctx, s2, a_safe));
+}
+
+// SIMDCONV ResBlock consumes/returns the time-major island ne=(C,T). Dilation
+// is part of each load-time PackedConv, so the custom op has no ephemeral
+// userdata and the graph may safely outlive this builder call.
+ggml_tensor* cv3_hift_resblock_fwd_simd_tm(ggml_context* ctx, ggml_tensor* x, const cv3_hift_resblock& rb,
+                                           int n_threads) {
+    for (int j = 0; j < 3; j++) {
+        ggml_tensor* xt = cv3_snake_tm(ctx, x, rb.a1_alpha[j]);
+        xt = core_hift_simdconv::conv_tm(ctx, xt, rb.c1_simd[j], n_threads);
+        xt = cv3_snake_tm(ctx, xt, rb.a2_alpha[j]);
+        xt = core_hift_simdconv::conv_tm(ctx, xt, rb.c2_simd[j], n_threads);
+        x = ggml_add(ctx, x, xt);
+    }
+    return x;
+}
+
+// Default/GPU fallback ResBlock. 3 sub-blocks
+// (snake1 → c1@dil → snake2 → c2 → residual). x (T,C), T contiguous.
 ggml_tensor* cv3_hift_resblock_fwd(ggml_context* ctx, ggml_tensor* x, const cv3_hift_resblock& rb,
                                    const int dilations[3]) {
     for (int j = 0; j < 3; j++) {
@@ -4380,8 +4430,16 @@ ggml_cgraph* cv3_build_hift_decode_graph(cosyvoice3_tts_context* ctx, int T_mel)
             // CausalConv1d k=1 left-pad 0 — degenerate, no padding needed.
             si = cv3_causal_conv1d(ctx0, s_stft, h.src_down_w[i], h.src_down_b[i]);
         }
-        // Source resblock (single ResBlock per stage).
-        si = cv3_hift_resblock_fwd(ctx0, si, h.src_resblocks[i], dilations);
+        // Source resblock (single ResBlock per stage). SIMDCONV pays one
+        // channel-major -> time-major -> channel-major island per stage, not
+        // one conversion per convolution.
+        if (h.simdconv_enabled) {
+            ggml_tensor* si_tm = cv3_hift_simd_to_tm(ctx0, si);
+            si_tm = cv3_hift_resblock_fwd_simd_tm(ctx0, si_tm, h.src_resblocks[i], ctx->n_threads);
+            si = cv3_hift_simd_from_tm(ctx0, si_tm);
+        } else {
+            si = cv3_hift_resblock_fwd(ctx0, si, h.src_resblocks[i], dilations);
+        }
         (void)src_rb_kernels; // kernels are baked into the loaded weights
         // Align T (defensive — the dim math should already match).
         {
@@ -4397,17 +4455,29 @@ ggml_cgraph* cv3_build_hift_decode_graph(cosyvoice3_tts_context* ctx, int T_mel)
         }
         x = ggml_add(ctx0, x, si);
 
-        // Main resblock fusion: 3 ResBlocks (kernel ∈ {3,7,11}), each applied
-        // INDEPENDENTLY to the same x, outputs averaged: x = mean_j rb_j(x).
-        ggml_tensor* xs = nullptr;
-        ggml_tensor* rb_in = x;
-        for (int j = 0; j < 3; j++) {
-            const int K = rb_kernels[j];
-            (void)K; // kernel baked into weights via cv3_causal_conv1d_dil
-            ggml_tensor* rj = cv3_hift_resblock_fwd(ctx0, rb_in, h.resblocks[i * 3 + j], dilations);
-            xs = xs ? ggml_add(ctx0, xs, rj) : rj;
+        // Main resblock fusion: 3 independent ResBlocks share ONE time-major
+        // island under SIMDCONV, then the averaged result is converted back
+        // for the next upsample/source-fusion stage.
+        if (h.simdconv_enabled) {
+            ggml_tensor* rb_in_tm = cv3_hift_simd_to_tm(ctx0, x);
+            ggml_tensor* xs_tm = nullptr;
+            for (int j = 0; j < 3; j++) {
+                ggml_tensor* rj_tm =
+                    cv3_hift_resblock_fwd_simd_tm(ctx0, rb_in_tm, h.resblocks[i * 3 + j], ctx->n_threads);
+                xs_tm = xs_tm ? ggml_add(ctx0, xs_tm, rj_tm) : rj_tm;
+            }
+            x = cv3_hift_simd_from_tm(ctx0, ggml_scale(ctx0, xs_tm, 1.0f / 3.0f));
+        } else {
+            ggml_tensor* xs = nullptr;
+            ggml_tensor* rb_in = x;
+            for (int j = 0; j < 3; j++) {
+                const int K = rb_kernels[j];
+                (void)K; // kernel baked into weights via cv3_causal_conv1d_dil
+                ggml_tensor* rj = cv3_hift_resblock_fwd(ctx0, rb_in, h.resblocks[i * 3 + j], dilations);
+                xs = xs ? ggml_add(ctx0, xs, rj) : rj;
+            }
+            x = ggml_scale(ctx0, xs, 1.0f / 3.0f);
         }
-        x = ggml_scale(ctx0, xs, 1.0f / 3.0f);
 
         {
             ggml_tensor* dump = ggml_cont(ctx0, x);
@@ -4827,6 +4897,39 @@ extern "C" int cosyvoice3_tts_init_hift_from_file(struct cosyvoice3_tts_context*
     hf.f0_classifier_w = require_t("cosyvoice3.hift.f0.classifier.w");
     hf.f0_classifier_b = require_t("cosyvoice3.hift.f0.classifier.b");
 
+    // ---- SIMDCONV: direct CPU ResBlock Conv1d, load-time packed ---------
+    // Shared core_hift_simdconv handles validation, tensor dequantization and
+    // rollback; this model adapter contributes only the bound tensors + causal padding.
+    {
+        const char* env2 = crispasr_env::get("CRISPASR_COSYVOICE3_SIMDCONV");
+        const bool requested = env2 && *env2 && *env2 != '0';
+        const bool cpu_hift = core_cpu_backend::is_cpu(hift_backend);
+        core_hift_simdconv::Packer pack(requested && cpu_hift);
+        const int dilations[3] = {1, 3, 5};
+
+        for (auto& rb : hf.resblocks)
+            for (int j = 0; j < 3; j++) {
+                pack.add(rb.c1_simd[j], rb.c1_w[j], rb.c1_b[j], dilations[j]);
+                pack.add(rb.c2_simd[j], rb.c2_w[j], rb.c2_b[j], 1);
+            }
+        for (auto& rb : hf.src_resblocks)
+            for (int j = 0; j < 3; j++) {
+                pack.add(rb.c1_simd[j], rb.c1_w[j], rb.c1_b[j], dilations[j]);
+                pack.add(rb.c2_simd[j], rb.c2_w[j], rb.c2_b[j], 1);
+            }
+
+        const int expected = (int)(hf.resblocks.size() + hf.src_resblocks.size()) * 6;
+        hf.simdconv_enabled = pack.finish(expected);
+        const int packed = pack.count();
+        if (crispasr_env::get("CRISPASR_COSYVOICE3_SIMDCONV_DEBUG") || (requested && ctx->params.verbosity >= 1)) {
+            const char* isa =
+                hf.simdconv_enabled ? core_cv3_hift_simdconv::isa_name(hf.resblocks[0].c1_simd[0].isa) : "fallback";
+            fprintf(stderr, "cosyvoice3_tts:hift SIMDCONV %s: packed %d/%d ResBlock convs, isa=%s, backend=%s%s\n",
+                    hf.simdconv_enabled ? "ON" : "OFF", packed, expected, isa, ggml_backend_name(hift_backend),
+                    requested && !cpu_hift ? " (GPU HiFT -> ggml fallback)" : "");
+        }
+    }
+
     // ---- FASTCONV: bake one F32 copy of each F16 hift conv kernel at load,
     // then re-point the named fields to the baked copies. The fork's
     // ggml_conv_1d casts an F16 kernel → F32 inside EVERY graph when the
@@ -4848,18 +4951,22 @@ extern "C" int cosyvoice3_tts_init_hift_from_file(struct cosyvoice3_tts_context*
         fields.push_back(&hf.conv_post_w);
         for (int i = 0; i < 3; i++)
             fields.push_back(&hf.ups_w[i]);
-        for (auto& rb : hf.resblocks)
-            for (int j = 0; j < 3; j++) {
-                fields.push_back(&rb.c1_w[j]);
-                fields.push_back(&rb.c2_w[j]);
-            }
+        // SIMDCONV never calls ggml_conv_1d for the 72 ResBlock kernels, so
+        // do not also allocate redundant baked-F32 copies of those weights.
+        if (!hf.simdconv_enabled)
+            for (auto& rb : hf.resblocks)
+                for (int j = 0; j < 3; j++) {
+                    fields.push_back(&rb.c1_w[j]);
+                    fields.push_back(&rb.c2_w[j]);
+                }
         for (int i = 0; i < 3; i++)
             fields.push_back(&hf.src_down_w[i]);
-        for (auto& rb : hf.src_resblocks)
-            for (int j = 0; j < 3; j++) {
-                fields.push_back(&rb.c1_w[j]);
-                fields.push_back(&rb.c2_w[j]);
-            }
+        if (!hf.simdconv_enabled)
+            for (auto& rb : hf.src_resblocks)
+                for (int j = 0; j < 3; j++) {
+                    fields.push_back(&rb.c1_w[j]);
+                    fields.push_back(&rb.c2_w[j]);
+                }
         for (int i = 0; i < 5; i++)
             fields.push_back(&hf.f0_condnet_w[i]);
 
@@ -5325,7 +5432,16 @@ bool cv3_bake_runtime_voice_bundle(const char* wav_path, const char* ref_text, s
     if (manifest_path.empty() || gguf_path.empty())
         return false;
 
-    const std::string upstream_base = "/Volumes/backups/code/cosyvoice3-stash/CosyVoice-upstream";
+    // Path to a CosyVoice upstream checkout, for the Python cross-check only.
+    // No hardcoded default: this was a maintainer path, so the cross-check
+    // could only ever run on one machine and silently failed everywhere else.
+    const char* upstream_env = crispasr_env::get("CRISPASR_COSYVOICE3_UPSTREAM_DIR");
+    if (!upstream_env || !*upstream_env) {
+        fprintf(stderr, "cosyvoice3: set CRISPASR_COSYVOICE3_UPSTREAM_DIR to a CosyVoice checkout "
+                        "to run the Python cross-check\n");
+        return false;
+    }
+    const std::string upstream_base = upstream_env;
     std::ostringstream manifest;
     manifest << "[{\"name\":\"runtime\",\"wav\":\"" << cv3_json_escape(wav_path ? wav_path : "")
              << "\",\"prompt_text\":\"" << cv3_json_escape(ref_text ? ref_text : "") << "\"}]";
