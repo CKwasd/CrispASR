@@ -176,7 +176,12 @@ public:
         // Multilingual language selection (#170/#348). `--target-lang` is the
         // explicit TTS output language; `-l` remains the convenient fallback.
         const std::string output_lang = !params.target_lang.empty() ? params.target_lang : params.language;
-        if (!output_lang.empty() && output_lang != "auto")
+        // Finnish Nano is monolingual and retains Nano's English tokenizer.
+        // `-l fi` selects this backend in the CLI router, but `[fi]` is not a
+        // token in its vocabulary and must not be injected into the prompt.
+        const bool finnish_nano =
+            contains_ci(params.backend, "finnish-nano") || contains_ci(params.backend, "finnish_nano");
+        if (!finnish_nano && !output_lang.empty() && output_lang != "auto")
             chatterbox_set_language(ctx_, output_lang.c_str());
         else
             chatterbox_set_language(ctx_, nullptr); // clear

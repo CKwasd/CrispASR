@@ -165,6 +165,11 @@ class TestVoiceCloningSessionDispatch(unittest.TestCase):
             self.synthesize,
         )
 
+    def test_finnish_nano_does_not_inject_a_nonexistent_language_token(self):
+        source = (REPO / "examples" / "cli" / "crispasr_backend_chatterbox.cpp").read_text(encoding="utf-8")
+        self.assertIn('contains_ci(params.backend, "finnish-nano")', source)
+        self.assertIn("if (!finnish_nano && !output_lang.empty()", source)
+
     def test_omnivoice_dispatches_wav_and_reference_text(self):
         self.assertIn(
             "omnivoice_set_voice_prompt(s->omnivoice_ctx, path, ref_text_or_null)",
