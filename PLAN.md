@@ -433,6 +433,14 @@ Audit PR #345, verify the additive C ABI and failure contracts, and run the
 hermetic plus available model-backed/live tests before deciding whether any
 changes are needed.
 
+## CLAIMED 2026-08-30 — #400 native Windows CUDA 13 release package
+
+Worktree: `.claude/worktrees/fix-400-windows-cuda13`.
+Audit the complete issue thread and the existing Windows CUDA 12 / Linux CUDA
+13 release legs, then add the smallest native Windows CUDA 13 package with a
+GitHub-hosted compile and DLL-closure proof. Keep CUDA 12 available; this is an
+additional artifact, not a replacement and not a fix for #397's AVX-512 crash.
+
 ## CLAIMED 2026-08-13 — #344 MOSS valid-frame metadata in stable C ABI
 
 Worktree: `.claude/worktrees/fix-344-moss-valid-frame-metadata`
