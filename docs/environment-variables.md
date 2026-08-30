@@ -402,6 +402,10 @@ suffixes.
 - `CRISPASR_CHATTERBOX_FORCE_GPU`
 - `CRISPASR_CHATTERBOX_FULL_CPU`
 - `CRISPASR_CHATTERBOX_LANG`
+- `CRISPASR_CHATTERBOX_KV_CONT` — materialize GPT-2 K/V layer views before
+  flash attention, reproducing the pre-PR-410 path for correctness/performance
+  A/Bs. The default passes the views directly; naive attention still
+  materializes them because its matrix operations require that layout.
 - `CRISPASR_CHATTERBOX_NAIVE_ATTN` — force the explicit softmax(QK^T)V T3
   attention on every backend (debug gate; outranks `_FLASH_ATTN`).
 - `CRISPASR_CHATTERBOX_S3GEN_CPU`

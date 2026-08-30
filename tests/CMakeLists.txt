@@ -4297,6 +4297,22 @@ catch_discover_tests(test-kv-quant-roundtrip
     PROPERTIES LABELS "unit"
 )
 
+# PR #410: Chatterbox passes a per-layer KV-cache view directly to
+# flash_attn_ext. Pin both the non-zero layer offset and output equivalence to
+# the former materialized-contiguous path without requiring a model download.
+add_executable(test-flash-attn-kv-view test-flash-attn-kv-view.cpp)
+target_include_directories(test-flash-attn-kv-view PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-flash-attn-kv-view PRIVATE
+    Catch2::Catch2WithMain
+    ggml ggml-base crispasr_link_ggml_cpu
+)
+catch_discover_tests(test-flash-attn-kv-view
+    TEST_SPEC "[unit][chatterbox][attention]"
+    PROPERTIES LABELS "unit;chatterbox"
+)
+
 # ─── test-core-adaln — core/adaln.h AdaLN-Zero modulation (ggml graph) ────────
 add_executable(test-core-adaln test-core-adaln.cpp)
 target_include_directories(test-core-adaln PRIVATE
