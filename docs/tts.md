@@ -42,7 +42,7 @@ trade-off:
 | Backend | Why pick it | Voice cloning | First-run download |
 |---|---|---|---|
 | **`melotts`** | Multilingual VITS2 (MeloTTS). 4 English speakers (US/BR/India/AU). 44.1 kHz output, ~102 MB GGUF. Neural G2P + CMU dict. BERT companion (Q4_K 52 MB) auto-downloads with `-m auto`; also via `--codec-model` or `CRISPASR_MELOTTS_BERT` env. | No (per-speaker ID) | ~154 MB via `-m auto` |
-| **`piper`** | Tiniest footprint (30 MB). rhasspy/piper VITS; 250+ community voices across 30+ languages. Built-in G2P (CMUdict + LTS rules) for English — no espeak-ng needed. Optional espeak-ng for other langs (loaded via dlopen). 22 kHz output. Use `--g2p-dict` to select dictionary source. | No (per-voice GGUF) | Manual `wget` |
+| [`piper`](#piper--community-voices) | Tiniest footprint (30 MB). rhasspy/piper VITS; 250+ community voices across 30+ languages. Built-in G2P (CMUdict + LTS rules) for English — no espeak-ng needed. Optional espeak-ng for other langs (loaded via dlopen). 22 kHz output. Use `--g2p-dict` to select dictionary source. | No (per-voice GGUF) | ~30 MB default via `-m auto`; other voices are manual downloads |
 | [`kokoro`](#kokoro--multilingual-smallest) | Smallest + fastest. 82 M-param StyleTTS2-derived model. Multilingual via built-in G2P or espeak-ng (dlopen/popen fallback). | No (preset voice packs) | Manual `wget` (no `-m auto`) |
 | [`qwen3-tts`](#qwen3-tts--voice-cloning-highest-fidelity) | Highest fidelity / strongest cloning. Speech-LLM (talker + code predictor + 12 Hz codec). Default voice auto-downloaded with `-m auto`; or supply your own WAV + ref-text. | Optional (auto default voice; or WAV + ref-text or baked voice GGUF) | ~1.3 GB via `-m auto` |
 | **`miotts`** | MioTTS-0.6B (Qwen3 LLM + MioCodec-v2). EN/JA. Single GGUF, 24 kHz output. Codec-aware mixed quantization (LLM Q4_K + codec F16). | Yes — `--voice preset.emb.gguf` (preset speaker embeddings) | 502 MB Q4_K via `-m auto` |
@@ -58,6 +58,50 @@ trade-off:
 | [`irodori-tts`](#irodori-tts--japanese-voice-cloning--emoji-emotion-control) | Irodori-TTS: RF-DiT flow-matching TTS with LowRankAdaLN + JointAttention + half-RoPE + SwiGLU. 48 kHz via Semantic-DACVAE-Japanese-32dim codec. MIT license. Japanese-focused (llm-jp-3 tokenizer). Zero-shot voice cloning from any reference WAV (DAC-VAE encoder + speaker CFG); emoji emotion control; duration predictor for output length. **VoiceDesign** (600M-v3): adds caption encoder for style/emotion control via text descriptions (`--instruct "calm adult male, deep voice"`); independent text/speaker/caption CFG. | Yes (`--voice <ref.wav> --i-have-rights`) | ~526 MB Q4_K (VoiceDesign) / ~852 MB Q4_K (base) + DAC-VAE codec |
 | [`indextts`](#indextts--chineseenglish-voice-cloning) | IndexTTS-1.5: GPT-2 AR (24L/1280d) mel-code generator + BigVGAN vocoder. Designed for Chinese+English. Zero-shot voice cloning from any reference WAV. | Yes (`--voice <ref.wav>`) | ~2.4 GB via `-m auto` (GPT F16 + BigVGAN F16) |
 | [`cosyvoice3-tts`](#cosyvoice3--voice-cloning-from-a-wav) | Fun-CosyVoice3-0.5B-2512: Qwen2-0.5B AR speech-token LM + DiT-CFM (10-step Euler) + HiFT (NSF + iSTFT) @ 24 kHz. 9 languages + 18 Chinese dialects. Ships an 8-voice baked bank (`zero_shot` + `fleurs-{en,de,zh,ja,fr,es,ko}`). | Yes — baked-bank name via `--voice <name>`, **or** native arbitrary-WAV cloning via `--voice <ref.wav> --ref-text "..."` (ports speech_tokenizer_v3 + CAMPPlus + matcha mel to ggml; speech tokens byte-exact vs ONNX). | ~1.2 GB via `-m auto` (Q4_K LLM + Q8_0 flow + HiFT + s3tok + campplus + voices) |
+
+## Piper — community voices
+
+The default US Lessac voice needs no manual model download:
+
+```powershell
+.\crispasr.exe --backend piper -m auto --tts "Hello from Piper." --tts-output piper.wav
+```
+
+For another voice, download its GGUF from
+[`cstr/piper-voices-GGUF`](https://huggingface.co/cstr/piper-voices-GGUF).
+Either pass the full path, or put it in `CRISPASR_MODELS_DIR` and pass its bare
+filename. CrispASR resolves that exact file; it does not replace an unknown
+community voice with the registered US default (#397).
+
+```powershell
+$env:CRISPASR_MODELS_DIR = 'D:\ai\crispasr'
+.\crispasr.exe --backend piper -m piper-en_GB-cori-medium-f16.gguf `
+  --tts "Hello from the Cori voice." --tts-output cori.wav
+```
+
+For the HTTP server and PowerShell, keep `-t 8` separate from `-l en` and call
+the real curl executable (PowerShell aliases `curl` in some versions):
+
+```powershell
+.\crispasr.exe --server --backend piper `
+  -m piper-en_GB-cori-medium-f16.gguf -l en -t 8 --port 8089 `
+  --no-spoken-disclaimer --accept-marking-responsibility
+
+curl.exe -sS http://localhost:8089/v1/audio/speech `
+  -H 'Content-Type: application/json' `
+  --data-raw '{"model":"piper","input":"Hello, how are you today?","spoken_disclaimer":false,"response_format":"wav"}' `
+  --output piper-server.wav
+```
+
+Writing a WAV with `--output` avoids sending binary audio through PowerShell's
+object pipeline. To test raw streaming in `cmd.exe`, request
+`"stream":true,"response_format":"pcm"` and pipe `curl.exe` to
+`ffplay.exe -f s16le -ar 22050 -ac 1 -nodisp -`.
+
+## More TTS backends
+
+| Backend | Why pick it | Voice cloning | First-run download |
+|---|---|---|---|
 | **`csm`** | Sesame CSM-1B: Llama-3.2 1B backbone (first-codebook AR) + 100M depth decoder (codebooks 1–31) + Kyutai Mimi codec (32-codebook RVQ → SEANet) @ 24 kHz. Single GGUF. Apache-2.0. | No (single built-in voice) | ~1.4 GB via `-m auto` (single Q4_K GGUF) |
 | **`dia`** | Nari Labs Dia 1.6B: byte-level text encoder (12L) + AR audio decoder (18L GQA) + 9-codebook DAC codec @ 44.1 kHz. CFG-guided, dialogue-style with `[S1]`/`[S2]` speaker tags. Apache-2.0. | No (dialogue via speaker tags) | ~1.6 GB via `-m auto` |
 | **`zonos-tts`** | Zyphra Zonos-v0.1-transformer: 26-layer GQA AR transformer → 9-codebook DAC @ 44.1 kHz. Rich conditioning: speaker embedding + text + emotion + FWHM pitch/tempo. CFG guided. Voice cloning from any reference WAV (pass via `CRISPASR_ZONOS_SPEAKER_EMB_PATH` or `--voice <ref.wav>`). Apache-2.0. | Yes (`--voice <ref.wav>`) | ~1.6 GB Q8_0 (default) or ~931 MB selective-Q4_K (heads/embeddings kept F16, auto-retry guard) or ~3.0 GB F16, via `-m auto` + 104 MB DAC codec. |

@@ -1851,6 +1851,14 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
             fclose(f);
             return model_arg;
         }
+        // A bare explicit filename is also allowed to live in the configured
+        // model roots.  Preserve its exact identity: do this before registry
+        // matching, whose backend fallback may name a different voice (#397).
+        if (model_arg.find_first_of("/\\") == std::string::npos) {
+            const std::string cached_explicit = crispasr_cache::probe_cached_file(model_arg, cache_dir_override);
+            if (!cached_explicit.empty())
+                return cached_explicit;
+        }
 
         // File not found — try registry-based download when permitted.
         // Match priority:

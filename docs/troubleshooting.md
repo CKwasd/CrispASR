@@ -182,6 +182,13 @@ crispasr --backend parakeet -m name.gguf --auto-download -f audio.wav
 crispasr --backend parakeet -m /full/path/to/name.gguf -f audio.wav
 ```
 
+A bare explicit filename is searched unchanged in `--cache-dir`,
+`CRISPASR_CACHE_DIR`, and `CRISPASR_MODELS_DIR` before CrispASR consults the
+registry. This matters for community models such as Piper voices: asking for
+`piper-en_GB-cori-medium-f16.gguf` must never silently substitute the registry's
+US Lessac default. If the file is elsewhere, pass its full path or set one of
+those model-directory options.
+
 Downloads land in `~/.cache/crispasr/` — on Windows
 `%USERPROFILE%\.cache\crispasr` (override with `CRISPASR_CACHE_DIR`).
 To see exactly which paths would be used without running anything, use

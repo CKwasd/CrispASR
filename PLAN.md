@@ -1,5 +1,13 @@
 # CrispASR — Pending work
 
+## NOW 2026-08-31 — #397 Piper Windows CLI/server resolution and live proof
+
+Worktree `.claude/worktrees/fix-397-piper`, branch
+`fix/397-piper-proof`. Reproduce the reporter's explicit Cori GGUF lookup and
+backend inference, fix misleading fallback/download behavior and broken
+Windows server examples, add regression coverage, then prove packaged-style
+Piper synthesis and server streaming with a real model plus ASR/audio checks.
+
 ## DONE 2026-08-30 — Kaggle quiet-box A/Bs → default flips for #404 memo + cv3 SIMDCONV
 
 Kernels `chr1str/crispasr-simdconv-cpu-ab` + `chr1str/crispasr-stream404-ab`

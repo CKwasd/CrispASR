@@ -4831,6 +4831,7 @@ set_tests_properties(test-progress-output PROPERTIES
 # Needs only the built binary (no models / network); SKIPs if absent.
 add_test(NAME test-dry-run-resolve
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-dry-run-resolve.sh
+            $<TARGET_FILE:crispasr-cli>
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 set_tests_properties(test-dry-run-resolve PROPERTIES
     LABELS "cli"

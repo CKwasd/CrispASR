@@ -36,6 +36,17 @@ static bool parse_auto_quant_spec(const std::string& spec, std::string& base, st
     return true;
 }
 
+// A bare explicit filename means "this exact file", but users commonly keep
+// those files in --cache-dir / CRISPASR_MODELS_DIR rather than the shell's
+// current directory.  Search the normal model roots before consulting the
+// registry; otherwise an unregistered Piper voice can be silently replaced by
+// the backend's unrelated default voice (#397).
+static std::string probe_explicit_model_filename(const std::string& model_arg, const std::string& cache_dir_override) {
+    if (model_arg.empty() || model_arg.find_first_of("/\\") != std::string::npos)
+        return {};
+    return crispasr_cache::probe_cached_file(model_arg, cache_dir_override);
+}
+
 static CrispasrResolvePreview build_preview(const std::string& model_arg, const std::string& backend_name,
                                             const std::string& cache_dir_override, const std::string& preferred_quant,
                                             bool ignore_cache) {
@@ -62,6 +73,14 @@ static CrispasrResolvePreview build_preview(const std::string& model_arg, const 
             fclose(f);
             out.exists_locally = true;
             out.resolved_path = effective_model_arg;
+            out.filename = effective_model_arg;
+            return out;
+        }
+
+        const std::string cached = probe_explicit_model_filename(effective_model_arg, cache_dir_override);
+        if (!cached.empty()) {
+            out.exists_locally = true;
+            out.resolved_path = cached;
             out.filename = effective_model_arg;
             return out;
         }
@@ -140,6 +159,13 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
         return effective_model_arg;
     }
     const int open_errno = errno;
+
+    const std::string cached_explicit = probe_explicit_model_filename(effective_model_arg, cache_dir_override);
+    if (!cached_explicit.empty()) {
+        if (!quiet)
+            fprintf(stderr, "crispasr: found explicit model in model search path: %s\n", cached_explicit.c_str());
+        return cached_explicit;
+    }
 
     // fopen failed. Distinguish "no such entry" (maybe a registry model *name*
     // to download — handled below) from "the entry exists but we can't open
