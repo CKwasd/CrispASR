@@ -9,6 +9,7 @@ on:
       - 'src/crispasr_model_registry.cpp'
       - 'src/crispasr_cache.cpp'
       - 'src/crispasr_cache.h'
+      - 'src/CMakeLists.txt'
       - 'src/piper_tts.cpp'
       - 'src/piper_tts.h'
       - 'tests/test-dry-run-resolve.sh'
@@ -48,6 +49,7 @@ jobs:
         shell: pwsh
         run: |
           $env:CRISPASR_MODELS_DIR = (Resolve-Path proof-models).Path
+          $env:CRISPASR_CACHE_DIR = $env:CRISPASR_MODELS_DIR
           $preview = (& build/bin/crispasr.exe `
             -m piper-en_GB-cori-medium-f16.gguf --dry-run-resolve 2>&1) -join "`n"
           Write-Host $preview
@@ -59,12 +61,20 @@ jobs:
           }
           if ($preview -match 'lessac') { throw 'Cori was substituted with the Lessac registry default' }
 
-          & build/bin/crispasr.exe --backend piper `
+          $ttsLog = (& build/bin/crispasr.exe --backend piper `
             -m piper-en_GB-cori-medium-f16.gguf -l en -t 2 --no-gpu `
             --tts 'The quick brown fox jumps over the lazy dog.' `
             --tts-output proof/cori-cli.wav `
-            --no-spoken-disclaimer --no-c2pa --accept-marking-responsibility
+            --no-spoken-disclaimer --no-c2pa --accept-marking-responsibility 2>&1) -join "`n"
+          Write-Host $ttsLog
           if ($LASTEXITCODE -ne 0) { throw "Piper CLI exited $LASTEXITCODE" }
+          if ($ttsLog -notmatch 'espeak IPA dict loaded') {
+            throw 'Piper did not load its auto-downloaded IPA dictionary'
+          }
+          if (-not (Test-Path proof-models/espeak_en_us.tsv) -or
+              (Get-Item proof-models/espeak_en_us.tsv).Length -lt 1000000) {
+            throw 'Piper IPA dictionary was not downloaded into the clean cache'
+          }
           $wav = [IO.File]::ReadAllBytes('proof/cori-cli.wav')
           if ($wav.Length -lt 10000 -or [Text.Encoding]::ASCII.GetString($wav, 0, 4) -ne 'RIFF') {
             throw 'CLI output is not a non-empty WAV'
