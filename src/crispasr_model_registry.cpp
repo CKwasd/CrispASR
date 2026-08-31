@@ -1016,21 +1016,21 @@ constexpr Entry k_registry[] = {
      "~220 MB"},
     {"pocket-tts-de", "pocket-tts-german-q8_0.gguf",
      "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-german-q8_0.gguf",
-     "~128 MB"},
+     "~124 MB"},
     {"pocket-tts-es", "pocket-tts-spanish-q8_0.gguf",
      "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-spanish-q8_0.gguf",
-     "~128 MB"},
+     "~124 MB"},
     {"pocket-tts-it", "pocket-tts-italian-q8_0.gguf",
      "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-italian-q8_0.gguf",
-     "~128 MB"},
+     "~124 MB"},
     {"pocket-tts-pt", "pocket-tts-portuguese-q8_0.gguf",
      "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-portuguese-q8_0.gguf",
-     "~128 MB"},
+     "~124 MB"},
     // French is upstream's 24-layer preview checkpoint; the other languages
     // use the distilled 6-layer releases.
     {"pocket-tts-fr", "pocket-tts-french_24l-q8_0.gguf",
      "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-french_24l-q8_0.gguf",
-     "~250 MB"},
+     "~365 MB"},
     // IndexTTS-1.5: GPT-2 AR mel-code generator + BigVGAN vocoder.
     // Voice cloning via Conformer+Perceiver conditioning on reference audio.
     // Two-file setup: GPT (mel codes) + BigVGAN (vocoder). Q8_0 recommended
