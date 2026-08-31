@@ -70,12 +70,14 @@ jobs:
           python - <<'PY'
           import os, pathlib, re, unicodedata, wave
           root = pathlib.Path(os.environ["WORK"]) / "proof"
+          # Prefixes tolerate normal inflection and a close ASR ending while
+          # still requiring two independently decoded content words.
           expected = {
-              "de": {"guten", "morgen", "heute", "sonne"},
-              "es": {"buenos", "dias", "hoy", "sol"},
-              "it": {"buongiorno", "oggi", "sole"},
-              "pt": {"bom", "dia", "hoje", "sol"},
-              "fr": {"bonjour", "aujourd", "soleil", "brille"},
+              "de": {"guten", "morgen", "heut", "sonne"},
+              "es": {"buen", "dia", "hoy", "sol"},
+              "it": {"giorn", "oggi", "splend", "sole"},
+              "pt": {"bom", "dia", "hoje", "sol", "brilh"},
+              "fr": {"bonjour", "aujourd", "soleil", "brill"},
           }
           for lang, wanted in expected.items():
               wav_path = root / f"pocket-{lang}.wav"
@@ -87,7 +89,7 @@ jobs:
               transcript = (root / f"pocket-{lang}-asr.txt").read_text()
               plain = unicodedata.normalize("NFKD", transcript).encode("ascii", "ignore").decode().lower()
               words = set(re.findall(r"[a-z]+", plain))
-              hits = wanted & words
+              hits = {stem for stem in wanted if any(word.startswith(stem) for word in words)}
               assert len(hits) >= 2, (lang, transcript, sorted(hits))
               print(f"{lang}: {seconds:.2f}s; decoded={transcript.strip()!r}; hits={sorted(hits)}")
           PY
