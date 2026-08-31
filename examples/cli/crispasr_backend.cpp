@@ -203,7 +203,11 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_f5_tts_backend();
     if (name == "irodori-tts" || name == "irodori_tts" || name == "irodori")
         return crispasr_make_irodori_tts_backend();
-    if (name == "pocket-tts" || name == "pocket_tts" || name == "pockettts" || name == "pocket")
+    if (name == "pocket-tts" || name == "pocket_tts" || name == "pockettts" || name == "pocket" ||
+        name == "pocket-tts-de" || name == "pocket-tts-german" || name == "pocket-tts-es" ||
+        name == "pocket-tts-spanish" || name == "pocket-tts-it" || name == "pocket-tts-italian" ||
+        name == "pocket-tts-pt" || name == "pocket-tts-portuguese" || name == "pocket-tts-fr" ||
+        name == "pocket-tts-french")
         return crispasr_make_pocket_tts_backend();
     if (name == "fastpitch" || name == "fastpitch-tts" || name == "fastpitch_tts")
         return crispasr_make_fastpitch_backend();
@@ -354,6 +358,11 @@ std::vector<std::string> crispasr_list_backends() {
         "indextts",
         "f5-tts",
         "pocket-tts",
+        "pocket-tts-de",
+        "pocket-tts-es",
+        "pocket-tts-it",
+        "pocket-tts-pt",
+        "pocket-tts-fr",
         "fastpitch",
         "kokoro",
         "melotts",

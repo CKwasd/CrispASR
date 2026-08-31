@@ -1014,6 +1014,23 @@ constexpr Entry k_registry[] = {
     {"pocket-tts", "pocket-tts-english-f16.gguf",
      "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-english-f16.gguf",
      "~220 MB"},
+    {"pocket-tts-de", "pocket-tts-german-q8_0.gguf",
+     "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-german-q8_0.gguf",
+     "~128 MB"},
+    {"pocket-tts-es", "pocket-tts-spanish-q8_0.gguf",
+     "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-spanish-q8_0.gguf",
+     "~128 MB"},
+    {"pocket-tts-it", "pocket-tts-italian-q8_0.gguf",
+     "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-italian-q8_0.gguf",
+     "~128 MB"},
+    {"pocket-tts-pt", "pocket-tts-portuguese-q8_0.gguf",
+     "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-portuguese-q8_0.gguf",
+     "~128 MB"},
+    // French is upstream's 24-layer preview checkpoint; the other languages
+    // use the distilled 6-layer releases.
+    {"pocket-tts-fr", "pocket-tts-french_24l-q8_0.gguf",
+     "https://huggingface.co/cstr/pocket-tts-GGUF/resolve/main/pocket-tts-french_24l-q8_0.gguf",
+     "~250 MB"},
     // IndexTTS-1.5: GPT-2 AR mel-code generator + BigVGAN vocoder.
     // Voice cloning via Conformer+Perceiver conditioning on reference audio.
     // Two-file setup: GPT (mel codes) + BigVGAN (vocoder). Q8_0 recommended
@@ -1557,7 +1574,7 @@ static std::string effective_license(const Entry& e) {
         return "CC-BY-4.0 (see the original model card)";
     if (b == "outetts")
         return "CC-BY-NC-SA-4.0 (see https://huggingface.co/OuteAI/OuteTTS-0.3-1B)";
-    if (b == "pocket-tts")
+    if (b == "pocket-tts" || b.rfind("pocket-tts-", 0) == 0)
         return "pocket-tts-terms (CC-BY-4.0 plus gated-use conditions; see https://huggingface.co/kyutai/pocket-tts)";
     if (b == "lid-fasttext176")
         return "CC-BY-NC-4.0 (see https://huggingface.co/facebook/fasttext-language-identification)";

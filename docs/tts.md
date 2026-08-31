@@ -67,7 +67,7 @@ trade-off:
 | **`bananamind-tts`** | BananaMind-TTS-V2.1 13M: Tacotron-lite (char tokenizer + Conv1d+BN+ReLU encoder + BiLSTM + AR GRU decoder with location-sensitive attention + postnet) + HiFi-GAN @ 22 kHz. English (LJ Speech) and German (ThorstenVoice). Apache-2.0. Runtime is designed as a template for standard Tacotron2 ports — add `decoder_rnn_type=lstm` to the GGUF to switch to the LSTM decoder path ([architecture notes](architecture.md#bananamind-tts)). | No (fixed voice per locale) | ~40 MB Q8_0 / ~50 MB F32 per locale |
 | [`parler-tts`](#parler-tts--prompt-conditioned-voice-description) | Parler TTS Mini v1.1 (~900M): T5 encoder + MusicGen decoder + DAC 44.1 kHz. Apache-2.0. Prompt-conditioned: describe the voice in natural language via `--instruct`. | No (prompt-conditioned) | ~900 MB via `-m auto` (Q8_0 GGUF) |
 | **`voxcpm2-tts`** | VoxCPM2: 2B Qwen2 backbone + flow matching + VAE decoder @ 48 kHz. Zero-shot voice cloning via `--voice <ref.wav>`. | Yes | ~2.4 GB via `-m auto` |
-| [`pocket-tts`](#pocket-tts-voices-and-environment-switches) | Kyutai Pocket TTS 100M: continuous-latent AR @ 12.5 Hz + one-step LSD flow head + Mimi VAE decoder → 24 kHz. CC-BY-4.0 plus gated-use conditions. Voice cloning via `--voice ref.wav`. | Yes (`--voice`) | ~220 MB via `-m auto` (F16 GGUF) |
+| [`pocket-tts`](#pocket-tts-languages-voices-and-environment-switches) | Kyutai Pocket TTS 100M: continuous-latent AR @ 12.5 Hz + one-step LSD flow head + Mimi VAE decoder → 24 kHz. English, German, Spanish, Italian, Portuguese, plus the upstream French 24L preview. CC-BY-4.0 plus gated-use conditions. Voice cloning via `--voice ref.wav`. | Yes (`--voice`) | ~128 MB Q8_0 per non-English 6L model; English F16 ~220 MB; French 24L is larger |
 | **`kugelaudio`** | KugelAudio-0-Open: 7B Qwen2.5 backbone + 4-layer DiT diffusion head (20-step SDE-DPMSolver++) + acoustic VAE decoder → 24 kHz. 23 languages. MIT. | Pre-encoded voices (`--voice voice.gguf`) | ~17.3 GB F16 via `-m auto` — needs >16 GB VRAM, else `--no-gpu`. The ~5.7 GB Q4_K is **not** a usable substitute: it stutters and loops (WER 0.72 vs 0.056 for F16) |
 | [`tada-1b`](#tada--multilingual-and-voice-cloning) | HumeAI TADA 1B: Llama-3.2-1B backbone + per-token flow-matching diffusion head + TADA codec → 24 kHz. **English-only.** `-m auto` downloads model + default `tada-ref.gguf`. | Yes (`--voice <tada-ref.gguf>`, English voice refs only) | ~1.7 GB Q4_K + ~1 GB codec |
 | [`tada` / `tada-3b-ml`](#tada--multilingual-and-voice-cloning) | HumeAI TADA 3B Multilingual: same architecture, 3B params. Supports **ar, ch, de, es, fr, it, ja, pl, pt** in addition to English. `-l <lang>` auto-downloads `tada-ref-<lang>.gguf`. | Yes (`--voice <tada-ref.gguf>`) | ~4 GB Q4_K + ~1 GB codec |
@@ -939,7 +939,20 @@ defaults reproduce the validated, end-to-end-tested code path.
 | `CRISPASR_QWEN3_TTS_CODEC_CTX` | `128` (`96` on CUDA) | Left-context codec frames prepended to each chunk. Values below the codec sliding window are raised; CUDA clamps larger values unless `CRISPASR_QWEN3_TTS_CODEC_ALLOW_FULL=1` is set. |
 | `CRISPASR_QWEN3_TTS_SKIP_REF_DECODE` | **on** (set `=0` to opt out) | Skip the codec decode of the reference audio in `qwen3_tts_synthesize`. The default-on path emits `codec_decode_codes(gen)` directly; the opt-out path concatenates `ref_codes + gen_codes`, decodes both, then trims the ref portion. With a 26 s reference (~334 codec frames at 12 Hz), the ref half adds ~16 s of constant codec compute regardless of how much new audio is generated (Jetson Orin AGX, issue #64). End-to-end RTF on Orin drops from ~7-9 → ~1.5; the win compounds N× under `/v1/audio/speech` long-form chunking. Bit-identity verified 2026-05-05 on Apple Silicon Metal, qwen3-tts-customvoice 0.6B Q8_0: max\|diff\| = 0, cosine similarity = 1.0 — equivalence holds because the codec is a straight-line forward pass with no rolling state. Set `CRISPASR_QWEN3_TTS_SKIP_REF_DECODE=0` only for A/B verification or if a future codec graph variant grows rolling state. |
 
-### pocket-tts voices and environment switches
+### pocket-tts languages, voices, and environment switches
+
+Pocket-TTS uses one checkpoint per language. With `-m auto`, the base backend
+routes `-l de`, `es`, `it`, `pt`, or `fr` to the corresponding model; omit
+`-l` (or use `-l en`) for English. The explicit backend names are
+`pocket-tts-de`, `pocket-tts-es`, `pocket-tts-it`, `pocket-tts-pt`, and
+`pocket-tts-fr`. French is Kyutai's 24-layer preview checkpoint; the other new
+languages are the distilled 6-layer releases.
+
+```bash
+./build/bin/crispasr --backend pocket-tts -m auto -l es \
+  --tts "Hola, este modelo ya habla español." \
+  --voice samples/jfk.wav --i-have-rights --tts-output pocket-es.wav
+```
 
 Voice cloning takes a reference WAV via `--voice`. Three forms are accepted:
 

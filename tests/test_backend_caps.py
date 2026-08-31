@@ -127,6 +127,38 @@ class TestVoiceCloningSessionDispatch(unittest.TestCase):
                 available = self.c_api_source.split("CA_EXPORT int crispasr_session_available_backends", 1)[1]
                 self.assertIn(backend, available)
 
+    def test_pocket_tts_language_variants_are_openable_and_advertised_by_the_c_abi(self):
+        available = self.c_api_source.split("CA_EXPORT int crispasr_session_available_backends", 1)[1]
+        for backend in (
+            "pocket-tts-de",
+            "pocket-tts-es",
+            "pocket-tts-it",
+            "pocket-tts-pt",
+            "pocket-tts-fr",
+        ):
+            with self.subTest(backend=backend):
+                self.assertIn(f's->backend == "{backend}"', self.c_api_source)
+                self.assertIn(backend, available)
+
+    def test_pocket_tts_language_selects_registry_variant_before_download(self):
+        run_source = (REPO / "examples" / "cli" / "crispasr_run.cpp").read_text(encoding="utf-8")
+        route = run_source.index("#411 — Pocket-TTS")
+        resolve = run_source.index("crispasr_resolve_model_cli", route)
+        for language, backend in (
+            ("de", "pocket-tts-de"),
+            ("es", "pocket-tts-es"),
+            ("it", "pocket-tts-it"),
+            ("pt", "pocket-tts-pt"),
+            ("fr", "pocket-tts-fr"),
+        ):
+            self.assertIn(f'params.language == "{language}"', run_source[route:resolve])
+            self.assertIn(f'routed = "{backend}"', run_source[route:resolve])
+
+    def test_pocket_tts_french_preview_keeps_all_24_layers(self):
+        converter = (REPO / "models" / "convert-pocket-tts-to-gguf.py").read_text(encoding="utf-8")
+        self.assertIn('lang == "french_24l"', converter)
+        self.assertIn('hparams["num_layers"] = 24', converter)
+
     def test_omnivoice_dispatches_audio_tokenizer(self):
         self.assertIn(
             "omnivoice_set_tokenizer_path(s->omnivoice_ctx, path)",

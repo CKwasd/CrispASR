@@ -3354,7 +3354,9 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
     }
 #endif
 #ifdef CA_HAVE_POCKET
-    if (s->backend == "pocket-tts" || s->backend == "pocket_tts" || s->backend == "pocket") {
+    if (s->backend == "pocket-tts" || s->backend == "pocket_tts" || s->backend == "pocket" ||
+        s->backend == "pocket-tts-de" || s->backend == "pocket-tts-es" || s->backend == "pocket-tts-it" ||
+        s->backend == "pocket-tts-pt" || s->backend == "pocket-tts-fr") {
         s->backend = "pocket-tts";
         pocket_tts_context_params p = pocket_tts_context_default_params();
         p.n_threads = s->n_threads;
@@ -4393,7 +4395,7 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
     list += ",dots-tts";
 #endif
 #ifdef CA_HAVE_POCKET
-    list += ",pocket-tts";
+    list += ",pocket-tts,pocket-tts-de,pocket-tts-es,pocket-tts-it,pocket-tts-pt,pocket-tts-fr";
 #endif
 #ifdef CA_HAVE_FASTPITCH
     list += ",fastpitch";

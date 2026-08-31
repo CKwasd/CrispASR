@@ -449,6 +449,23 @@ TEST_CASE("registry: pocket-tts has entry", "[unit][registry]") {
     REQUIRE(crispasr_registry_lookup("pocket-tts", e));
 }
 
+TEST_CASE("registry: Pocket-TTS language checkpoints are wired", "[unit][registry]") {
+    const std::pair<const char*, const char*> variants[] = {
+        {"pocket-tts-de", "pocket-tts-german-q8_0.gguf"},
+        {"pocket-tts-es", "pocket-tts-spanish-q8_0.gguf"},
+        {"pocket-tts-it", "pocket-tts-italian-q8_0.gguf"},
+        {"pocket-tts-pt", "pocket-tts-portuguese-q8_0.gguf"},
+        {"pocket-tts-fr", "pocket-tts-french_24l-q8_0.gguf"},
+    };
+    for (const auto& [backend, filename] : variants) {
+        CAPTURE(backend);
+        CrispasrRegistryEntry e;
+        REQUIRE(crispasr_registry_lookup(backend, e));
+        REQUIRE(e.filename == filename);
+        REQUIRE(e.url.find("cstr/pocket-tts-GGUF") != std::string::npos);
+    }
+}
+
 TEST_CASE("registry: speecht5 has entry", "[unit][registry]") {
     CrispasrRegistryEntry e;
     REQUIRE(crispasr_registry_lookup("speecht5", e));

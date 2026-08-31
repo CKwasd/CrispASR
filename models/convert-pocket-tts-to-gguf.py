@@ -373,6 +373,14 @@ def convert(args):
     mimi = dict(MIMI_HPARAMS)
     seanet_ratios = list(SEANET_RATIOS)
 
+    # The gated weights repository does not carry the YAML files from the
+    # pocket-tts source repository. All distilled releases match the English
+    # 6-layer defaults above; the French preview is deliberately undistilled.
+    # Without this override its 24 transformer blocks are written but runtime
+    # metadata says six, silently discarding three quarters of the model.
+    if config is None and lang == "french_24l":
+        hparams["num_layers"] = 24
+
     if config:
         fl = config.get('flow_lm', {})
         xfmr = fl.get('transformer', {})

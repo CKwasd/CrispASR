@@ -2921,6 +2921,29 @@ int crispasr_run_backend(const whisper_params& params_in) {
         }
     }
 
+    // #411 — Pocket-TTS publishes a separate checkpoint per language. Keep
+    // the simple `--backend pocket-tts -m auto -l xx` interface and select
+    // the matching registry entry before model resolution. An explicit model
+    // path remains authoritative.
+    if (model_is_auto && !params.language.empty() && params.language != "auto" &&
+        (backend_name == "pocket-tts" || backend_name == "pocket_tts" || backend_name == "pockettts" ||
+         backend_name == "pocket")) {
+        std::string routed;
+        if (params.language == "de") routed = "pocket-tts-de";
+        else if (params.language == "es") routed = "pocket-tts-es";
+        else if (params.language == "it") routed = "pocket-tts-it";
+        else if (params.language == "pt") routed = "pocket-tts-pt";
+        else if (params.language == "fr") routed = "pocket-tts-fr";
+        if (!routed.empty()) {
+            if (!params.no_prints) {
+                fprintf(stderr, "crispasr: -l %s with --backend %s — auto-routing to %s\n",
+                        params.language.c_str(), backend_name.c_str(), routed.c_str());
+            }
+            backend_name = routed;
+            params.backend = routed;
+        }
+    }
+
     // #231 — "cohere-ar" is the Arabic shorthand for the cohere backend
     // (routes to the same runtime; the registry resolves the recommended
     // Arabic imatrix GGUF for `-m auto`). Default the language to "ar" so
