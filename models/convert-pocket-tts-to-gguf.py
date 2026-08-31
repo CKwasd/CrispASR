@@ -325,8 +325,19 @@ def remap_mimi_from_original(key: str) -> str | None:
 # ── Main converter ──────────────────────────────────────────────────
 
 def convert(args):
-    model_dir = load_model_dir(args.input)
     lang = args.language
+    # A repository contains every language checkpoint and each includes the
+    # shared Mimi stack. Pulling the broad ``*.safetensors`` pattern wastes
+    # several GB and can exhaust a conversion runner. Keep this conversion
+    # strictly language-local while retaining both current and legacy layouts.
+    model_dir = load_model_dir(args.input, [
+        f"languages/{lang}/*",
+        f"pocket_tts/config/{lang}.yaml",
+        f"config/{lang}.yaml",
+        f"{lang}.yaml",
+        "model.safetensors",
+        "tokenizer.model",
+    ])
 
     # Find config YAML
     config_path = None
