@@ -77,8 +77,11 @@ static std::wstring to_wide(const std::string& s) {
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
     if (n <= 0)
         return {};
-    std::wstring w(static_cast<size_t>(n - 1), L'\0');
+    // MultiByteToWideChar writes the trailing NUL because cbMultiByte is -1.
+    // Keep room for it, then remove it from the returned C++ string.
+    std::wstring w(static_cast<size_t>(n), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], n);
+    w.pop_back();
     return w;
 }
 
@@ -88,8 +91,10 @@ static std::string to_utf8(const std::wstring& w) {
     int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
     if (n <= 0)
         return {};
-    std::string s(static_cast<size_t>(n - 1), '\0');
+    // WideCharToMultiByte likewise includes the trailing NUL for cchWideChar=-1.
+    std::string s(static_cast<size_t>(n), '\0');
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], n, nullptr, nullptr);
+    s.pop_back();
     return s;
 }
 
@@ -209,7 +214,24 @@ static bool fetch_winhttp(const std::string& url, const std::string& dest, bool 
                                     WINHTTP_NO_HEADER_INDEX);
                 while (!loc.empty() && loc.back() == L'\0')
                     loc.pop_back();
-                current_url = to_utf8(loc);
+                // Hugging Face's first /resolve/ redirect is commonly a
+                // root-relative /api/resolve-cache/... URL. WinHttpCrackUrl
+                // requires an absolute URL, so retain the current origin.
+                if (loc.rfind(L"//", 0) == 0) {
+                    current_url = to_utf8(std::wstring(scheme) + L":" + loc);
+                } else if (!loc.empty() && loc.front() == L'/') {
+                    std::wstring absolute = std::wstring(scheme) + L"://" + host;
+                    const bool default_port = (is_https && port == INTERNET_DEFAULT_HTTPS_PORT) ||
+                                              (!is_https && port == INTERNET_DEFAULT_HTTP_PORT);
+                    if (!default_port)
+                        absolute += L":" + std::to_wstring(port);
+                    current_url = to_utf8(absolute + loc);
+                } else if (loc.find(L"://") != std::wstring::npos) {
+                    current_url = to_utf8(loc);
+                } else {
+                    const size_t slash = current_url.find_last_of('/');
+                    current_url = current_url.substr(0, slash == std::string::npos ? 0 : slash + 1) + to_utf8(loc);
+                }
             }
             WinHttpCloseHandle(hReq);
             WinHttpCloseHandle(hConn);
@@ -512,13 +534,13 @@ static bool fetch_download(const std::string& url, const std::string& dest, bool
     {
         std::string curl_cmd = "curl -fL ";
         curl_cmd += quiet ? "-s " : "--progress-bar ";
-        curl_cmd += "-H 'Accept: application/octet-stream' ";
+        curl_cmd += "-H " + shell_quote("Accept: application/octet-stream") + " ";
         {
             const char* tok = getenv("HF_TOKEN");
             if (!tok)
                 tok = getenv("HUGGING_FACE_HUB_TOKEN");
             if (tok && tok[0])
-                curl_cmd += "-H 'Authorization: Bearer " + std::string(tok) + "' ";
+                curl_cmd += "-H " + shell_quote("Authorization: Bearer " + std::string(tok)) + " ";
         }
         curl_cmd += "-o " + shell_quote(dest) + " " + shell_quote(url);
 
@@ -528,13 +550,13 @@ static bool fetch_download(const std::string& url, const std::string& dest, bool
 
         std::string wget_cmd = "wget ";
         wget_cmd += quiet ? "-q " : "--show-progress ";
-        wget_cmd += "--header='Accept: application/octet-stream' ";
+        wget_cmd += "--header=" + shell_quote("Accept: application/octet-stream") + " ";
         {
             const char* tok = getenv("HF_TOKEN");
             if (!tok)
                 tok = getenv("HUGGING_FACE_HUB_TOKEN");
             if (tok && tok[0])
-                wget_cmd += "--header='Authorization: Bearer " + std::string(tok) + "' ";
+                wget_cmd += "--header=" + shell_quote("Authorization: Bearer " + std::string(tok)) + " ";
         }
         wget_cmd += "-O " + shell_quote(dest) + " " + shell_quote(url);
 
