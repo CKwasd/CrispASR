@@ -6,6 +6,26 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #411 Pocket-TTS multilingual registry — five languages model-proven, fixed 2026-08-31
+
+Added Kyutai's German, Spanish, Italian, Portuguese, and French Pocket-TTS
+checkpoints to the public GGUF repository and wired `-m auto -l de|es|it|pt|fr`
+through the registry, CLI factory/router, and C session ABI. The four distilled
+6-layer Q8_0 models are ~124 MB each; the undistilled French 24-layer preview is
+~365 MB. The converter now downloads only one language at a time and explicitly
+records French's 24 layers because the gated weights repository omits the
+source YAML. Direct inspection of the published GGUF confirmed architecture,
+language, and `num_layers=24` metadata.
+
+Hosted run 33371566746 passed 4,787 registry assertions, capability/static
+tests, the complete backend-wiring audit, public gated-license auto-download,
+and CPU synthesis plus multilingual Whisper roundtrip for all five models.
+Decoded proof: German “Guten Morgen … die Sonne”; Spanish “Buenos días … el
+sol”; Italian “un giorno … splendere il sole”; Portuguese target-exact; French
+“Bonjour. Aujourd'hui, le soleil …”. WAV and log artifacts are retained on the
+run. F16 and Q8_0 voice-cloning GGUFs and the multilingual model card are
+published at `cstr/pocket-tts-GGUF`.
+
 ## #382 Finnish Chatterbox Nano — registry and live proof, fixed 2026-08-30
 
 Registered `JJarvinen/chatterbox-finnish-nano-GGUF` v0.1.3 with its shared

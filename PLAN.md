@@ -433,14 +433,12 @@ Audit PR #345, verify the additive C ABI and failure contracts, and run the
 hermetic plus available model-backed/live tests before deciding whether any
 changes are needed.
 
-## CLAIMED 2026-08-31 — #411 multilingual Pocket-TTS and next release
+## CLAIMED 2026-08-31 — next release (#411 implementation complete)
 
 Worktree: `.claude/worktrees/feat-pocket-multilingual`.
-Add the five requested upstream language checkpoints across conversion,
-registry/CLI/C-ABI surfaces and documentation; validate tokenizer/model-backed
-output per language with hosted CI or Kaggle; then write comprehensive release
-notes from the previous tag and cut the next version only after the final tip is
-green.
+#411 shipped on main with all five F16/Q8_0 artifacts and hosted decoded-output
+proof (run 33371566746); see HISTORY.md. Comprehensive v0.8.31 notes are drafted.
+Cut the version only after the final tip is green.
 
 ## CLAIMED 2026-08-13 — #344 MOSS valid-frame metadata in stable C ABI
 
