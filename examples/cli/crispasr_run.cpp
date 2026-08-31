@@ -2929,15 +2929,20 @@ int crispasr_run_backend(const whisper_params& params_in) {
         (backend_name == "pocket-tts" || backend_name == "pocket_tts" || backend_name == "pockettts" ||
          backend_name == "pocket")) {
         std::string routed;
-        if (params.language == "de") routed = "pocket-tts-de";
-        else if (params.language == "es") routed = "pocket-tts-es";
-        else if (params.language == "it") routed = "pocket-tts-it";
-        else if (params.language == "pt") routed = "pocket-tts-pt";
-        else if (params.language == "fr") routed = "pocket-tts-fr";
+        if (params.language == "de")
+            routed = "pocket-tts-de";
+        else if (params.language == "es")
+            routed = "pocket-tts-es";
+        else if (params.language == "it")
+            routed = "pocket-tts-it";
+        else if (params.language == "pt")
+            routed = "pocket-tts-pt";
+        else if (params.language == "fr")
+            routed = "pocket-tts-fr";
         if (!routed.empty()) {
             if (!params.no_prints) {
-                fprintf(stderr, "crispasr: -l %s with --backend %s — auto-routing to %s\n",
-                        params.language.c_str(), backend_name.c_str(), routed.c_str());
+                fprintf(stderr, "crispasr: -l %s with --backend %s — auto-routing to %s\n", params.language.c_str(),
+                        backend_name.c_str(), routed.c_str());
             }
             backend_name = routed;
             params.backend = routed;

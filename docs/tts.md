@@ -18,7 +18,7 @@ trade-off:
 - [Kokoro](#kokoro--multilingual-smallest) — multilingual, smallest
 - [Qwen3-TTS](#qwen3-tts--voice-cloning-highest-fidelity) — voice cloning, highest fidelity
   - [qwen3-tts environment switches](#qwen3-tts-environment-switches)
-  - [pocket-tts voices and environment switches](#pocket-tts-voices-and-environment-switches)
+  - [pocket-tts languages, voices, and environment switches](#pocket-tts-languages-voices-and-environment-switches)
 - [VibeVoice](#vibevoice--realtime-streaming-tts) — realtime streaming TTS
 - [VibeVoice 1.5B](#vibevoice-15b--base-tts-with-wav-cloning) — base TTS with WAV cloning
 - [Orpheus](#orpheus--llama-32-3b--snac-codec) — Llama-3.2-3B + SNAC codec
