@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.8.31
+
+* **Pocket-TTS** now supports German, Spanish, Italian, Portuguese, and French
+  through managed GGUF variants, language-aware `-m auto` routing, and the C
+  session ABI (#411).
+* **Chatterbox Nano** gains a Finnish checkpoint (#382), while direct T3
+  KV-cache views remove redundant per-layer copies (#410).
+* Streaming partials avoid repeated audio slicing and can opt into bounded
+  tail decoding; CosyVoice3 enables packed Conv1d by default (#404, #406).
+* GPU portability improves across Windows CUDA 13, old-CPU CUDA packages,
+  Vulkan Chatterbox, Qwen3-TTS HIP fallbacks, and HTDemucs separation
+  (#337, #398, #400, #402, #405).
+* Silero language identification, server-side transcription progress, safer
+  TTS padding, and Go speaker-turn access round out the release (#395, #408,
+  #409).
+
 ## 0.8.30
 
 * **Audio input**: files whose sample rate differs from the backend's are no
