@@ -950,6 +950,7 @@ languages are the distilled 6-layer releases.
 
 ```bash
 ./build/bin/crispasr --backend pocket-tts -m auto -l es \
+  --accept-license pocket-tts-terms \
   --tts "Hola, este modelo ya habla español." \
   --voice samples/jfk.wav --i-have-rights --tts-output pocket-es.wav
 ```

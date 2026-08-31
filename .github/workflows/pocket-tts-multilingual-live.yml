@@ -54,6 +54,7 @@ jobs:
             wav="$WORK/proof/pocket-$lang.wav"
             build/bin/crispasr --backend pocket-tts --gpu-backend cpu \
               -m auto --auto-download --cache-dir "$WORK/cache" -l "$lang" \
+              --accept-license pocket-tts-terms \
               --seed 1234 --voice "$WORK/voice.wav" --i-have-rights \
               --no-spoken-disclaimer --accept-marking-responsibility \
               --tts "${text[$lang]}" --tts-output "$wav" \

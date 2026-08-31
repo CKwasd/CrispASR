@@ -102,6 +102,7 @@ Or with auto-download. `-l de`, `es`, `it`, `pt`, or `fr` selects and caches
 the matching Q8_0 checkpoint; omit `-l` for English:
 ```bash
 ./build/bin/crispasr --backend pocket-tts -m auto --auto-download -l es \
+    --accept-license pocket-tts-terms \
     --voice ref.wav --i-have-rights \
     --tts "Hola, este modelo ya habla español." \
     --tts-output hola.wav
