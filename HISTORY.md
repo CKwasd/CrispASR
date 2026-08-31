@@ -6,6 +6,29 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #397 Piper community voices on Windows — exact lookup, clean-install G2P, and live proof, fixed 2026-08-31
+
+Fixed the reporter's `piper-en_GB-cori-medium-f16.gguf` command end to end.
+An explicit bare filename is now searched unchanged in the normal model/cache
+directories before registry fallback, so a community voice in
+`CRISPASR_MODELS_DIR` is selected and Piper is inferred from its filename;
+it is never silently replaced by the registry's Lessac default. The shared C
+resolver has the same behavior. Piper's pre-generated IPA and CMU dictionaries
+are again downloadable because their cache dependency now lives in and is
+linked from `crispasr-core`. The audit also repaired native Windows downloads:
+WinHTTP now follows Hugging Face's root-relative redirects without corrupting
+UTF conversions, while curl/wget fallback headers are quoted for cmd.exe.
+The Piper docs include copyable PowerShell server and JSON request examples.
+
+Hosted Windows Server 2022 run 33444762281 is the release-independent proof:
+a clean portable CPU build found the exact Cori GGUF, inferred `piper`,
+downloaded and loaded 126,051 IPA entries, synthesized a 2.54-second 22.05 kHz
+WAV, and Whisper recovered “The quick brown fox…”; the server arm recovered
+“You did a great job today” and passed nonempty chunked `audio/pcm`. Local
+proof additionally covered the registry (4,789 assertions), five resolution
+cases, standalone cache/Piper linkage, real CLI/server synthesis, and HTTP WAV
+and streaming roundtrips.
+
 ## #411 Pocket-TTS multilingual registry — five languages model-proven, fixed 2026-08-31
 
 Added Kyutai's German, Spanish, Italian, Portuguese, and French Pocket-TTS

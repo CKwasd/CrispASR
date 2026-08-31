@@ -1,12 +1,28 @@
 # CrispASR — Pending work
 
-## NOW 2026-08-31 — #397 Piper Windows CLI/server resolution and live proof
+## DONE 2026-08-31 — #397 Piper Windows CLI/server resolution and live proof
 
 Worktree `.claude/worktrees/fix-397-piper`, branch
 `fix/397-piper-proof`. Reproduce the reporter's explicit Cori GGUF lookup and
 backend inference, fix misleading fallback/download behavior and broken
 Windows server examples, add regression coverage, then prove packaged-style
 Piper synthesis and server streaming with a real model plus ASR/audio checks.
+
+Root causes fixed: an exact bare community-voice filename was only checked in
+the current directory, so a file already in `CRISPASR_MODELS_DIR` could be
+ignored and replaced by the registry's Lessac default; Piper's clean-install
+G2P dictionary download was compiled out of its backend target; and WinHTTP
+could not follow Hugging Face's root-relative redirect (with broken cmd.exe
+quoting in the curl/wget fallback). Documentation now gives valid PowerShell
+server and request commands.
+
+Proof: local registry suite (4,789 assertions), dry-run resolution (5/5),
+standalone Piper/cache targets, real Cori CLI + server WAV/streaming PCM, and
+Whisper roundtrips passed. Hosted Windows Server 2022 run 33444762281 built a
+portable CPU binary from a clean checkout, resolved the exact Cori file,
+downloaded and loaded 126,051 IPA entries, synthesized 22.05 kHz audio, had
+Whisper recover “The quick brown fox…” and the HTTP “great job” phrase, and
+passed chunked PCM. The workflow retains WAV/log artifacts.
 
 ## DONE 2026-08-30 — Kaggle quiet-box A/Bs → default flips for #404 memo + cv3 SIMDCONV
 
