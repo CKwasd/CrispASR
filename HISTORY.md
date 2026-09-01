@@ -6,6 +6,18 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## #411 Pocket-TTS official prepared voices, fixed 2026-09-01
+
+Added native loading of Kyutai `embeddings_v3/*.safetensors` prepared
+transformer K/V voice states to the Pocket runtime, CLI/server adapter, and C
+session ABI. Bare `--voice` names prefer `<voice-dir>/<name>.safetensors`
+before WAV; malformed or model-incompatible cache shapes fail closed. Local
+real-asset synthesis was non-silent and roundtripped exactly as `Hola mundo.`;
+hosted run
+[33486783999](https://github.com/CrispStrobe/CrispASR/actions/runs/33486783999)
+passed 4,789 assertions and all five multilingual ASR roundtrips, including
+the Alba Spanish prepared voice (four decoded content stems).
+
 ## #397 Piper community voices on Windows — exact lookup, clean-install G2P, and live proof, fixed 2026-08-31
 
 Fixed the reporter's `piper-en_GB-cori-medium-f16.gguf` command end to end.

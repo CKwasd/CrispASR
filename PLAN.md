@@ -1,6 +1,6 @@
 # CrispASR — Pending work
 
-## NOW 2026-09-01 — #411 official Pocket-TTS safetensors voices
+## DONE 2026-09-01 — #411 official Pocket-TTS safetensors voices
 
 Worktree `.claude/worktrees/fix-411-embeddings`, branch
 `fix/411-official-embeddings`. Reproduce the reporter's failure with Kyutai's
@@ -8,6 +8,15 @@ official `embeddings_v3/*.safetensors`, add the prepared transformer-KV voice
 state path to both CLI and C ABI, cover malformed/shape-mismatched assets with
 weight-free unit tests, then prove real synthesis and an ASR roundtrip in
 hosted CI before answering the issue.
+
+Root cause: official embeddings are already-prefilled FlowLM transformer K/V
+states, but every CLI/C-ABI Pocket voice path was decoded as WAV. The runtime
+now validates and installs the safetensors cache and routes explicit or
+`--voice-dir` embeddings on both surfaces. Local exact-asset proof synthesized
+0.96 s at 24 kHz (RMS 0.134) and Whisper decoded `Hola mundo.` exactly. Hosted
+run 33486783999 passed 4,789 unit assertions, wiring audits, loaded Alba (6
+layers / 126 frames), and decoded four required Spanish content stems; all
+other multilingual Pocket roundtrips remained green.
 
 ## DONE 2026-08-31 — #397 Piper Windows CLI/server resolution and live proof
 
