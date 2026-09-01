@@ -1,5 +1,33 @@
 # CrispASR — Pending work
 
+## 2026-09-01 — #419 aligner romanization leaked into display text (FIX)
+
+Worktree `.claude/worktrees/fix-419-canary`, branch `fix/419-canary-cyrillic`.
+
+Reporter (Subtitle Edit, Windows): canary `-l ru` output clean translit
+("vikingi, otvazhnye voyny") instead of Cyrillic. Reproduced on Linux CPU —
+NOT platform-, quant-, or sensitivity-dependent: the trigger is any flag
+that wants word timestamps (`-sp`/`-sow`/srt/vtt/max-len/print-colors),
+which auto-enables the canary-ctc-aligner with force_aligner. Exonerated
+first (worth recording): GGUF vocab == upstream tokenizer.json exactly
+(<|ru|>=157, 2175 Cyrillic pieces at identical ids), prompt construction,
+sensitivity presets, GPU.
+
+Root cause: `crispasr_align_words` romanized the WHOLE transcript
+(core_uroman, #252 — needed as labels for Latin-vocab CTC aligners) and
+returned the romanized strings as the aligned words' TEXT. Display paths
+that rebuild text from words then showed the romanization — Cyrillic AND
+CJK (ja/zh srt output got romaji/pinyin — wider blast radius than the
+report).
+
+Fix: tokenise the ORIGINAL transcript, romanize per-word (1:1) as the
+aligner's labels only, map original words back onto aligned timings
+(`restore_text`, size-guarded) for all three arms (qwen3-fa, wav2vec2,
+canary-ctc). Verified: -sp / reporter's full flags / -osrt all emit
+Cyrillic with correct timings; uroman label-safety unit test added
+(per-word romanization stays single non-empty tokens). Unit suite rerun
+pending RAM headroom (box contended).
+
 ## DONE 2026-09-01 — #411 official Pocket-TTS safetensors voices
 
 Worktree `.claude/worktrees/fix-411-embeddings`, branch

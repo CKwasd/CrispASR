@@ -605,31 +605,64 @@ static std::vector<CrispasrAlignedWord> align_words_impl(const std::string& alig
     if (aligner_model.empty() || transcript.empty() || !samples || n_samples <= 0)
         return out;
 
-    // #252: auto-romanize non-Latin reference text for CTC aligners with Latin vocab.
-    // Disable with CRISPASR_ALIGN_NO_ROMANIZE=1 to pass raw script through.
-    std::string eff_transcript = transcript;
+    // #252: auto-romanize non-Latin reference text for CTC aligners with Latin
+    // vocab. #419: romanization is an ALIGNMENT KEY, never a display
+    // transform. It used to romanize the whole transcript and let the
+    // romanized strings flow back out as the aligned words' text — so every
+    // output path that rebuilds display text from words (-sp/-sow/srt/vtt/
+    // karaoke, i.e. exactly what subtitle tools request) silently replaced
+    // Cyrillic/CJK transcripts with their transliteration ("викинги" came
+    // back "vikingi"). Now: tokenise the ORIGINAL transcript first, romanize
+    // per word (1:1 by construction) for the aligner's labels, and map the
+    // original words back onto the aligned timings before returning.
+    // Disable the romanized labels with CRISPASR_ALIGN_NO_ROMANIZE=1.
+    const auto orig_words = tokenise_words(transcript);
+    std::vector<std::string> label_words = orig_words;
     {
         const char* no_rom = std::getenv("CRISPASR_ALIGN_NO_ROMANIZE");
         if (!(no_rom && no_rom[0] == '1') && core_uroman::needs_romanization(transcript)) {
-            eff_transcript = core_uroman::romanize(transcript);
+            for (auto& w : label_words) {
+                if (core_uroman::needs_romanization(w))
+                    w = core_uroman::romanize(w);
+            }
             const char* dbg = std::getenv("CRISPASR_ALIGN_DEBUG");
-            if (dbg && dbg[0] == '1')
-                fprintf(stderr, "crispasr[aligner]: romanized → \"%s\"\n", eff_transcript.c_str());
+            if (dbg && dbg[0] == '1') {
+                std::string joined;
+                for (const auto& w : label_words) {
+                    if (!joined.empty())
+                        joined += ' ';
+                    joined += w;
+                }
+                fprintf(stderr, "crispasr[aligner]: romanized labels → \"%s\"\n", joined.c_str());
+            }
         }
     }
+    // Restore the original-script text onto the aligned words. Every arm
+    // aligns label_words 1:1, so a size match is the expected case; on a
+    // mismatch (an arm dropped words) keep the arm's text rather than guess.
+    auto restore_text = [&](std::vector<CrispasrAlignedWord> v) {
+        if (v.size() == orig_words.size()) {
+            for (size_t i = 0; i < v.size(); i++)
+                v[i].text = orig_words[i];
+        } else if (!v.empty()) {
+            fprintf(stderr,
+                    "crispasr[aligner]: aligned %zu words for %zu inputs — keeping the aligner's "
+                    "own labels for this segment\n",
+                    v.size(), orig_words.size());
+        }
+        return v;
+    };
 
     const bool is_qwen3_fa = path_contains_ci(aligner_model, "forced-aligner") ||
                              path_contains_ci(aligner_model, "qwen3-fa") ||
                              path_contains_ci(aligner_model, "qwen3-forced");
     if (is_qwen3_fa) {
-        const auto words = tokenise_words(eff_transcript);
-        return align_qwen3_fa(aligner_model, words, samples, n_samples, t_offset_cs, n_threads);
+        return restore_text(align_qwen3_fa(aligner_model, label_words, samples, n_samples, t_offset_cs, n_threads));
     }
 
     const std::string arch = gguf_architecture(aligner_model);
     if (is_wav2vec2_aligner_model(aligner_model, arch)) {
-        const auto words = tokenise_words(eff_transcript);
-        return align_wav2vec2_ctc(aligner_model, words, samples, n_samples, t_offset_cs, n_threads);
+        return restore_text(align_wav2vec2_ctc(aligner_model, label_words, samples, n_samples, t_offset_cs, n_threads));
     }
 
     // §176e: reuse cached canary-ctc context if same model path.
@@ -660,18 +693,18 @@ static std::vector<CrispasrAlignedWord> align_words_impl(const std::string& alig
         return out;
     }
 
-    const auto words = tokenise_words(eff_transcript);
-    if (words.empty()) {
+    if (label_words.empty()) {
         free(ctc_logits);
         return out;
     }
 
-    std::vector<canary_ctc_word> aligned(words.size());
-    std::vector<const char*> word_ptrs(words.size());
-    for (size_t i = 0; i < words.size(); i++)
-        word_ptrs[i] = words[i].c_str();
+    std::vector<canary_ctc_word> aligned(label_words.size());
+    std::vector<const char*> word_ptrs(label_words.size());
+    for (size_t i = 0; i < label_words.size(); i++)
+        word_ptrs[i] = label_words[i].c_str();
 
-    rc = canary_ctc_align_words(actx, ctc_logits, T_ctc, V_ctc, word_ptrs.data(), (int)words.size(), aligned.data());
+    rc = canary_ctc_align_words(actx, ctc_logits, T_ctc, V_ctc, word_ptrs.data(), (int)label_words.size(),
+                                aligned.data());
     free(ctc_logits);
     // Do NOT free actx — it's cached (§176e).
 
@@ -688,5 +721,5 @@ static std::vector<CrispasrAlignedWord> align_words_impl(const std::string& alig
         cw.t1_cs = t_offset_cs + w.t1;
         out.push_back(std::move(cw));
     }
-    return out;
+    return restore_text(std::move(out));
 }
