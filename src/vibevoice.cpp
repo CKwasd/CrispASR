@@ -307,6 +307,23 @@ extern "C" struct vibevoice_context* vibevoice_init_from_file(const char* path_m
         }
     }
 
+    // #418 (second finding): BitNet ternary weights (TQ1_0/TQ2_0) cannot be
+    // used from a Vulkan buffer — no Vulkan kernels exist for the type, so the
+    // scheduler aborts at the first lookup: "pre-allocated tensor
+    // (lm.tok_emb.weight) in a buffer (Vulkan0) that cannot run the operation"
+    // (ggml-backend.cpp:940). Scan the tensor types while the metadata is
+    // still open so backend selection below can route the whole model to CPU
+    // instead of aborting. CRISPASR_VIBEVOICE_TQ_VULKAN=1 keeps Vulkan anyway
+    // (bisection gate for when Vulkan gains TQ kernels).
+    bool has_tq_weights = false;
+    for (int64_t ti = 0, tn = gguf_get_n_tensors(gctx); ti < tn; ti++) {
+        const ggml_type tt = gguf_get_tensor_type(gctx, ti);
+        if (tt == GGML_TYPE_TQ1_0 || tt == GGML_TYPE_TQ2_0) {
+            has_tq_weights = true;
+            break;
+        }
+    }
+
     gguf_free(gctx);
 
     if (params.verbosity >= 1) {
@@ -321,6 +338,16 @@ extern "C" struct vibevoice_context* vibevoice_init_from_file(const char* path_m
     // backend is Metal/CUDA/Vulkan.
     ctx->backend = hp.d_lm > 0 ? (params.use_gpu ? crispasr_init_gpu_backend() : core_cpu_backend::init())
                                : core_cpu_backend::init();
+    if (has_tq_weights && ctx->backend) {
+        const char* bname = ggml_backend_name(ctx->backend);
+        const char* keep = crispasr_env::get("CRISPASR_VIBEVOICE_TQ_VULKAN");
+        if (bname && std::strncmp(bname, "Vulkan", 6) == 0 && !(keep && keep[0] == '1')) {
+            fprintf(stderr, "vibevoice: BitNet (TQ) weights have no Vulkan kernels — running this model on "
+                            "CPU instead (issue #418; override with CRISPASR_VIBEVOICE_TQ_VULKAN=1)\n");
+            ggml_backend_free(ctx->backend);
+            ctx->backend = nullptr; // fall through to the CPU path below
+        }
+    }
     if (!ctx->backend)
         ctx->backend = core_cpu_backend::init();
     ctx->backend_cpu = core_cpu_backend::init();

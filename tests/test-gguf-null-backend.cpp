@@ -25,8 +25,12 @@ namespace {
 
 // Write a minimal but valid GGUF (one F32 tensor) so the null-backend guard
 // is what the load trips on, not a parse error.
-std::string write_tiny_gguf() {
-    std::string path = "test-gguf-null-backend.tmp.gguf";
+std::string write_tiny_gguf(const char* tag) {
+    // Per-case filename: ctest -j runs the two cases of this binary
+    // CONCURRENTLY (catch_discover_tests registers each TEST_CASE as its own
+    // ctest entry), and a shared name let one case delete the file while the
+    // other was reading it — a flake seen on the first -j2 run after landing.
+    std::string path = std::string("test-gguf-null-backend.") + tag + ".tmp.gguf";
     ggml_init_params ip{ggml_tensor_overhead() + 64 * sizeof(float), nullptr, false};
     ggml_context* ctx = ggml_init(ip);
     REQUIRE(ctx != nullptr);
@@ -48,7 +52,7 @@ std::string write_tiny_gguf() {
 } // namespace
 
 TEST_CASE("load_weights with a null backend fails cleanly instead of aborting", "[unit][gguf][null-backend]") {
-    const std::string path = write_tiny_gguf();
+    const std::string path = write_tiny_gguf("null");
 
     core_gguf::WeightLoad wl;
     // Pre-fix: GGML_ASSERT(backend) abort inside ggml_backend_get_device().
@@ -62,7 +66,7 @@ TEST_CASE("load_weights with a null backend fails cleanly instead of aborting", 
 TEST_CASE("load_weights with a real CPU backend still succeeds on the same file", "[unit][gguf][null-backend]") {
     // Control arm: the guard must reject ONLY the null backend, not break
     // normal loading of the identical file.
-    const std::string path = write_tiny_gguf();
+    const std::string path = write_tiny_gguf("cpu");
 
     ggml_backend_t cpu = core_cpu_backend::init();
     REQUIRE(cpu != nullptr);

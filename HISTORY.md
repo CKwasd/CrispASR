@@ -84,6 +84,45 @@ Hosted live run 33333867440 used public Nano Q4_K plus Turbo S3Gen Q4_K: both
 paths emitted the same 40-token trajectory and byte-identical decoded PCM.
 `CRISPASR_CHATTERBOX_KV_CONT=1` retains the old path as a diagnostic A/B.
 
+## #418 VibeVoice-ASR aborted on Intel Arc Vulkan — encoder CPU fallback + BitNet TQ guard, fixed 2026-09-01
+
+An Arc B580 user transcribing a 1-hour file hit `ggml-vulkan
+GGML_ASSERT(wg0 <= maxComputeWorkGroupCount…)` on every VAD slice, for both
+the q4_k and bitnet ASR models — and correctly guessed the cause: the σ-VAE
+DECODER got a CPU fallback for exactly this device class in issue #52, but
+the ENCODERS (the ASR direction) missed it. The acoustic/semantic tokenizer
+encoders dispatch convs over the raw 24 kHz waveform; on drivers whose
+`maxComputeWorkGroupCount` is 65535 per dimension (Intel ANV, llvmpipe —
+NVIDIA reports 2^31) even an 11 s slice overflows.
+
+Fix 1: `vibevoice_backend_policy.h` — a pure, unit-tested decision table
+(`CRISPASR_VIBEVOICE_ENC_BACKEND={auto|cpu|gpu}`); auto pins the encoder
+graphs to the CPU backend on Vulkan+Intel/llvmpipe via
+`ggml_backend_sched_set_tensor_backend`, the same mechanism as the #52
+decoder fallback. Metal is deliberately NOT diverted. Along the way the #52
+decoder matcher turned out to be silently dead: it matched
+`ggml_backend_dev_name()`, which for Vulkan is the registry label
+("Vulkan0") — the marketing string with "Intel"/"llvmpipe" lives in
+`ggml_backend_dev_description()`. Both policies now check both strings.
+
+Fix 2 (second finding while proving the first): BitNet TQ1_0/TQ2_0 weights
+have no Vulkan kernels at all — post-encoder the load aborted with
+"pre-allocated tensor (lm.tok_emb.weight) in a buffer (Vulkan0) that cannot
+run the operation" (ggml-backend.cpp:940). The loader now scans tensor types
+and routes a TQ model entirely to CPU under Vulkan with a clear message
+(`CRISPASR_VIBEVOICE_TQ_VULKAN=1` keeps Vulkan for when kernels land).
+
+Proof, all on this VPS with mesa lavapipe (llvmpipe reports the same 65535
+limit as Intel; ggml hides CPU-class Vulkan devices unless
+`GGML_VK_VISIBLE_DEVICES=0`): the pre-fix behaviour
+(`CRISPASR_VIBEVOICE_ENC_BACKEND=gpu`) reproduces the reporter's abort
+bit-for-bit (rc=134, same assert, right after the encoder banner, on 33 s
+AND 11 s clips); the fixed defaults run the same 33 s clip end-to-end to the
+correct JFK transcript (encoder-diversion log line + TQ-guard log line both
+firing). Local Vulkan builds on this 8 GB box need the generated SPIR-V
+blob TUs compiled -O0 (a ~120 MB initializer file OOMs cc1plus at -O3) —
+kept as an uncommitted ggml-submodule note, not shipped.
+
 ## #405 CUDA package on a pre-AVX2 CPU had NO cpu backend — variant CPU modules + graceful no-CPU failure, fixed 2026-08-30
 
 A Tesla P40 user (old pre-AVX2 Xeon) crashed on every run of the

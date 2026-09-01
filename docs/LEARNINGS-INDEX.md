@@ -17,7 +17,7 @@ per-backend porting detail (Per-model port notes + the family cross-reference).
 Reach for the topic groups when you are stuck on a *technique*, and the
 cross-reference when you already know which model you are touching.
 
-## Index by topic (295 lessons)
+## Index by topic (296 lessons)
 
 **Security & untrusted input** (2)
 
@@ -264,7 +264,7 @@ cross-reference when you already know which model you are touching.
 - L16894 — cohere language whitelist + probe LID
 - L17012 — CV3 phase 6 speech_tokenizer_v3 ggml port
 
-**Mel, codecs & the audio front-end** (16)
+**Mel, codecs & the audio front-end** (17)
 
 - L241 — The audio front door resampled with linear interpolation
 - L2051 — A one-frame error in a codec ENCODER shifts every RoPE position and shows up as an onset artifact, not a gradual drift — and a padding scheme faithful to one codec can be wrong for another
@@ -282,6 +282,7 @@ cross-reference when you already know which model you are touching.
 - L15402 — #245/§232 qwen3-tts CP_DIRECT + codec FASTCONV DONE
 - L17727 — glint MP3+AAC TTS output §225 SHIPPED
 - L18210 — voxcpm2 CausalTransposeConv1d kwargs gotcha
+- L18676 — The #52 fallback died silently when name and description split — and the encoder half of a symmetric codec never inherited it
 
 **Process, triage & documentation discipline** (19)
 
