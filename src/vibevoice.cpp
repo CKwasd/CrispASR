@@ -14,6 +14,7 @@
 #define _USE_MATH_DEFINES
 
 #include "vibevoice.h"
+#include "vibevoice_backend_policy.h"
 #include "core/attention.h"
 #include "core/bpe.h"
 #include "core/vibevoice_asr_prompt.h"
@@ -803,10 +804,47 @@ static int vibevoice_encoder_left_context_samples() {
 
 // Run one tokenizer encoder call: a single graph build + compute, no
 // chunking. Returns [vae_dim * T] row-major, frame-first.
+// Issue #418: whether the σ-VAE tokenizer encoders (at_enc / st_enc) run on
+// CPU instead of the active backend. On Vulkan devices whose
+// maxComputeWorkGroupCount is 65535 (Intel Arc/Iris/UHD, llvmpipe) the
+// encoder conv dispatches over long raw audio exceed the limit and ggml
+// aborts in ggml_vk_dispatch_pipeline — the ASR-side twin of the decoder's
+// issue-#52 fallback. Decision table in vibevoice_backend_policy.h; override
+// with CRISPASR_VIBEVOICE_ENC_BACKEND={auto|cpu|gpu}.
+static bool vibevoice_enc_should_use_cpu(vibevoice_context* ctx) {
+    if (!ctx->backend_cpu || ctx->backend_cpu == ctx->backend)
+        return false; // no distinct CPU backend wired — nothing to divert to
+    const char* backend_name = ctx->backend ? ggml_backend_name(ctx->backend) : nullptr;
+    const char* device_name = nullptr;
+    if (ctx->backend) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(ctx->backend);
+        // NOTE: dev_name for Vulkan is the registry label ("Vulkan0"); the
+        // marketing string that carries "Intel"/"llvmpipe" is the DESCRIPTION.
+        device_name = dev ? ggml_backend_dev_description(dev) : nullptr;
+    }
+    const bool cpu =
+        vibevoice_policy::enc_use_cpu(crispasr_env::get("CRISPASR_VIBEVOICE_ENC_BACKEND"), backend_name, device_name);
+    static bool s_logged = false;
+    if (cpu && !s_logged) {
+        s_logged = true;
+        fprintf(stderr,
+                "vibevoice: tokenizer encoders → CPU (device '%s' has a low Vulkan workgroup-count "
+                "limit, issue #418; override with CRISPASR_VIBEVOICE_ENC_BACKEND=gpu)\n",
+                device_name ? device_name : "?");
+    }
+    return cpu;
+}
+
 static std::vector<float> run_encoder_stage_one_call(vibevoice_context* ctx, const char* prefix, const float* samples,
                                                      int n_samples, int* out_T, int* out_vae_dim) {
     ggml_cgraph* gf = build_tokenizer_encoder_graph(ctx, prefix, n_samples);
     ggml_backend_sched_reset(ctx->sched);
+    // #418: pin the whole encoder graph to CPU on low-workgroup-limit Vulkan
+    // devices — same mechanism as the σ-VAE decoder's #52 fallback.
+    if (vibevoice_enc_should_use_cpu(ctx)) {
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++)
+            ggml_backend_sched_set_tensor_backend(ctx->sched, ggml_graph_node(gf, i), ctx->backend_cpu);
+    }
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         fprintf(stderr, "vibevoice: %s graph alloc failed\n", prefix);
         return {};
@@ -2474,14 +2512,17 @@ static bool backend_is_vulkan_intel_igpu(ggml_backend_t b) {
     ggml_backend_dev_t dev = ggml_backend_get_device(b);
     if (!dev)
         return false;
-    const char* dev_name = ggml_backend_dev_name(dev);
-    if (!dev_name)
-        return false;
-    // Match any Intel GPU naming pattern. Discrete Intel Arc dGPUs
-    // (Alchemist series) also match — they have higher limits than
-    // iGPUs but reports of the same assert haven't been ruled out, so
-    // we err conservative.
-    return std::strstr(dev_name, "Intel") != nullptr;
+    // #418: the device NAME for Vulkan is the registry label ("Vulkan0");
+    // the marketing string that carries "Intel"/"llvmpipe" is the
+    // DESCRIPTION. Matching the name silently disabled this #52 fallback
+    // when ggml split the two — check both so a future swap cannot break it
+    // again.
+    // Match any low-workgroup-limit device (Intel iGPU/dGPU, llvmpipe) —
+    // shared table with the #418 encoder policy. Discrete Intel Arc dGPUs
+    // (Alchemist/Battlemage) also match: #418 confirmed the same 65535
+    // maxComputeWorkGroupCount on a B580, so conservative is correct.
+    return vibevoice_policy::low_workgroup_limit_device(ggml_backend_dev_description(dev)) ||
+           vibevoice_policy::low_workgroup_limit_device(ggml_backend_dev_name(dev));
 }
 
 // Centralised decision for whether the σ-VAE decoder graph should run

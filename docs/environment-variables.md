@@ -1361,6 +1361,13 @@ end-to-end cosine cannot do.
 - `CRISPASR_VIBEVOICE_BITNET_ACT_QUANT`
 - `CRISPASR_VIBEVOICE_DEBUG`
 - `CRISPASR_VIBEVOICE_DUMP_DIR`
+- `CRISPASR_VIBEVOICE_ENC_BACKEND` — `{auto|cpu|gpu}` backend for the σ-VAE
+  tokenizer ENCODERS (the ASR direction). `auto` (default) diverts them to CPU
+  on Vulkan devices with a 65535 `maxComputeWorkGroupCount` (Intel Arc/Iris/
+  UHD, llvmpipe), where the conv dispatches over long audio overflow and abort
+  (issue #418 — the ASR twin of the decoder's #52 fallback,
+  `CRISPASR_VIBEVOICE_VAE_BACKEND`). `gpu` forces the active backend (the
+  repro arm); `cpu` forces the fallback anywhere.
 - `CRISPASR_VIBEVOICE_ENCODER_CHUNK_SECONDS`
 - `CRISPASR_VIBEVOICE_ENCODER_CONTEXT_SECONDS`
 - `CRISPASR_VIBEVOICE_GELU_TANH`

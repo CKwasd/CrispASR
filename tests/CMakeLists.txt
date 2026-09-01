@@ -5179,6 +5179,17 @@ catch_discover_tests(test-gguf-null-backend
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test-vibevoice-enc-policy — issue #418 encoder-backend decision table (hermetic, unit)
+add_executable(test-vibevoice-enc-policy test-vibevoice-enc-policy.cpp)
+target_include_directories(test-vibevoice-enc-policy PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-vibevoice-enc-policy PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-vibevoice-enc-policy
+    TEST_SPEC "[enc-policy]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test-num2words-fr-es — French + Spanish number expansion (hermetic, unit)
 add_executable(test-num2words-fr-es test-num2words-fr-es.cpp)
 target_include_directories(test-num2words-fr-es PRIVATE ${PROJECT_SOURCE_DIR}/src)
