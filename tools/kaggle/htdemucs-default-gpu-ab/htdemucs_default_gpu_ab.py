@@ -40,7 +40,7 @@ RESULTS = WORK / "htdemucs414_results.json"
 
 HERE = Path(__file__).resolve().parent
 CRISPASR_URL = "https://github.com/CrispStrobe/CrispASR.git"
-BRANCH = "integr/pr-414"  # switch to "main" after the merge for re-runs
+BRANCH = "main"  # proof runs used integr/pr-414 (merged as 208b2d59); main keeps re-runs working
 CLONE = Path("/kaggle/temp/CrispASR")
 if not CLONE.exists():
     try:
