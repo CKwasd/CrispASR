@@ -884,6 +884,54 @@ std::vector<float> sidon_extract_hidden(sidon_context* ctx, const float* pcm_16k
     return hidden;
 }
 
+// Degenerate-output detection (issue #416). Sidon's failure mode when a stage
+// miscomputes is not a crash and not an error return — it is a full-length
+// buffer of zeros or NaNs, which reaches the WAV writer as a perfectly valid
+// file of pure silence. The reporter of #416 had literally nothing to go on:
+// rc=0, correct duration, correct sample rate, no message.
+//
+// NaN and all-zero are reported separately on purpose. They look identical
+// downstream (float->int16 turns NaN into 0), but they mean different things:
+// NaN is arithmetic that went wrong, all-zero is a stage that produced nothing.
+// Checking both stages says whether the predictor or the DAC decoder is at
+// fault, which is the first question any such report has to answer, and it
+// costs one O(n) pass against multi-second graph compute.
+namespace {
+struct SignalStats {
+    size_t n_nonfinite = 0;
+    float peak = 0.0f;
+};
+
+SignalStats scan_signal(const std::vector<float>& v) {
+    SignalStats s;
+    for (const float x : v) {
+        if (!std::isfinite(x)) {
+            ++s.n_nonfinite;
+            continue;
+        }
+        s.peak = std::max(s.peak, std::fabs(x));
+    }
+    return s;
+}
+
+// `stage` is the producer being judged; `next` names what it feeds, so the
+// message points at the boundary rather than just the symptom.
+void warn_if_degenerate(const SignalStats& s, size_t n, const char* stage, const char* next) {
+    if (s.n_nonfinite) {
+        std::fprintf(stderr,
+                     "sidon: WARNING: %s produced %zu non-finite value(s) of %zu — %s will be silent. "
+                     "This is a compute fault, not a quantization-precision effect; please report the model "
+                     "file and the backend in use (run with -ng to compare against CPU).\n",
+                     stage, s.n_nonfinite, n, next);
+    } else if (s.peak == 0.0f && n > 0) {
+        std::fprintf(stderr,
+                     "sidon: WARNING: %s output is identically zero — %s will be silent. "
+                     "Please report the model file and the backend in use (run with -ng to compare against CPU).\n",
+                     stage, next);
+    }
+}
+} // namespace
+
 std::vector<float> sidon_restore(sidon_context* ctx, const float* samples, int n_samples) {
     if (!ctx || !samples || n_samples < 400)
         return {};
@@ -969,6 +1017,11 @@ std::vector<float> sidon_restore(sidon_context* ctx, const float* samples, int n
     std::vector<float> predictor_features((size_t)ggml_nelements(ctx->predictor_output));
     ggml_backend_tensor_get(ctx->predictor_output, predictor_features.data(), 0,
                             predictor_features.size() * sizeof(float));
+
+    // Judge the predictor BEFORE the DAC consumes it, so a bad handoff is
+    // attributed to the predictor rather than to the decoder it poisons.
+    const SignalStats predictor_stats = scan_signal(predictor_features);
+    warn_if_degenerate(predictor_stats, predictor_features.size(), "the w2v-BERT predictor", "the restored audio");
 
     // Diff-harness hook: dump the predictor handoff (raw f32 + ne dims on a
     // header line to stderr) so it can be compared against the upstream
@@ -1093,6 +1146,12 @@ std::vector<float> sidon_restore(sidon_context* ctx, const float* samples, int n
     }
     pcm.erase(pcm.begin(), pcm.begin() + (std::ptrdiff_t)lead_samples);
     pcm.resize(target_samples);
+
+    // Only worth reporting if the predictor was healthy — otherwise the warning
+    // above already named the real culprit and this would just be its echo.
+    if (predictor_stats.n_nonfinite == 0 && predictor_stats.peak > 0.0f)
+        warn_if_degenerate(scan_signal(pcm), pcm.size(), "the DAC decoder", "the written file");
+
     const auto download_done = clock::now();
     if (!release_decoder_workspace(ctx)) {
         std::fprintf(stderr, "sidon: failed to release decoder workspace\n");
