@@ -1559,8 +1559,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "             --pitch-hop-ms MS           [%-7.1f] pitch analysis hop in milliseconds\n",
             params.pitch_hop_ms);
     fprintf(stderr,
-            "             --piano                     [%-7s] piano transcription; prints "
-            "onset/offset/midi/name/velocity per note\n",
+            "             --piano                     [%-7s] note-event transcription; prints "
+            "onset/offset/midi/name/velocity per note (piano-transcription / basic-pitch, arch auto-detected)\n",
             params.piano ? "true" : "false");
     fprintf(stderr, "             --piano-format FMT          [%-7s] piano output format: text or json\n",
             params.piano_format.empty() ? "text" : params.piano_format.c_str());

@@ -388,6 +388,7 @@ for the per-task flags and output formats.
   **htdemucs** (4-stem). `--stems vocals,drums` selects a subset;
   `--sep-output-dir` sets the output location.
 - **Piano transcription** (`--backend piano-transcription`) — piano audio → MIDI
+- **Polyphonic note events** (`--backend basic-pitch`) — Spotify Basic Pitch, any instrument → note events (~110 KB model)
   note events (88 keys @ 100 fps, ByteDance/Kong CRNN; F16 GGUF ≈ 77 MB).
 - **Guitar tablature** (`--tab`) — per-frame fret-per-string grid via **TabCNN**
   (Wiggins & Kim, ISMIR 2019; CC BY 4.0 weights). The backend emits per-string

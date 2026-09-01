@@ -1422,11 +1422,17 @@ beats and you never have to merge two lists to reconstruct the grid.
 
 Another standalone task: audio in, **note events** out — onset, offset, MIDI
 pitch, name and velocity. Routes to its own dispatcher before any ASR backend
-is built, like `--pitch` / `--chords` / `--separate`.
+is built, like `--pitch` / `--chords` / `--separate`. Two backends share the
+surface, selected by GGUF architecture: **`piano-transcription`** (ByteDance
+CRNN, 88-key piano, the higher-accuracy piano specialist) and
+**`basic-pitch`** (Spotify, ~110 KB, polyphonic any-instrument, #250 — no
+pedal events).
 
 ```bash
 crispasr --piano -m auto --auto-download -f piano.wav
 crispasr --piano --piano-format json -m piano-transcription-f16.gguf -f piano.wav
+# any-instrument polyphonic, tiny model:
+crispasr --piano --backend basic-pitch -m auto --auto-download -f guitar.wav
 ```
 
 Default output is one tab-separated line per note — `onset_sec`, `offset_sec`,

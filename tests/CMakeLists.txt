@@ -5349,6 +5349,26 @@ catch_discover_tests(test-piano-transcription
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test - basic-pitch — live integration tests (#250)
+add_executable(test-basic-pitch
+    test_basic_pitch_live.cpp
+)
+target_include_directories(test-basic-pitch PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-basic-pitch PRIVATE
+    Catch2::Catch2WithMain
+    basic-pitch
+)
+catch_discover_tests(test-basic-pitch
+    TEST_SPEC "[basic-pitch]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── C2PA native-JS signer — unit + live parity tests (node --test) ──────────
 # The signer (bindings/javascript/c2pa.mjs) re-implements C2PA signing in pure
 # WebCrypto so the wasm build needs no c2pa-rs. Unit tests are hermetic (CBOR
