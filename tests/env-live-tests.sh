@@ -154,6 +154,9 @@ export CRISPASR_MODEL_WAVTOK="${CRISPASR_MODEL_WAVTOK:-$CRISPASR_MODELS_DIR/wavt
 
 # ── Sidon speech restoration ──
 export CRISPASR_MODEL_SIDON="${CRISPASR_MODEL_SIDON:-$CRISPASR_MODELS_DIR/sidon-v0.1-f16.gguf}"
+# Issue #416: quantized Sidon builds must be exercised too — the f16 path
+# alone left every quant untested. Any q8_0/q6_k/q4_k Sidon GGUF works.
+export CRISPASR_MODEL_SIDON_QUANT="${CRISPASR_MODEL_SIDON_QUANT:-$CRISPASR_MODELS_DIR/sidon-v0.1-q8_0.gguf}"
 
 # ── VoxCPM2 AudioVAE speech upscaler ──
 export CRISPASR_MODEL_VOXCPM2_VAE="${CRISPASR_MODEL_VOXCPM2_VAE:-$CRISPASR_MODELS_DIR/voxcpm2-vae-f32.gguf}"

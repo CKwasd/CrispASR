@@ -671,6 +671,33 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                __func__);
     }
 
+    // Sidon speech restoration (arch "sidon"): w2v-BERT predictor + continuous
+    // DAC. The 64 attention/FFN matrices (1024x1024, 1024x4096) are the bulk and
+    // quantize normally; the DAC decoder is 3-D conv and is skipped by ok_dims.
+    // Two 2-D tensors slip through the generic rule and should not:
+    //
+    //   * `...self_attn.distance_embedding.weight` (64 x 73) is the relative-
+    //     position LOOKUP TABLE — one row per distance bucket, the same class as
+    //     every other embedding this file already protects (tok_emb, lang_emb,
+    //     whisper-vad encoder.embed_positions, voxtral codec.semantic_cb). Its
+    //     73 rows bias EVERY attention score in all 8 layers, so rounding them
+    //     perturbs the whole attention map rather than one projection.
+    //   * `predictor.feature_projection.projection.weight` (160 x 1024) is the
+    //     single 160-d feature -> 1024-d hidden input projection. Everything the
+    //     predictor computes is downstream of it.
+    //
+    // Neither row is 256-aligned (73-bucket table rows are 64 wide; the
+    // projection rows are 160), so under `--q4_k` BOTH silently take the row-fit
+    // fallback to legacy Q4_0 — the crudest 4-bit type, not a k-quant — which is
+    // the worst place in this model to spend precision. Keeping both at source
+    // precision costs ~235 KB on a 251 MB q4_k file (0.09 %).
+    const bool is_sidon = (arch == "sidon");
+    if (is_sidon) {
+        printf("%s: sidon — keeping the relative-position distance_embedding and the feature "
+               "projection at source precision (they are not 256-aligned and would fall back to Q4_0)\n",
+               __func__);
+    }
+
     // First pass: determine which tensors will be quantized and compute
     // their target types. We need this BEFORE adding tensors to ctx_out
     // so that gguf_add_tensor computes correct offsets for the quantized
@@ -856,6 +883,10 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
             // can't cast k-quant → the pos_emb get_rows workaround, #305). Keep it
             // at F16 like every other positional embedding.
             !(is_whisper_vad && sname == "encoder.embed_positions.weight") &&
+            // Sidon: relative-position lookup table + the input feature
+            // projection stay at source precision (see the is_sidon note above).
+            !(is_sidon && (sname.find("self_attn.distance_embedding.") != std::string::npos ||
+                           sname.find("feature_projection.projection.") != std::string::npos)) &&
             !(is_higgs && (sname == "token_embd.weight" || sname == "output.weight")) &&
             !(is_miotts && sname.find("codec.") == 0) &&
             !(is_parakeet && parakeet_is_rnnt && !parakeet_quant_all &&

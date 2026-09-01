@@ -1,5 +1,55 @@
 # CrispASR — Pending work
 
+## NOW — #416 Sidon quantized models decode to silence
+
+Worktree `.claude/worktrees/fix-416-sidon-quant`, branch `fix/416-sidon-quant`.
+Reporter: `sidon-v0.1-f16.gguf` restores correctly, but `q4_k` and `q8_0` both
+write a full-length file of pure silence.
+
+**NOT REPRODUCED YET — root cause still open.** What is established:
+
+- **Not reproducible on x86-64 CPU.** Same 2 s clip, same three HF artifacts:
+  f16 rms 0.128101, q8_0 0.127733, q4_k 0.126898 (peaks 0.612 / 0.595 / 0.583).
+  All three decode normally.
+- **Not a precision effect.** q8_0 is ~lossless; silence there cannot come from
+  rounding, so it has to be a code path only quantized weights take.
+- **GGUF metadata is sound.** All three files carry the same 372 tensors with
+  identical names; only 73 predictor tensors are quantized. The quants declare
+  the DAC snake `alpha`s and `decoder.model.7.weight` with a dropped trailing
+  `1` (`1x1536x1` -> `1x1536`), which is inert — ggml pads `ne` to 4 dims, and
+  `dac_decoder.h` reads `ne[N]` rather than `ggml_n_dims`.
+- **Vulkan is NOT the culprit.** `distance_embedding` is the only quantized
+  tensor feeding a broadcasting matmul (src0 `[64,73,1,1]` broadcast over
+  H=16 heads), which looked like the classic CPU-tolerant/GPU-strict trap. A
+  probe at sidon's exact shapes on a real Vulkan device (lavapipe, llvmpipe)
+  compared CPU vs Vulkan: F16 cos 0.999999, Q8_0 0.999985, Q4_0 0.999985,
+  magnitudes matching. Hypothesis disproven. `test-backend-ops -o MUL_MAT`
+  on the same device showed no failures either.
+- Untested backends: **CUDA and Metal**. Next step is a Kaggle CUDA run, or
+  the reporter's answer, whichever lands first.
+
+Asked the reporter for OS/GPU, `crispasr --version` backends, and a `-ng`
+(force-CPU) re-run — that flag alone separates a GPU-path fault from a
+CPU-variant one (issue #405 territory).
+
+Shipped meanwhile, independent of the root cause:
+
+- **Sidon had no quantizer rules at all** (contributing checklist point 8 was
+  skipped). `self_attn.distance_embedding.weight` (64x73 relative-position
+  LOOKUP TABLE, biasing every attention score in all 8 layers) and
+  `feature_projection.projection.weight` (160x1024, the sole input projection)
+  were both quantized, and because neither row is 256-aligned both silently
+  took the row-fit fallback to legacy **Q4_0** under `--q4_k`. They now stay at
+  source precision: the re-quantized file drops from 9 Q4_0 tensors to none
+  (238 F32 / 70 F16 / 64 Q4_K) for +282 KB (+0.12 %). Spectrally this is a wash
+  on the 2 s clip (mag_corr vs f16 0.9673 fixed vs 0.9726 before, logmag 0.9697
+  vs 0.9668) — it is a correctness//hygiene change, not a measured quality win.
+- **The coverage gap that let this ship:** `tests/env-live-tests.sh` pointed
+  `CRISPASR_MODEL_SIDON` at the f16 build only, so no quantized Sidon was ever
+  executed by any test. Added `CRISPASR_MODEL_SIDON_QUANT` and a live case that
+  asserts the properties a silent/NaN decode breaks (full length, all-finite,
+  rms > 0.01, peak > 0.05, and output energy ordering tracking the input).
+
 ## 2026-09-01 — #419 aligner romanization leaked into display text (FIX)
 
 Worktree `.claude/worktrees/fix-419-canary`, branch `fix/419-canary-cyrillic`.
