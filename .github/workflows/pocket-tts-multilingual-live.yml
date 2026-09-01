@@ -36,6 +36,12 @@ jobs:
           curl --fail --location --retry 5 \
             -o "$WORK/voice.wav" \
             https://huggingface.co/cstr/crispasr-regression-fixtures/resolve/98ba026354b6c4e6aed93550208e9c6f95e83df7/pocket-tts/ref_voice_kokoro_af_heart.wav
+          # Public mirror of Kyutai embeddings_v3/alba.safetensors. The upstream
+          # repository is gated, while this byte-compatible published asset lets
+          # CI reproduce #411 without a secret token.
+          curl --fail --location --retry 5 \
+            -o "$WORK/alba.safetensors" \
+            https://huggingface.co/audio-cpp/audio.cpp-gguf/resolve/main/PocketTTS-GGUF/spanish/embeddings/alba.safetensors
           curl --fail --location --retry 5 \
             -o "$WORK/ggml-base.bin" \
             https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
@@ -52,10 +58,16 @@ jobs:
           )
           for lang in de es it pt fr; do
             wav="$WORK/proof/pocket-$lang.wav"
+            voice="$WORK/voice.wav"
+            rights=(--i-have-rights)
+            if [ "$lang" = es ]; then
+              voice="$WORK/alba.safetensors"
+              rights=()
+            fi
             build/bin/crispasr --backend pocket-tts --gpu-backend cpu \
               -m auto --auto-download --cache-dir "$WORK/cache" -l "$lang" \
               --accept-license pocket-tts-terms \
-              --seed 1234 --voice "$WORK/voice.wav" --i-have-rights \
+              --seed 1234 --voice "$voice" "${rights[@]}" \
               --no-spoken-disclaimer --accept-marking-responsibility \
               --tts "${text[$lang]}" --tts-output "$wav" \
               2>&1 | tee "$WORK/proof/pocket-$lang-synthesis.log"
@@ -64,6 +76,8 @@ jobs:
               -of "$WORK/proof/pocket-$lang-asr" "$wav" \
               2>&1 | tee "$WORK/proof/pocket-$lang-asr.log"
           done
+          grep -F "loaded prepared voice embedding '$WORK/alba.safetensors'" \
+            "$WORK/proof/pocket-es-synthesis.log"
 
       - name: Validate audio and decoded words
         run: |

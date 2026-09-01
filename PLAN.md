@@ -1,5 +1,14 @@
 # CrispASR — Pending work
 
+## NOW 2026-09-01 — #411 official Pocket-TTS safetensors voices
+
+Worktree `.claude/worktrees/fix-411-embeddings`, branch
+`fix/411-official-embeddings`. Reproduce the reporter's failure with Kyutai's
+official `embeddings_v3/*.safetensors`, add the prepared transformer-KV voice
+state path to both CLI and C ABI, cover malformed/shape-mismatched assets with
+weight-free unit tests, then prove real synthesis and an ASR roundtrip in
+hosted CI before answering the issue.
+
 ## DONE 2026-08-31 — #397 Piper Windows CLI/server resolution and live proof
 
 Worktree `.claude/worktrees/fix-397-piper`, branch

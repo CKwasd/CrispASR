@@ -999,14 +999,23 @@ languages are the distilled 6-layer releases.
   --voice samples/jfk.wav --i-have-rights --tts-output pocket-es.wav
 ```
 
-Voice cloning takes a reference WAV via `--voice`. Three forms are accepted:
+`--voice` accepts either reference audio or Kyutai's prepared voice states:
 
 - **Absolute/relative path** — `--voice /path/to/ref.wav` (requires `--i-have-rights`).
+- **Official embedding** — `--voice alba.safetensors`. Files from Kyutai's
+  `embeddings_v3` directory are prefilled transformer K/V states, so they work
+  even with a GGUF that omits the Mimi voice-cloning encoder. Match the
+  embedding to the model language/layer count.
 - **Bare name + `--voice-dir`** — `--voice alice --voice-dir voices/` resolves to
-  `voices/alice.wav`. This is what `--server` / `{"voice": "<name>"}` requests use,
-  so a single server can serve multiple voices from one directory (issue #255).
+  `voices/alice.safetensors` when present, then `voices/alice.wav`. This is what
+  `--server` / `{"voice": "<name>"}` requests use, so a single server can serve
+  multiple voices from one directory (issues #255 and #411).
 - **Unset** — auto-loads `samples/jfk.wav` as a default; without any voice the
   output is near-silent.
+
+Prepared embeddings are preset identities, not a claim that the voice is safe
+to impersonate. CrispASR retains its disclosure/marking warning; follow the
+embedding publisher's license and personality-rights terms.
 
 | Variable | Default | Effect when set |
 |---|---|---|

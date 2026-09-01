@@ -8214,6 +8214,16 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
         return (tail[0] == '.' && (tail[1] == 'w' || tail[1] == 'W') && (tail[2] == 'a' || tail[2] == 'A') &&
                 (tail[3] == 'v' || tail[3] == 'V'));
     };
+    auto ends_with_safetensors = [](const char* p) {
+        static const char suffix[] = ".safetensors";
+        size_t n = std::strlen(p), m = sizeof(suffix) - 1;
+        if (n < m)
+            return false;
+        for (size_t i = 0; i < m; ++i)
+            if (std::tolower((unsigned char)p[n - m + i]) != suffix[i])
+                return false;
+        return true;
+    };
 
     // Record whether this is a voice CLONE (reference WAV) as opposed to a
     // preset/bank voice name. Every backend arm below reaches the same
@@ -8568,6 +8578,8 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
 #endif
 #ifdef CA_HAVE_POCKET
     if (s->pocket_tts_ctx) {
+        if (ends_with_safetensors(path))
+            return pocket_tts_load_voice_embedding(s->pocket_tts_ctx, path);
         // Pocket TTS (Mimi encoder) expects 24 kHz. Load directly at that
         // rate — avoids the lossy 16k→24k double-resample.
         if (!ends_with_wav(path))

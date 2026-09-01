@@ -405,8 +405,9 @@ CRISPASR_SESSION_API int crispasr_session_set_parakeet_att_context(crispasr_sess
 // is its HiggsAudioV2 tokenizer; for Chatterbox it is S3Gen.
 CRISPASR_SESSION_API int crispasr_session_set_codec_path(crispasr_session* s, const char* path);
 // Set the active TTS backend's voice from its native format. Chatterbox accepts
-// a conditioning GGUF or reference WAV; OmniVoice accepts a reference WAV and
-// uses ref_text_or_null as its transcript. Returns -3 when the active backend
+// a conditioning GGUF or reference WAV; Pocket-TTS accepts a reference WAV or
+// an official prepared *.safetensors voice state; OmniVoice accepts a reference
+// WAV and uses ref_text_or_null as its transcript. Returns -3 when the active backend
 // has no voice-setting implementation.
 CRISPASR_SESSION_API int crispasr_session_set_voice(crispasr_session* s, const char* path,
                                                     const char* ref_text_or_null);
