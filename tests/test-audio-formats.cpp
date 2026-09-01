@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -360,6 +361,122 @@ TEST_CASE("crispasr_audio_load decodes WebM (Opus)", "[audio][unit][webm]") {
     double cc = cross_correlation(ref.pcm, ref.samples, pcm, samples);
     INFO("WebM cross-correlation: " << cc);
     REQUIRE(cc > 0.80);
+
+    crispasr_audio_free(pcm);
+}
+
+// Is the WebM/Opus path built at all? The live-WebM cases below must not
+// silently skip on a decode failure — that is the very regression they guard —
+// so they ask this first and only skip when the *plain* WebM sample fails too.
+static bool webm_opus_available() {
+    float* pcm = nullptr;
+    int samples = 0, rate = 0;
+    int rc = crispasr_audio_load(sample("jfk.webm").c_str(), &pcm, &samples, &rate);
+    if (pcm)
+        crispasr_audio_free(pcm);
+    return rc == 0;
+}
+
+TEST_CASE("crispasr_audio_load decodes live/streaming WebM (Opus, unknown-size clusters)", "[audio][unit][webm]") {
+    // Issue #417 — Chrome MediaRecorder (libwebm mkvmuxer against a
+    // non-seekable writer) emits the Segment AND every Cluster with the EBML
+    // "unknown size" marker, one Cluster per timeslice. The demuxer used to
+    // bound each Cluster by that marker read as a literal length, so it stopped
+    // at the first Cluster and returned ~0.1 s of an 11 s recording.
+    if (!webm_opus_available()) {
+        WARN("WebM decoder not available — skipping");
+        return;
+    }
+
+    float* pcm = nullptr;
+    int samples = 0, rate = 0;
+    int rc = crispasr_audio_load(sample("jfk-live.webm").c_str(), &pcm, &samples, &rate);
+    REQUIRE(rc == 0);
+    REQUIRE(pcm != nullptr);
+    REQUIRE(rate == 16000);
+    REQUIRE(has_energy(pcm, samples));
+
+    auto ref = load_ref();
+
+    // The whole recording, not just the first cluster. The pre-fix decoder
+    // produced a ratio of ~0.008 here, so this bound is far tighter than the
+    // defect it guards.
+    double ratio = (double)samples / ref.samples;
+    INFO("live WebM length ratio: " << ratio);
+    REQUIRE(ratio > 0.98);
+    REQUIRE(ratio < 1.02);
+
+    double cc = cross_correlation(ref.pcm, ref.samples, pcm, samples);
+    INFO("live WebM cross-correlation: " << cc);
+    REQUIRE(cc > 0.80);
+
+    crispasr_audio_free(pcm);
+}
+
+TEST_CASE("crispasr_audio_load handles the 1-byte EBML unknown-size marker", "[audio][unit][webm]") {
+    // The unknown-size marker is "all data bits set", which is
+    // length-dependent: the 1-byte form is 0xFF, whose *value* is 127. A
+    // value-based test misreads it as a 127-byte element. No shipping muxer
+    // writes the short form today, so derive it from the live fixture rather
+    // than carrying a second one.
+    if (!webm_opus_available()) {
+        WARN("WebM decoder not available — skipping");
+        return;
+    }
+
+    std::vector<uint8_t> data;
+    {
+        FILE* f = std::fopen(sample("jfk-live.webm").c_str(), "rb");
+        REQUIRE(f != nullptr);
+        std::fseek(f, 0, SEEK_END);
+        long n = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        REQUIRE(n > 0);
+        data.resize((size_t)n);
+        REQUIRE(std::fread(data.data(), 1, data.size(), f) == data.size());
+        std::fclose(f);
+    }
+
+    static const uint8_t kWide[8] = {0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    std::vector<uint8_t> narrow;
+    narrow.reserve(data.size());
+    int rewritten = 0;
+    for (size_t i = 0; i < data.size();) {
+        if (i + 8 <= data.size() && std::memcmp(data.data() + i, kWide, 8) == 0) {
+            narrow.push_back(0xff);
+            i += 8;
+            ++rewritten;
+        } else {
+            narrow.push_back(data[i]);
+            ++i;
+        }
+    }
+    INFO("rewritten unknown-size markers: " << rewritten);
+    REQUIRE(rewritten > 100); // Segment + one per cluster
+
+    // Fixed name: this is the only writer, and the content is deterministic,
+    // so a concurrent ctest shard racing us would write the same bytes.
+    const std::string tmp = (std::filesystem::temp_directory_path() / "crispasr-live-unknown-1b.webm").string();
+    {
+        FILE* f = std::fopen(tmp.c_str(), "wb");
+        REQUIRE(f != nullptr);
+        REQUIRE(std::fwrite(narrow.data(), 1, narrow.size(), f) == narrow.size());
+        std::fclose(f);
+    }
+
+    float* pcm = nullptr;
+    int samples = 0, rate = 0;
+    int rc = crispasr_audio_load(tmp.c_str(), &pcm, &samples, &rate);
+    std::remove(tmp.c_str());
+    REQUIRE(rc == 0);
+    REQUIRE(rate == 16000);
+    REQUIRE(has_energy(pcm, samples));
+
+    auto ref = load_ref();
+    double ratio = (double)samples / ref.samples;
+    INFO("1-byte-marker live WebM length ratio: " << ratio);
+    REQUIRE(ratio > 0.98);
+    REQUIRE(ratio < 1.02);
 
     crispasr_audio_free(pcm);
 }

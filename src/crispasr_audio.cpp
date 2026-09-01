@@ -674,7 +674,19 @@ struct EBMLReader {
 
     // Read EBML variable-length integer (VINT). Returns the value and advances pos.
     // On failure returns UINT64_MAX.
-    uint64_t read_vint() {
+    //
+    // A size VINT whose data bits are ALL ONES means "unknown size" — the
+    // element runs until the next element that cannot be its child. That is
+    // what live/streaming muxers (Chrome MediaRecorder via libwebm, ffmpeg
+    // `-live 1`) write for the Segment and for every Cluster. It must be
+    // distinguished from a parse failure, and from a genuine size: the
+    // all-ones pattern is length-dependent (0xFF is 127, not "huge"), so it
+    // cannot be recognised from the returned value alone. Callers that care
+    // pass `out_unknown`; the value returned in that case is the all-ones
+    // number and must not be used as a length.
+    uint64_t read_vint(bool* out_unknown = nullptr) {
+        if (out_unknown)
+            *out_unknown = false;
         if (eof())
             return UINT64_MAX;
         uint8_t first = data[pos];
@@ -696,6 +708,12 @@ struct EBMLReader {
         for (int i = 1; i < len; ++i)
             val = (val << 8) | data[pos + i];
         pos += len;
+
+        if (out_unknown) {
+            // All 7*len data bits set == "unknown size" marker.
+            const uint64_t all_ones = (len >= 9) ? UINT64_MAX : ((1ULL << (7 * len)) - 1);
+            *out_unknown = (val == all_ones);
+        }
         return val;
     }
 
@@ -768,6 +786,52 @@ struct EBMLReader {
 
     const uint8_t* ptr() const { return data + pos; }
 };
+
+// Valid direct children of a Cluster (Matroska spec). Used to find where an
+// unknown-size Cluster ends: it ends at the first element that is not one of
+// these — in practice the next Cluster, or Cues/Tags at the end of the file.
+static bool is_cluster_child_id(uint32_t id) {
+    switch (id) {
+    case 0xE7:   // Timestamp (Timecode)
+    case 0x5854: // SilentTracks
+    case 0xA7:   // Position
+    case 0xAB:   // PrevSize
+    case 0xA3:   // SimpleBlock
+    case 0xA0:   // BlockGroup
+    case 0xAF:   // EncryptedBlock
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Resolve the end offset of an unknown-size Cluster whose body starts at
+// `body_pos`. Walks the child headers only (no payload) until an element that
+// is not a Cluster child, and returns that element's start offset — that is
+// where the Cluster ends and the next top-level element begins. Bounded by
+// `hard_end`.
+static size_t resolve_unknown_cluster_end(const uint8_t* data, size_t body_pos, size_t hard_end) {
+    EBMLReader r(data, hard_end);
+    r.pos = body_pos;
+    while (r.pos < hard_end) {
+        const size_t id_pos = r.pos;
+        uint32_t id = r.read_id();
+        bool child_unknown = false;
+        uint64_t sz = r.read_vint(&child_unknown);
+        // A malformed header, or a nested unknown size we cannot resolve,
+        // terminates the cluster here rather than swallowing the rest of the
+        // file — the caller still keeps every packet found so far.
+        if (id == 0 || sz == UINT64_MAX || child_unknown)
+            return id_pos;
+        if (!is_cluster_child_id(id))
+            return id_pos;
+        const size_t child_end = r.pos + (size_t)sz;
+        if (child_end > hard_end || child_end < r.pos)
+            return hard_end;
+        r.pos = child_end;
+    }
+    return hard_end;
+}
 
 struct WebMTrack {
     uint64_t track_number = 0;
@@ -985,12 +1049,15 @@ int crispasr_webm_decode(const char* path, int want_channels, float** out_buf, i
 
     // Find Segment
     uint32_t seg_id = r.read_id();
-    uint64_t seg_sz = r.read_vint();
-    if (seg_id != EBML_SEGMENT)
+    bool seg_unknown = false;
+    uint64_t seg_sz = r.read_vint(&seg_unknown);
+    if (seg_id != EBML_SEGMENT || seg_sz == UINT64_MAX)
         return -2;
 
-    size_t seg_end = r.pos + (size_t)seg_sz;
-    if (seg_sz == UINT64_MAX - 1 || seg_end > r.size) // unknown size
+    // A live/streaming muxer writes the Segment with unknown size (it cannot
+    // seek back to patch it once recording ends), so the Segment runs to EOF.
+    size_t seg_end = seg_unknown ? r.size : r.pos + (size_t)seg_sz;
+    if (seg_end > r.size || seg_end < r.pos)
         seg_end = r.size;
 
     // First pass: find Tracks element and parse audio track info
@@ -1000,12 +1067,22 @@ int crispasr_webm_decode(const char* path, int want_channels, float** out_buf, i
 
     while (r.pos < seg_end && !r.eof()) {
         uint32_t id = r.read_id();
-        uint64_t sz = r.read_vint();
+        bool unknown_size = false;
+        uint64_t sz = r.read_vint(&unknown_size);
         if (sz == UINT64_MAX || id == 0)
             break;
-        size_t elem_end = r.pos + (size_t)sz;
-        if (elem_end > seg_end)
-            elem_end = seg_end;
+        size_t elem_end;
+        if (unknown_size) {
+            // Only a Cluster can legitimately carry an unknown size here, and
+            // Tracks always precedes the first one — but resolve it properly
+            // rather than giving up, so a stray unknown-size element before
+            // Tracks does not hide the track list.
+            elem_end = (id == EBML_CLUSTER) ? resolve_unknown_cluster_end(r.data, r.pos, seg_end) : seg_end;
+        } else {
+            elem_end = r.pos + (size_t)sz;
+            if (elem_end > seg_end || elem_end < r.pos)
+                elem_end = seg_end;
+        }
 
         if (id == EBML_TRACKS) {
             // Parse track entries
@@ -1043,16 +1120,24 @@ int crispasr_webm_decode(const char* path, int want_channels, float** out_buf, i
     std::vector<std::vector<uint8_t>> opus_packets;
     std::vector<uint8_t> vorbis_data; // for Vorbis, concatenate raw packets
 
+    size_t n_clusters = 0;
     while (r.pos < seg_end && !r.eof()) {
         uint32_t id = r.read_id();
-        uint64_t sz = r.read_vint();
+        bool unknown_size = false;
+        uint64_t sz = r.read_vint(&unknown_size);
         if (sz == UINT64_MAX || id == 0)
             break;
-        size_t elem_end = r.pos + (size_t)sz;
-        if (elem_end > seg_end)
-            elem_end = seg_end;
+        size_t elem_end;
+        if (unknown_size) {
+            elem_end = (id == EBML_CLUSTER) ? resolve_unknown_cluster_end(r.data, r.pos, seg_end) : seg_end;
+        } else {
+            elem_end = r.pos + (size_t)sz;
+            if (elem_end > seg_end || elem_end < r.pos)
+                elem_end = seg_end;
+        }
 
         if (id == EBML_CLUSTER) {
+            ++n_clusters;
             // Parse blocks within cluster
             while (r.pos < elem_end && !r.eof()) {
                 uint32_t bid = r.read_id();
@@ -1151,7 +1236,8 @@ int crispasr_webm_decode(const char* path, int want_channels, float** out_buf, i
 #endif
         } else {
             if (const char* e = std::getenv("CRISPASR_OPUS_DEBUG"); e && e[0] && e[0] != '0')
-                std::fprintf(stderr, "[glint-webm-opus] %zu packets, %d ch @ 48000\n", opus_packets.size(), ch);
+                std::fprintf(stderr, "[glint-webm-opus] %zu packets from %zu cluster(s), %d ch @ 48000\n",
+                             opus_packets.size(), n_clusters, ch);
             glint_opus_dec_t gdec = glint_opus_dec_create(ch, 48000);
             if (!gdec)
                 return -2;

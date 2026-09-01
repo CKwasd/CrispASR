@@ -27,6 +27,36 @@ canary-ctc). Verified: -sp / reporter's full flags / -osrt all emit
 Cyrillic with correct timings; uroman label-safety unit test added
 (per-word romanization stays single non-empty tokens). Unit suite rerun
 pending RAM headroom (box contended).
+## DONE 2026-09-01 — #417 Chrome MediaRecorder WebM/Opus truncated to ~0.1 s
+
+Worktree `.claude/worktrees/fix-webm-opus-truncation`, branch
+`fix/webm-opus-truncation`. Reproduce the reporter's truncation with a
+Chrome-style live-muxed WebM, fix the EBML demuxer, and prove the full
+recording decodes on every surface.
+
+Root cause: the inline EBML demuxer in `src/crispasr_audio.cpp` had no notion
+of the *unknown size* marker. A live muxer — Chrome's `MediaRecorder`, i.e.
+libwebm `mkvmuxer` writing to a non-seekable stream — cannot seek back to patch
+lengths, so it emits the Segment and **every Cluster** with that marker and
+starts a new Cluster per `timeslice`. The demuxer read the marker as a literal
+length, bounded the first Cluster there, then jumped to the (clamped) segment
+end — so only the first timeslice of packets was ever collected. With a 100 ms
+timeslice that is the reported ~0.1 s out of 1.13 s. It returned success, so
+the ffmpeg fallback was never reached. The marker is also *length-dependent*
+(all data bits set: the 1-byte form 0xFF has the value 127), so a value-based
+test cannot recognise it — `read_vint()` now reports it via an out-param, and
+an unknown-size Cluster is bounded by walking its child headers until an
+element that is not a valid Cluster child (Matroska spec).
+
+Proof: `samples/jfk-live.webm` (regenerable with `tools/make-live-webm.py`)
+decoded 0.093 s before the fix and 10.993 s after, matching ffmpeg's 10.9935 s
+exactly, with all 110 clusters consumed. Both new guards were watched failing
+against the pre-fix build (length ratio 0.0085; rc -2 on the 1-byte marker)
+before the fix landed. The `[audio]` suite passes 132 assertions in 16 cases;
+mono, stereo and CLI surfaces all agree; end-to-end `crispasr` + moonshine
+transcribed the live WebM to the same text as the WAV ground truth; 300
+mutated inputs produced no crash or hang. ffmpeg's own `-live 1` output
+(unknown Segment, known Clusters) and the plain/Vorbis samples are unregressed.
 
 ## DONE 2026-09-01 — #411 official Pocket-TTS safetensors voices
 
