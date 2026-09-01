@@ -179,6 +179,10 @@
 #include "piano_transcription.h"
 #define CA_HAVE_PIANO_TRANSCRIPTION 1
 #endif
+#if __has_include("basic_pitch.h")
+#include "basic_pitch.h"
+#define CA_HAVE_BASIC_PITCH 1
+#endif
 #if __has_include("moss_tts.h")
 #include "moss_tts.h"
 #define CA_HAVE_MOSS_TTS 1
@@ -1878,6 +1882,12 @@ struct crispasr_session {
 #ifdef CA_HAVE_PIANO_TRANSCRIPTION
     piano_transcription_ctx* piano_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_BASIC_PITCH
+    // Second model behind the same note-event surface. It is NOT
+    // piano-specific, but the task and the flat note layout are identical, so
+    // it reuses crispasr_session_piano* rather than growing a parallel API.
+    basic_pitch_ctx* basic_pitch_ctx_ = nullptr;
+#endif
 #ifdef CA_HAVE_MOSS_TTS
     moss_tts_context* moss_tts_ctx = nullptr;
 #endif
@@ -2808,6 +2818,20 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         p.use_gpu = s->use_gpu;
         s->piano_ctx = piano_transcription_init_from_file(model_path, p);
         if (!s->piano_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_BASIC_PITCH
+    if (s->backend == "basic-pitch" || s->backend == "basic_pitch") {
+        basic_pitch_params p = basic_pitch_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = g_open_verbosity_tls;
+        p.use_gpu = s->use_gpu;
+        s->basic_pitch_ctx_ = basic_pitch_init_from_file(model_path, p);
+        if (!s->basic_pitch_ctx_) {
             delete s;
             return nullptr;
         }
@@ -4308,6 +4332,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_PIANO_TRANSCRIPTION
     list += ",piano-transcription";
+#endif
+#ifdef CA_HAVE_BASIC_PITCH
+    list += ",basic-pitch";
 #endif
 #ifdef CA_HAVE_MOSS_TTS
     list += ",moss-tts";
@@ -10475,13 +10502,35 @@ CA_EXPORT int crispasr_session_piano(crispasr_session* s, const float* pcm_16k, 
         return n;
     }
 #endif
+#ifdef CA_HAVE_BASIC_PITCH
+    if (s->basic_pitch_ctx_) {
+        // NOTE THE PARAMETER NAME: `pcm_16k` is a piano-transcription-ism.
+        // Basic Pitch wants 22050 Hz — callers must ask
+        // crispasr_session_piano_sample_rate() rather than assume 16 kHz.
+        s->piano_last_notes.clear();
+        basic_pitch_result res{};
+        if (basic_pitch_transcribe(s->basic_pitch_ctx_, pcm_16k, n_samples, &res) != 0)
+            return -1;
+        s->piano_last_notes.reserve((size_t)res.n_notes * 4);
+        for (int i = 0; i < res.n_notes; i++) {
+            const basic_pitch_note_event& e = res.notes[i];
+            s->piano_last_notes.push_back(e.start_time * 1000.0f);
+            s->piano_last_notes.push_back(e.end_time * 1000.0f);
+            s->piano_last_notes.push_back((float)e.midi_note);
+            s->piano_last_notes.push_back((float)e.velocity);
+        }
+        const int n = res.n_notes;
+        basic_pitch_result_free(&res);
+        return n;
+    }
+#endif
     return -1;
 }
 
 CA_EXPORT int crispasr_session_piano_n_notes(crispasr_session* s) {
     if (!s)
         return 0;
-#ifdef CA_HAVE_PIANO_TRANSCRIPTION
+#if defined(CA_HAVE_PIANO_TRANSCRIPTION) || defined(CA_HAVE_BASIC_PITCH)
     return (int)(s->piano_last_notes.size() / 4);
 #else
     return 0;
@@ -10510,6 +10559,10 @@ CA_EXPORT int crispasr_session_piano_sample_rate(crispasr_session* s) {
 #ifdef CA_HAVE_PIANO_TRANSCRIPTION
     if (s->piano_ctx)
         return (int)piano_transcription_sample_rate(s->piano_ctx);
+#endif
+#ifdef CA_HAVE_BASIC_PITCH
+    if (s->basic_pitch_ctx_)
+        return (int)basic_pitch_sample_rate(s->basic_pitch_ctx_);
 #endif
     return 0;
 }
@@ -10643,6 +10696,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_PIANO_TRANSCRIPTION
     if (s->piano_ctx)
         piano_transcription_free(s->piano_ctx);
+#endif
+#ifdef CA_HAVE_BASIC_PITCH
+    if (s->basic_pitch_ctx_)
+        basic_pitch_free(s->basic_pitch_ctx_);
 #endif
 #ifdef CA_HAVE_MOSS_TTS
     if (s->moss_tts_ctx)

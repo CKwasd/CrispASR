@@ -730,6 +730,14 @@ constexpr Entry k_registry[] = {
     {"piano-transcription", "piano-transcription-f16.gguf",
      "https://huggingface.co/cstr/piano-transcription-GGUF/resolve/main/piano-transcription-f16.gguf",
      "~77 MB"},
+    // Basic Pitch (Spotify, ICASSP 2022, Apache-2.0): polyphonic note events.
+    // Tiny — the CQT kernels are most of the file. NOTE: the HF repo is not
+    // uploaded yet, so auto-download will 404; build the GGUF locally with
+    // models/convert-basic-pitch-to-gguf.py against the nmp.onnx that ships
+    // inside the basic-pitch package.
+    {"basic-pitch", "basic-pitch-f16.gguf",
+     "https://huggingface.co/cstr/basic-pitch-GGUF/resolve/main/basic-pitch-f16.gguf",
+     "~110 KB"},
     {"moss-tts", "moss-tts-v1.5-q4_k.gguf",
      "https://huggingface.co/cstr/moss-tts-v1.5-GGUF/resolve/main/moss-tts-v1.5-q4_k.gguf",
      "~5 GB",

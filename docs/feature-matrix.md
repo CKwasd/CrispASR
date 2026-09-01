@@ -38,6 +38,7 @@ All 110 backends compiled into the `crispasr` binary, with their declared capabi
 | `qwen3-tts` | ✓ | ✓ |  | ✓ |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  | ✓ |  |
 | `miotts` | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `piano-transcription` |  |  |  |  |  | ✓ | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  | ✓ |  |  |  |  |  |  |
+| `basic-pitch` |  |  |  |  |  | ✓ | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  | ✓ |  |  |  |  |  |  |
 | `moss-tts` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `moss-tts-local` | ✓ | ✓ |  |  |  | ✓ |  |  |  |  | ✓ |  |  | ✓ |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `vibevoice-1.5b` | ✓ | ✓ |  |  |  | ✓ |  | ✓ |  |  |  |  |  | ✓ | ✓ |  |  |  |  |  |  |  | ✓ |  |  |  |  |

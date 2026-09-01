@@ -41,6 +41,7 @@
 #include "mel_band_roformer.h"
 #include "btc_chords.h"
 #include "tabcnn.h"
+#include "basic_pitch.h"
 #include "piano_transcription.h"
 #include "beatrice_phone.h"
 #include "beatrice_pitch.h"
@@ -1343,6 +1344,22 @@ int main(int argc, char** argv) {
         }
         return piano_transcription_diff(model_path.c_str(), ref_path.c_str(), pcm.data(), (int)pcm.size(),
                                         /*verbosity=*/2);
+    }
+    if (backend_name == "basic-pitch" || backend_name == "basic_pitch") {
+        // model_path = basic-pitch GGUF, ref_path = ref.gguf from
+        // tools/reference_backends/basic_pitch.py.
+        //
+        // The reference DOES carry the exact 43844-sample window it fed the
+        // model (audio_window0), and that is the first stage compared, so a
+        // resampler difference between librosa and read_audio_data shows up as
+        // itself instead of silently shifting every downstream cosine.
+        std::vector<float> pcm;
+        std::vector<std::vector<float>> stereo_unused;
+        if (!read_audio_data(audio_path, pcm, stereo_unused, /*stereo=*/false, /*target_rate=*/22050)) {
+            fprintf(stderr, "crispasr-diff: failed to read audio '%s'\n", audio_path.c_str());
+            return 2;
+        }
+        return basic_pitch_diff(model_path.c_str(), ref_path.c_str(), pcm.data(), (int)pcm.size(), /*verbosity=*/2);
     }
     if (backend_name == "htdemucs") {
         // model_path = htdemucs GGUF (f32 for a clean structural diff), ref_path =

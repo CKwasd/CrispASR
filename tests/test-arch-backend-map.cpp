@@ -255,6 +255,7 @@ TEST_CASE("every emitted backend name is a name a surface can open", "[unit][arc
         "rvc-svc",
         "beat-this",
         "piano-transcription",
+        "basic-pitch",
     };
     size_t n = 0;
     const core_arch::entry* k = core_arch::table(&n);

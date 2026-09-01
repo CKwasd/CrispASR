@@ -1683,6 +1683,18 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# basic-pitch — Spotify Basic Pitch, polyphonic note events (Apache-2.0, ~110 KB F16)
+# ---------------------------------------------------------------------------
+add_library(basic-pitch STATIC basic_pitch.h basic_pitch.cpp)
+set_target_properties(basic-pitch PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(basic-pitch PUBLIC .)
+target_compile_features   (basic-pitch PUBLIC cxx_std_17)
+target_link_libraries     (basic-pitch PUBLIC crispasr-core ggml ggml-base crispasr_link_ggml_cpu)
+if(NOT MSVC)
+    target_compile_options(basic-pitch PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # audioseal — Meta AudioSeal watermark generator + detector (MIT, ~5M params)
 # ---------------------------------------------------------------------------
 add_library(audioseal STATIC audioseal.h audioseal.cpp)
@@ -2803,6 +2815,9 @@ if (TARGET vibevoice)
 endif()
 if (TARGET piano-transcription)
     target_link_libraries(crispasr-lib PUBLIC piano-transcription)
+endif()
+if (TARGET basic-pitch)
+    target_link_libraries(crispasr-lib PUBLIC basic-pitch)
 endif()
 if (TARGET kugelaudio)
     target_link_libraries(crispasr-lib PUBLIC kugelaudio)

@@ -4057,8 +4057,32 @@ ggml port targets. New category: audio → note events (MIDI).
   (4-layer Conv2d + 2-layer BiGRU) sub-networks (frame/onset/offset/velocity),
   88-key output at 100fps. ~172 MB checkpoint, ~86 MB F16 GGUF. **TAKEN** (VPS
   session, 2026-07-19).
-- [ ] **Basic Pitch** (Spotify, Apache-2.0). Lightweight CNN (~10 MB). Polyphonic
-  audio → MIDI. After piano_transcription.
+- [x] **Basic Pitch** (Spotify, Apache-2.0). Polyphonic, instrument-agnostic
+  audio → note events. **DONE (2026-08-30, VPS).** The network is tiny (~40k
+  conv weights, 112 KB F16 GGUF) — the model is really its front end.
+  Weights come from the `nmp.onnx` that ships inside the package
+  (`basic_pitch/saved_models/icassp_2022/`, sha256 `2c3c1d14…59a0ec`): the ONNX
+  has the BatchNorms already folded AND carries the nnAudio CQT kernels as
+  initializers, so `models/convert-basic-pitch-to-gguf.py` copies them
+  bit-for-bit instead of reimplementing `scipy.signal.firwin2`.
+  **`src/core/cqt.h` could NOT be reused** — it is the direct-kernel librosa CQT
+  (zero pad, `1+n/hop` frames); Basic Pitch trained on nnAudio **CQT2010v2**
+  (one top-octave kernel bank, 9 octaves of recursive x2 decimation, reflect
+  padding, `sqrt(lengths)` rescale). New `src/core/cqt2010v2.h`; `cqt.h` is
+  untouched so BTC parity is unaffected.
+  Parity vs `tools/reference_backends/basic_pitch.py` (onnxruntime), synthetic
+  polyphonic clip: **every stage cos = 1.000000** — audio window, CQT magnitude,
+  NormalizedLog, harmonic stack, all three heads, and the stitched full-file
+  posteriorgrams. End-to-end note events **27/27 exact** (start, end, MIDI,
+  velocity) at F32; F16 shifts 2 of 27 note ENDS by one frame at a
+  threshold boundary. jfk.wav (16 kHz → resampled, so the resampler differs from
+  librosa's): all stages ≥ 0.9991, note events 11/11 exact at both F16 and F32.
+  Wired: converter + `src/basic_pitch.{h,cpp}` + CLI adapter + `--piano`
+  dispatch (routes on GGUF arch) + arch map + registry row + `crispasr-diff`
+  branch. **GGUF not yet uploaded** — registry row points at
+  `cstr/basic-pitch-GGUF`, build locally until then.
+  Not ported: pitch bends (`get_pitch_bends`) and MIDI file writing — the CLI
+  emits note events, same shape as `piano-transcription`.
 - [ ] **MT3** (Google, Apache-2.0). Seq2seq multi-instrument. Feasibility check
   DONE 2026-08-30 → **GO**, `docs/music-transcription/mt3-feasibility.md`.
   Corrections to the old line: the checkpoint is **171.6 MB** (60 M params, ~120
@@ -4134,7 +4158,9 @@ and Mel-Band RoFormer separation, piano_transcription (§250).
   `cstr/btc-chords-GGUF`. `core/cqt.h` landed and was NOT the last blocker --
   the real bugs were a missing `scale=True` and a chunked-vs-continuous
   front-end mismatch. See `docs/music-transcription/PLAN.md`.
-- [ ] **Basic Pitch** — see §250, claimed there.
+- [x] **Basic Pitch** — see §250. DONE 2026-08-30. Note: it needed a SECOND CQT
+  (`src/core/cqt2010v2.h`, nnAudio CQT2010v2) — `core/cqt.h` stays the librosa
+  direct-kernel one for BTC/TabCNN.
 - [ ] **MT3** — feasibility memo on T5X/JAX checkpoint conversion BEFORE any C++.
 
 ### Phase 2 — surfaces

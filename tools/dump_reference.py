@@ -373,6 +373,17 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # waveform, not from replayed features, or the front end is never tested
     # (the BTC/piano blind spot).
     "tabcnn": "reference_backends.tabcnn",
+    # Basic Pitch (Spotify, ICASSP 2022, Apache-2.0, §250): polyphonic,
+    # instrument-agnostic audio → note events. `model_dir` is the ONNX FILE
+    # (nmp.onnx), which ships inside the basic-pitch package/repo at
+    # basic_pitch/saved_models/icassp_2022/. Runs on onnxruntime — do NOT
+    # install tensorflow for this. Audio arg = any file librosa can read; it is
+    # loaded at 22050 Hz mono.
+    # ⚠️ The CQT lives INSIDE the ONNX, so this dumper exposes the graph's own
+    # intermediate tensors (cqt_magnitude, normalized_log, harmonic_stack) as
+    # extra outputs and emits `audio_window0` too. Diff from the waveform, not
+    # from replayed features — the front end is most of this model.
+    "basic_pitch": "reference_backends.basic_pitch",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import

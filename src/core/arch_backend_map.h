@@ -288,6 +288,8 @@ inline const entry* table(size_t* n_out) {
         {"beat-this",                 "beat-this"},
         {"piano-transcription",       "piano-transcription"},
         {"piano_transcription",       "piano-transcription"},
+        {"basic-pitch",               "basic-pitch"},
+        {"basic_pitch",               "basic-pitch"},
     };
     if (n_out)
         *n_out = sizeof(k) / sizeof(k[0]);
