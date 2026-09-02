@@ -2,9 +2,29 @@
 """Assert every bundled kaggle_harness.py matches the canonical one.
 
 Each tools/kaggle/<kernel>/ directory ships its own copy of
-tools/kaggle/kaggle_harness.py, because `kaggle kernels push` uploads only the
-files in the push directory and the bundled copy is the fallback used when the
+tools/kaggle/kaggle_harness.py, intended as the fallback used when the
 in-kernel `git clone` fails (CPU workers get no internet at all).
+
+⚠ THAT FALLBACK CANNOT FIRE AS BUILT — verified 2026-09-03. `kaggle kernels
+push` on a `kernel_type: script` uploads ONLY `code_file`; `kaggle kernels
+pull` of a pushed kernel returns exactly one .py and nothing else. So the
+bundled copy never reaches Kaggle, `sys.path.insert(0, _script_dir)` points at
+a directory that holds only the script, and a clone failure kills the kernel on
+`import kaggle_harness` regardless of how fresh the bundle is. The copies are
+therefore useful for LOCAL kernel testing only.
+
+Two consequences before anyone invests more here: (1) keeping the copies
+byte-identical is hygiene, not protection — do not treat a green run of this
+check as evidence that the no-internet path works; (2) making the fallback real
+needs the harness to arrive by a route that survives no-internet, i.e. published
+as a Kaggle DATASET and listed in each kernel's `dataset_sources` (the same
+mechanism the hf-token dataset already uses), after which the bundled copies and
+this check can go away entirely.
+
+Note also that 7 of the 61 bundled copies are untracked (a `.gitignore` glob
+added after 54 had already been committed), so they cannot propagate through a
+commit at all — harmless while the copies are local-testing conveniences,
+load-bearing if anyone revives the fallback without fixing the delivery route.
 
 Nothing kept those copies in sync. On 2026-07-20 there were **four** distinct
 versions across 53 files, and the canonical one was used by exactly one kernel.
