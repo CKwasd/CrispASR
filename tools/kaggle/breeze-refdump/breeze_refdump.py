@@ -152,6 +152,29 @@ import soundfile as sf  # noqa: E402
 
 torch.set_grad_enabled(False)
 assert torch.cuda.is_available(), "this kernel needs enable_gpu=true"
+
+# GPU LOTTERY GUARD. Kaggle assigns P100 (sm_60) or T4 (sm_75) and the
+# `machine_shape` metadata field does NOT reliably select one (verified
+# 2026-09-02: a kernel carrying GPU_T4_X2 still drew a P100). Kaggle's OWN
+# preinstalled torch is now built for sm_70/75/90 only, so a P100 draw is
+# FATAL, not merely slow — it dies with "no kernel image is available for
+# execution on the device" AFTER the ~7 GB checkpoint download and model
+# load (observed here, run 3, ~20 wasted minutes). Check first and exit
+# cheaply so a redraw costs ~1 minute.
+_cap = torch.cuda.get_device_capability(0)
+_name = torch.cuda.get_device_name(0)
+print(f"[gpu] {_name} sm_{_cap[0]}{_cap[1]}", flush=True)
+if _cap < (7, 0):
+    print(
+        f"P100_LOTTERY_RETRY: drew {_name} (sm_{_cap[0]}{_cap[1]}); this torch "
+        f"build has no kernels below sm_70. Nothing was computed — re-push to redraw.",
+        flush=True,
+    )
+    Path("/kaggle/working/lottery_retry.json").write_text(
+        json.dumps({"conclusive": False, "reason": "gpu_too_old", "gpu": _name,
+                    "capability": f"sm_{_cap[0]}{_cap[1]}"}, indent=1))
+    raise SystemExit(0)
+
 DEVICE = "cuda:0"
 
 # ── checkpoint ────────────────────────────────────────────────────────────
