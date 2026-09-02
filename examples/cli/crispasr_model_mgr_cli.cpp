@@ -205,8 +205,33 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     bool have_match = crispasr_registry_lookup_by_filename(effective_model_arg, match, effective_quant);
     if (!have_match)
         have_match = crispasr_registry_lookup(effective_model_arg, match, effective_quant);
-    if (!have_match && !backend_name.empty())
+    bool backend_fallback = false; // step 3: the -m arg itself matched NOTHING
+    if (!have_match && !backend_name.empty()) {
         have_match = crispasr_registry_lookup(backend_name, match, effective_quant);
+        backend_fallback = have_match;
+    }
+
+    if (backend_fallback) {
+        // The user's -m matched nothing; only --backend did. Silently handing
+        // back the backend's registry default here meant a typo'd path
+        // transcribed with a DIFFERENT model at rc 0 (found 2026-09-02 while
+        // execution-verifying the getting-started tutorial). A slash makes the
+        // intent unambiguous — that is a PATH, and a missing path is an error,
+        // same posture as the unreadable-entry branch above. A bare name keeps
+        // the historical substitution but says so loudly.
+        if (effective_model_arg.find('/') != std::string::npos || effective_model_arg.find('\\') != std::string::npos) {
+            fprintf(stderr,
+                    "crispasr: model file '%s' does not exist and matches no registry entry.\n"
+                    "  Refusing to substitute the '%s' registry default for an explicit --model path.\n"
+                    "  Fix the path, or pass -m auto to use the registry default.\n",
+                    effective_model_arg.c_str(), backend_name.c_str());
+            return effective_model_arg;
+        }
+        fprintf(stderr,
+                "crispasr: WARNING: '-m %s' does not exist and matches no registry entry — "
+                "substituting the '%s' registry default '%s'. Pass -m auto to silence this.\n",
+                effective_model_arg.c_str(), backend_name.c_str(), match.filename.c_str());
+    }
 
     if (!have_match) {
         // Nothing to download — return the arg and let the load layer
