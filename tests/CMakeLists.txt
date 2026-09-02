@@ -5476,6 +5476,26 @@ catch_discover_tests(test-piano-transcription
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test - mt3 — live integration tests (#250, multi-instrument)
+# Stage parity is the crispasr-diff mt3 harness's job; this covers the C ABI
+# contract, the decode-budget knob and the drum/instrument invariants.
+add_executable(test-mt3 test_mt3_live.cpp)
+target_include_directories(test-mt3 PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/examples
+)
+target_link_libraries(test-mt3 PRIVATE
+    Catch2::Catch2WithMain
+    mt3
+)
+catch_discover_tests(test-mt3
+    TEST_SPEC "[mt3]"
+    PROPERTIES
+        LABELS live
+        SKIP_RETURN_CODE 4
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test - basic-pitch — live integration tests (#250)
 add_executable(test-basic-pitch
     test_basic_pitch_live.cpp
