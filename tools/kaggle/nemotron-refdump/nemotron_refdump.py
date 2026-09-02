@@ -24,7 +24,7 @@ print("[2] installing deps", flush=True)
 subprocess.check_call([
     sys.executable, "-m", "pip", "install", "--quiet",
     "torch", "transformers", "safetensors", "gguf",
-    "huggingface_hub", "hf_transfer",
+    "huggingface_hub", "hf_transfer", "nemo_toolkit[asr]",
 ])
 kh.step("deps_installed")
 
