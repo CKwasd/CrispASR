@@ -12215,6 +12215,35 @@ CA_EXPORT int32_t crispasr_speaker_db_enroll2(const char* dir_path, const char* 
     return speaker_db_enroll(dir_path, name, embedding, dim, /*consent_attested=*/true) ? 0 : 1;
 }
 
+// Enroll through an OPEN handle (writes the .spkr AND updates the handle's
+// in-memory profiles, honouring a retained roster — see speaker_db.h).
+// rc: 0 = enrolled and matchable on this handle; 1 = write failed;
+// 2 = consent refused; 3 = written to disk but outside this handle's
+// retained roster (reopen with the name claimed to match against it).
+CA_EXPORT int32_t crispasr_speaker_db_enroll_into(void* db, const char* name, const float* embedding, int32_t dim,
+                                                  int32_t consent_attested) {
+    if (!consent_attested)
+        return 2;
+    auto* sdb = (struct speaker_db*)db;
+    const int32_t before = (int32_t)speaker_db_count(sdb);
+    if (!speaker_db_enroll_into(sdb, name, embedding, dim, /*consent_attested=*/true))
+        return 1;
+    // Distinguish "matchable now" from "on disk only" so bindings can
+    // surface the roster note instead of a silent non-match later.
+    const int32_t after = (int32_t)speaker_db_count(sdb);
+    if (after == before) {
+        // Not added: either it replaced an existing profile (matchable —
+        // fine) or the roster excluded it. Probe by name.
+        for (int32_t i = 0; i < after; i++) {
+            const char* n = speaker_db_name(sdb, i);
+            if (n && std::strcmp(n, name) == 0)
+                return 0;
+        }
+        return 3;
+    }
+    return 0;
+}
+
 // Legacy ungated enrollment — removed (issue #266); fails loudly at runtime.
 CA_EXPORT int32_t crispasr_speaker_db_enroll(const char* dir_path, const char* name, const float* embedding,
                                              int32_t dim) {

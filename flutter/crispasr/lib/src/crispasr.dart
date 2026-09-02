@@ -5157,18 +5157,39 @@ class CrispasrSpeakerDB {
 
   /// Enroll a speaker with the given name and embedding. The consent
   /// attestation given at construction is recorded in the profile.
+  ///
+  /// On libcrispasr builds that export `crispasr_speaker_db_enroll_into`
+  /// the enrolled name becomes matchable on THIS handle immediately
+  /// (subject to the retained roster). Older dylibs only write the
+  /// profile to disk — there a caller must close and reopen the DB
+  /// before [match] can resolve the new name (the contract
+  /// SpeakerIdService has always followed).
   bool enroll(String name, Float32List embedding) {
-    final enrollFn = _lib.lookupFunction<
-        Int32 Function(
-            Pointer<Utf8>, Pointer<Utf8>, Pointer<Float>, Int32, Int32),
-        int Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Float>, int,
-            int)>('crispasr_speaker_db_enroll2');
-    final dp = dirPath.toNativeUtf8();
     final np = name.toNativeUtf8();
     final embPtr = malloc<Float>(embedding.length);
     embPtr.asTypedList(embedding.length).setAll(0, embedding);
-    final rc = enrollFn(dp, np, embPtr, embedding.length, 1);
-    malloc.free(dp);
+    int rc;
+    if (_lib.providesSymbol('crispasr_speaker_db_enroll_into')) {
+      final fn = _lib.lookupFunction<
+          Int32 Function(
+              Pointer<Void>, Pointer<Utf8>, Pointer<Float>, Int32, Int32),
+          int Function(Pointer<Void>, Pointer<Utf8>, Pointer<Float>, int,
+              int)>('crispasr_speaker_db_enroll_into');
+      rc = fn(_handle, np, embPtr, embedding.length, 1);
+      // rc 3 = written to disk but outside this handle's retained roster;
+      // the profile exists, so report success — matching it needs a
+      // reopen with the name claimed, which the C side logs.
+      if (rc == 3) rc = 0;
+    } else {
+      final enrollFn = _lib.lookupFunction<
+          Int32 Function(
+              Pointer<Utf8>, Pointer<Utf8>, Pointer<Float>, Int32, Int32),
+          int Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Float>, int,
+              int)>('crispasr_speaker_db_enroll2');
+      final dp = dirPath.toNativeUtf8();
+      rc = enrollFn(dp, np, embPtr, embedding.length, 1);
+      malloc.free(dp);
+    }
     malloc.free(np);
     malloc.free(embPtr);
     return rc == 0;
