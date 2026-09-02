@@ -4842,6 +4842,19 @@ set_tests_properties(test-progress-output PROPERTIES
     LABELS "live;progress"
     TIMEOUT 300)
 
+# ─── test-help-stdout — offline regression (#420): an explicitly requested
+# --help is program OUTPUT, so it must go to stdout with exit 0 and be
+# pipeable (`crispasr --help | less`). Usage printed for a usage ERROR must go
+# to stderr with a non-zero status instead. Parses args only — no models, no
+# network; SKIPs if the binary is absent.
+add_test(NAME test-help-stdout
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-help-stdout.sh
+            $<TARGET_FILE:crispasr-cli>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-help-stdout PROPERTIES
+    LABELS "cli"
+    TIMEOUT 60)
+
 # ─── test-dry-run-resolve — offline regression: --dry-run-resolve must preview
 # the same model a real `-m <alias>` would load (sub-variant keys, §166).
 # Needs only the built binary (no models / network); SKIPs if absent.

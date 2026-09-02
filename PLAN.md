@@ -1,5 +1,44 @@
 # CrispASR — Pending work
 
+## DONE 2026-09-02 — #420 `crispasr --help` was not pipeable
+
+Worktree `.claude/worktrees/fix-420-help-stdout`, branch `fix/420-help-stdout`.
+
+Root cause: `whisper_print_usage()` wrote all 269 lines to **stderr**, so
+`crispasr --help | less` showed nothing and `crispasr --help | wc -l` said 0 —
+the reporter needed `2>&1`, which they correctly said should not be necessary.
+An explicitly requested `--help` is the program's OUTPUT: it now goes to stdout
+with exit 0. Usage printed because of a usage ERROR still goes to stderr, which
+is the mirror-image half that is easy to regress into. The function takes a
+`FILE* out`; all six call sites pass the right stream.
+
+Second defect fixed at the same sites: three argument-error paths called
+`exit(0)`, so `crispasr --typo` reported SUCCESS and a script could not detect
+it. Unknown-argument, unknown-language and `--diarize`+`--tinydiarize` now exit
+1. Only the unknown-argument path is actually reachable — the other two sit
+after every `crispasr_run_backend()` early return, so `-l zz` and
+`--diarize --tinydiarize` are silently accepted by the dispatcher today. That
+is a **separate pre-existing bug, not fixed here** (see NEXT below).
+
+Upstream whisper.cpp was checked and has the identical defect, unfixed, in
+`examples/cli/cli.cpp` and every other example (usage to stderr, `exit(0)` on
+unknown argument) — so there was no upstream convention to match, and the fix
+is deliberately scoped to the `crispasr` binary the issue reports. CrispASR's
+sibling CLIs (server, bench, stream, command, lsp, chat, lid, cohere-align,
+nfa-align, vad-speech-segments, talk-llama) still print usage to stderr.
+
+Proof: `tests/test-help-stdout.sh` (ctest `test-help-stdout`, label `cli`,
+offline, no models) — 11 assertions green after, and watched failing 7/11
+against the pre-fix binary (0 stdout lines, 28 242 stderr bytes, exit 0 on a
+typo'd flag). `--help` now yields 269 stdout lines and 0 stderr bytes, matching
+the reporter's expected count exactly. Existing consumers unaffected:
+`tests/test_strict_pipeline.sh` captures with `2>&1`, and `ci.yml`'s bare
+`crispasr --help` still exits 0.
+
+NEXT (not started): `-l <bad>` and `--diarize --tinydiarize` are accepted
+silently because their guards live after the backend dispatch. Worth a separate
+issue — validation belongs before `crispasr_run_backend()`.
+
 ## NOW — #416 Sidon quantized models decode to silence
 
 Worktree `.claude/worktrees/fix-416-sidon-quant`, branch `fix/416-sidon-quant`.
