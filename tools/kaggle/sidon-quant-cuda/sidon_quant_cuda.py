@@ -188,7 +188,7 @@ def run_sidon(binp, model, tag, gpu):
 def main():
     smi = sh("nvidia-smi --query-gpu=name,driver_version --format=csv,noheader")
     gpu_name = (smi.stdout or "").strip()
-    kh.step("gpu", name=gpu_name)
+    kh.step("gpu", device=gpu_name)
 
     binp = build_crispasr()
     make_clip()
