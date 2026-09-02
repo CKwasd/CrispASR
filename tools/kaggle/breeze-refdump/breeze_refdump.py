@@ -120,14 +120,26 @@ def step(name, **kv):
 
 
 # ── clones + harness ──────────────────────────────────────────────────────
+# Kaggle workers have flaky GitHub access (gotcha #18; run 5 here died with
+# "could not read Username for 'https://github.com'" on a clean clone), so
+# retry. This retry CANNOT live in kaggle_harness.py: the harness is imported
+# *from* the CrispASR clone, so this bootstrap runs before it exists. Same
+# shape as the raon-roundtrip fix (d921bf2d).
 for url, dst, ref in ((CRISPASR_URL, CLONE, CRISPASR_REF), (BREEZE_URL, BREEZE, None)):
-    if dst.exists():
-        shutil.rmtree(dst)
     cmd = ["git", "clone", "--depth", "1"]
     if ref:
         cmd += ["--branch", ref]
     cmd += [url, str(dst)]
-    subprocess.run(cmd, check=True, timeout=1800)
+    for attempt in range(4):
+        if dst.exists():
+            shutil.rmtree(dst)
+        r = subprocess.run(cmd, timeout=1800)
+        if r.returncode == 0:
+            break
+        print(f"clone {url} attempt {attempt + 1} failed rc={r.returncode}; retrying", flush=True)
+        time.sleep(15)
+    else:
+        raise SystemExit(f"clone failed after 4 attempts: {url}")
 
 sys.path.insert(0, str(CLONE / "tools" / "kaggle"))
 import kaggle_harness as kh  # noqa: E402
