@@ -31,6 +31,7 @@
 
 #include "core/utf8.h"
 #include "core/gguf_loader.h"
+#include "core/hifigan.h"          // #387 perf: shared GPU-capable HiFi-GAN vocoder
 #include "core/gpu_backend_pref.h" // crispasr_init_gpu_backend (#214)
 #include "core/crispasr_env.h"
 #include "core/pinyin_g2p.h" // #294: Chinese g2p (jieba-min + pypinyin TONE3)
@@ -406,6 +407,17 @@ struct f5_tts_context {
     std::vector<float> mel_fb;
     std::vector<float> mel_window;
     std::map<std::string, std::vector<float>> hifigan_w;
+    // #387 perf: the same voc.* HiFi-GAN weights as GGUF-resident ggml tensors
+    // (they live in w_ctx), so the vocoder can run through the shared,
+    // GPU-capable core_hifigan graph (im2col+gemm) instead of naive CPU loops.
+    // This is the default; hifigan_w above is populated only as the A/B CPU
+    // fallback (CRISPASR_F5_HIFIGAN_CPU=1). ups_w_perm holds the pre-permuted
+    // ConvTranspose1d upsample kernels for the decomposed col2im path.
+    std::map<std::string, ggml_tensor*> hifigan_ts;
+    core_hifigan::hparams voc_hp;
+    std::vector<ggml_tensor*> ups_w_perm;
+    ggml_context* ctx_perm = nullptr;
+    ggml_backend_buffer_t buf_perm = nullptr;
     std::string ref_text;
 
     // Diff harness: inject reference initial noise for reproducibility
@@ -1714,6 +1726,55 @@ static std::vector<float> hifigan_decode(f5_tts_context* ctx, const float* mel_d
     return out;
 }
 
+// #387 perf: HiFi-GAN decode via the shared, GPU-capable core_hifigan graph.
+// Numerically identical to hifigan_decode() above (validated cos≈0.998 through
+// the CRISPASR_F5_VOCODE_MEL probe), but runs on the backend scheduler
+// (im2col+gemm, threaded/GPU) instead of naive CPU loops. This is the default
+// vocoder path; CRISPASR_F5_HIFIGAN_CPU=1 selects the CPU reference above.
+static std::vector<float> hifigan_decode_ggml(f5_tts_context* ctx, const float* mel_data, int T_mel, int mel_dim) {
+    const auto voc_t0 = std::chrono::steady_clock::now();
+
+    f5_mini_graph mg(ctx->sched);
+    // core_hifigan wants ne[0]=T (time is the conv1d spatial dim), ne[1]=n_mel.
+    ggml_tensor* mel_in = ggml_new_tensor_2d(mg.ctx, GGML_TYPE_F32, T_mel, mel_dim);
+    ggml_set_name(mel_in, "voc_mel_in");
+    ggml_set_input(mel_in);
+
+    ggml_tensor* audio = core_hifigan::forward(mg.ctx, mel_in, ctx->hifigan_ts, "voc", ctx->voc_hp, ctx->ups_w_perm);
+    ggml_set_name(audio, "audio_out");
+    ggml_set_output(audio);
+
+    ggml_cgraph* gf = ggml_new_graph_custom(mg.ctx, 32768, false);
+    ggml_build_forward_expand(gf, audio);
+    ggml_backend_sched_reset(mg.sched);
+    if (!ggml_backend_sched_alloc_graph(mg.sched, gf)) {
+        fprintf(stderr, "f5_tts: hifigan_decode(ggml) graph alloc failed\n");
+        return {};
+    }
+
+    // Incoming mel is (T, C) row-major (C contiguous per frame). core_hifigan
+    // needs ne[0]=T, i.e. T contiguous per channel: mel_voc[c*T + t].
+    {
+        std::vector<float> mel_voc((size_t)mel_dim * T_mel);
+        for (int t = 0; t < T_mel; t++)
+            for (int c = 0; c < mel_dim; c++)
+                mel_voc[(size_t)c * T_mel + t] = mel_data[(size_t)t * mel_dim + c];
+        ggml_backend_tensor_set(mel_in, mel_voc.data(), 0, mel_voc.size() * sizeof(float));
+    }
+
+    ggml_backend_sched_graph_compute(mg.sched, gf);
+
+    const int n = (int)ggml_nelements(audio);
+    std::vector<float> out(n);
+    ggml_backend_tensor_get(audio, out.data(), 0, (size_t)n * sizeof(float));
+
+    if (ctx->verbosity >= 1) {
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - voc_t0).count();
+        fprintf(stderr, "f5_tts: hifigan_decode(ggml) T_mel=%d → %d samples in %.1f ms\n", T_mel, n, ms);
+    }
+    return out;
+}
+
 static std::vector<float> vocos_decode(f5_tts_context* ctx, const float* mel_data, int T_mel, int mel_dim) {
     const auto& hp = ctx->hp;
     int D = hp.voc_dim; // 512
@@ -2298,12 +2359,19 @@ static bool load_weights(f5_tts_context* ctx, const char* path) {
         w.voc_head_weight = get("voc.head.weight");
         w.voc_head_bias = get("voc.head.bias");
     } else if (hp.vocoder == "hifigan") {
-        // #387: pull every voc.* HiFi-GAN tensor straight into the CPU cache
-        // (weight-norm already fused in the converter). The decoder looks them
-        // up by name; the arch (rates/kernels) is fixed by sbhifigan16k.
+        // #387: keep every voc.* HiFi-GAN tensor (weight-norm already fused in
+        // the converter) as a GGUF-resident ggml tensor so the shared,
+        // GPU-capable core_hifigan graph can consume it by name. The CPU float
+        // cache is populated only when the A/B fallback is requested
+        // (CRISPASR_F5_HIFIGAN_CPU=1). The arch (rates/kernels) is fixed by
+        // sbhifigan16k; see the voc_hp setup after the scheduler is created.
+        const bool cpu_voc = crispasr_env::truthy("CRISPASR_F5_HIFIGAN_CPU");
         for (const auto& kv : ts) {
-            if (kv.first.rfind("voc.", 0) == 0)
-                read_tensor_f32(kv.second, ctx->hifigan_w[kv.first]);
+            if (kv.first.rfind("voc.", 0) == 0) {
+                ctx->hifigan_ts[kv.first] = kv.second;
+                if (cpu_voc)
+                    read_tensor_f32(kv.second, ctx->hifigan_w[kv.first]);
+            }
         }
         // Shipped slaney mel filterbank + Hann window.
         read_tensor_f32(get("f5.mel_fb"), ctx->mel_fb);
@@ -2436,6 +2504,35 @@ struct f5_tts_context* f5_tts_init_from_file(const char* path_model, struct f5_t
         }
     }
 
+    // #387 perf: configure + prime the shared GPU-capable HiFi-GAN vocoder.
+    // Arch is fixed by sbhifigan16k (rates [8,8,2,2], kernels [16,16,4,4],
+    // MRF [3,7,11]×[1,3,5]); the Raon mel feeds the vocoder directly, so no
+    // pre-normalization. Pre-permute the ConvTranspose1d upsample kernels once
+    // for the decomposed col2im path (mirrors fastpitch/speecht5).
+    if (ctx->hp.vocoder == "hifigan") {
+        auto& vhp = ctx->voc_hp;
+        vhp.model_in_dim = ctx->hp.mel_dim;
+        vhp.upsample_initial_ch = 512;
+        vhp.leaky_relu_slope = 0.1f;
+        vhp.normalize_before = false;
+        vhp.upsample_rates = {8, 8, 2, 2};
+        vhp.upsample_kernel_sizes = {16, 16, 4, 4};
+        vhp.resblock_kernel_sizes = {3, 7, 11};
+        vhp.resblock_dilation_sizes = {{1, 3, 5}, {1, 3, 5}, {1, 3, 5}};
+
+        const int n = vhp.num_upsamples();
+        std::vector<ggml_tensor*> srcs(n);
+        std::vector<ggml_tensor**> dsts(n);
+        ctx->ups_w_perm.resize(n, nullptr);
+        for (int i = 0; i < n; i++) {
+            auto it2 = ctx->hifigan_ts.find("voc.ups." + std::to_string(i) + ".weight");
+            srcs[i] = (it2 != ctx->hifigan_ts.end()) ? it2->second : nullptr;
+            dsts[i] = &ctx->ups_w_perm[i];
+        }
+        core_convt::permute_convt1d_weights_batch(srcs.data(), dsts.data(), n, ctx->backend, &ctx->ctx_perm,
+                                                  &ctx->buf_perm);
+    }
+
     // Apply params (0 = use model default)
     ctx->ode_steps = params.ode_steps > 0 ? params.ode_steps : ctx->hp.ode_steps;
     ctx->cfg_strength = params.cfg_strength > 0.0f ? params.cfg_strength : ctx->hp.cfg_strength;
@@ -2454,6 +2551,10 @@ void f5_tts_free(struct f5_tts_context* ctx) {
         return;
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    if (ctx->buf_perm)
+        ggml_backend_buffer_free(ctx->buf_perm); // #387 perf: permuted ups kernels
+    if (ctx->ctx_perm)
+        ggml_free(ctx->ctx_perm);
     if (ctx->w_buf)
         core_gguf::release_weight_buffer(ctx->w_buf);
     if (ctx->w_ctx)
@@ -2609,7 +2710,9 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
             size_t rd = fread(mel.data(), sizeof(float), n, f);
             fclose(f);
             (void)rd;
-            auto audio = (hp.vocoder == "hifigan") ? hifigan_decode(ctx, mel.data(), T, mel_dim)
+            const bool cpu_voc = crispasr_env::truthy("CRISPASR_F5_HIFIGAN_CPU");
+            auto audio = (hp.vocoder == "hifigan") ? (cpu_voc ? hifigan_decode(ctx, mel.data(), T, mel_dim)
+                                                              : hifigan_decode_ggml(ctx, mel.data(), T, mel_dim))
                                                    : vocos_decode(ctx, mel.data(), T, mel_dim);
             *pcm_out = (float*)malloc(audio.size() * sizeof(float));
             memcpy(*pcm_out, audio.data(), audio.size() * sizeof(float));
@@ -2751,7 +2854,9 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
 
     // ── Vocoder (Vocos for stock F5; HiFi-GAN for Raon sbhifigan16k, #387) ──
     f5_bench_stage _b_voc("vocoder");
-    auto audio = (hp.vocoder == "hifigan") ? hifigan_decode(ctx, gen_mel.data(), gen_T, mel_dim)
+    const bool cpu_voc = crispasr_env::truthy("CRISPASR_F5_HIFIGAN_CPU");
+    auto audio = (hp.vocoder == "hifigan") ? (cpu_voc ? hifigan_decode(ctx, gen_mel.data(), gen_T, mel_dim)
+                                                      : hifigan_decode_ggml(ctx, gen_mel.data(), gen_T, mel_dim))
                                            : vocos_decode(ctx, gen_mel.data(), gen_T, mel_dim);
     if (audio.empty()) {
         // Fallback: return empty for now, will be filled once vocos is implemented
