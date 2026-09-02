@@ -112,8 +112,11 @@ static sidon_rpe_mode parse_rpe_mode() {
 struct sidon_context {
     sidon_context_params params{};
     sidon_rpe_mode rpe_mode = sidon_rpe_mode::bucket_direct;
+    // #416 bisection gate: keep the quantized relative-position multiply.
+    bool quant_rpe = false;
     sidon_model model;
     core_dac::fastconv_cache decoder_fc;
+    ggml_tensor* bucket_ids = nullptr;
     ggml_backend_t backend = nullptr, decoder_backend = nullptr, backend_cpu = nullptr;
     ggml_backend_sched_t predictor_sched = nullptr, decoder_sched = nullptr;
     bool predictor_vulkan = false;
@@ -422,6 +425,11 @@ static ggml_cgraph* build_predictor_graph(sidon_context* ctx, ggml_context* c, i
     }
     ggml_set_name(rel_idx, "sidon_rel_indices");
     ggml_set_input(rel_idx);
+    // Identity gather (0..n_buckets-1) used to dequantize the relative-position
+    // table in-graph; see the distance_w note in the bucket branch below.
+    ggml_tensor* bucket_ids = ggml_new_tensor_1d(c, GGML_TYPE_I32, m.hp.rel_left + m.hp.rel_right + 1);
+    ggml_set_name(bucket_ids, "sidon_bucket_ids");
+    ggml_set_input(bucket_ids);
 
     ggml_tensor* cur = predictor_norm(ctx, c, in, m.feature_norm_w, m.feature_norm_b, m.hp.eps);
     cur = linear(c, m.feature_proj_w, cur, m.feature_proj_b);
@@ -469,11 +477,29 @@ static ggml_cgraph* build_predictor_graph(sidon_context* ctx, ggml_context* c, i
             // a [n_buckets, T, H] tensor — then gather the bucket each key
             // selects. Never materialises the [head_dim, T, T] expansion.
             //
-            // distance_w is left in its stored dtype: ggml_mul_mat consumes a
-            // quantized/F16 src0 natively, and ggml_cast on a k-quant aborts on
-            // Metal (no k-quant CPY kernel), so casting here would be both
-            // redundant and a portability hazard.
-            ggml_tensor* bucket_logits = ggml_mul_mat(c, l.distance_w, Q); // [bucket, query, head]
+            // distance_w must NOT stay quantized here (issue #416). This is the
+            // only mul_mat in the model whose src0 is a quantized weight AND is
+            // broadcast (ne2=1) across the H attention heads. On a Vulkan device
+            // advertising integer dot product, ggml routes quantized src0 through
+            // the MMQ/Q8_1 path (`quantize_y` in ggml-vulkan.cpp), and that
+            // combination produced an all-zero predictor output -> a full-length
+            // file of silence, while the f16 model (never quantized, never on
+            // that path) was fine. A device WITHOUT integer dot product takes the
+            // dequant-to-F16 fallback and is unaffected, which is why software
+            // Vulkan (lavapipe, `int dot: 0`) could not reproduce it.
+            //
+            // Dequantizing costs nothing worth measuring: the table is 73x64, so
+            // ~9 KB per layer, and it is gathered once per graph rather than per
+            // frame. Use get_rows, not ggml_cast: get_rows works for every quant
+            // type and returns F32, while ggml_cast on a k-quant aborts on Metal
+            // (no k-quant CPY kernel).
+            //
+            // CRISPASR_SIDON_QUANT_RPE=1 restores the quantized multiply as a
+            // bisection gate for when the Vulkan MMQ path is fixed upstream.
+            ggml_tensor* dist_w = l.distance_w;
+            if (ggml_is_quantized(dist_w->type) && !ctx->quant_rpe)
+                dist_w = ggml_get_rows(c, dist_w, bucket_ids);       // [hd, n_buckets] F32
+            ggml_tensor* bucket_logits = ggml_mul_mat(c, dist_w, Q); // [bucket, query, head]
             bucket_logits = ggml_reshape_4d(c, bucket_logits, 1, bucket_logits->ne[0], T, H);
             // ggml_get_rows batches on (ne2, ne3), so the index must carry the
             // head dimension. bucket_direct supplies it as a plain input (the
@@ -707,6 +733,7 @@ static bool prepare_predictor_graph(sidon_context* ctx, int T) {
 
     ctx->predictor_input = ggml_graph_get_tensor(ctx->predictor_graph, "sidon_features");
     ctx->relative_indices = ggml_graph_get_tensor(ctx->predictor_graph, "sidon_rel_indices");
+    ctx->bucket_ids = ggml_graph_get_tensor(ctx->predictor_graph, "sidon_bucket_ids");
     ctx->predictor_output = ggml_graph_get_tensor(ctx->predictor_graph, "sidon_predictor_output");
     if (!ctx->predictor_input || !ctx->relative_indices || !ctx->predictor_output) {
         std::fprintf(stderr, "sidon: predictor graph is missing a required tensor\n");
@@ -787,6 +814,8 @@ sidon_context* sidon_init_from_file(const char* path, sidon_context_params param
     }
     prepare_fastconv(ctx);
     ctx->rpe_mode = parse_rpe_mode();
+    if (const char* e = getenv("CRISPASR_SIDON_QUANT_RPE"); e && e[0] && e[0] != '0')
+        ctx->quant_rpe = true;
     ctx->predictor_sched = make_stage_scheduler(ctx->backend, ctx->backend_cpu);
     ctx->decoder_sched = make_stage_scheduler(ctx->decoder_backend, ctx->backend_cpu);
     if (!ctx->predictor_sched || !ctx->decoder_sched) {
@@ -839,6 +868,17 @@ static void set_predictor_inputs(sidon_context* ctx, const std::vector<float>& f
     for (size_t h = 1; h < n_planes; ++h)
         std::memcpy(indices.data() + h * plane, indices.data(), plane * sizeof(int32_t));
     ggml_backend_tensor_set(ctx->relative_indices, indices.data(), 0, indices.size() * sizeof(int32_t));
+    // Re-set on EVERY call even though the contents never change: gallocr may
+    // hand an input's buffer to a later intermediate as scratch once its last
+    // use has passed, so a constant written only at build time is silently
+    // corrupted from the second eval onward.
+    if (ctx->bucket_ids) {
+        const int n_buckets = (int)ggml_nelements(ctx->bucket_ids);
+        std::vector<int32_t> ids((size_t)n_buckets);
+        for (int i = 0; i < n_buckets; ++i)
+            ids[(size_t)i] = i;
+        ggml_backend_tensor_set(ctx->bucket_ids, ids.data(), 0, ids.size() * sizeof(int32_t));
+    }
 }
 
 // Encoder-only feature extraction: SeamlessM4T frontend + the loaded conformer
