@@ -38,7 +38,7 @@ def step(msg):
 step("Clone + build CrispASR (CUDA)")
 CRISPASR_DIR = WORK / "CrispASR"
 if not CRISPASR_DIR.exists():
-    subprocess.check_call(["git", "clone", "--depth", "1",
+    subprocess.check_call(["git", "clone", "--depth", "1", "--recursive", "--shallow-submodules",
                            "https://github.com/CrispStrobe/CrispASR.git", str(CRISPASR_DIR)])
 sys.path.insert(0, str(CRISPASR_DIR / "tools" / "kaggle"))
 import kaggle_harness as kh
