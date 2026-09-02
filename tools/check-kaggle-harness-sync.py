@@ -5,21 +5,25 @@ Each tools/kaggle/<kernel>/ directory ships its own copy of
 tools/kaggle/kaggle_harness.py, intended as the fallback used when the
 in-kernel `git clone` fails (CPU workers get no internet at all).
 
-⚠ THAT FALLBACK CANNOT FIRE AS BUILT — verified 2026-09-03. `kaggle kernels
-push` on a `kernel_type: script` uploads ONLY `code_file`; `kaggle kernels
-pull` of a pushed kernel returns exactly one .py and nothing else. So the
-bundled copy never reaches Kaggle, `sys.path.insert(0, _script_dir)` points at
-a directory that holds only the script, and a clone failure kills the kernel on
-`import kaggle_harness` regardless of how fresh the bundle is. The copies are
-therefore useful for LOCAL kernel testing only.
+⚠ WHETHER THAT FALLBACK CAN FIRE AT ALL IS OPEN — do not assume it protects
+you. `kaggle kernels pull` of a pushed script kernel returns exactly one .py
+and nothing else (observed 2026-09-03), which is suggestive but NOT conclusive:
+pull is selective by design — its `--metadata` flag *generates*
+kernel-metadata.json rather than fetching an uploaded one — so that observation
+distinguishes nothing about what `push` actually uploads. A runtime probe now
+rides on the sidon-quant-cuda kernel (it lists its own directory before the
+sm_60 early-exit, so any draw answers it); look for the `upload_probe` step.
+The fallback can fire iff `kaggle_harness.py` appears in that listing.
 
-Two consequences before anyone invests more here: (1) keeping the copies
-byte-identical is hygiene, not protection — do not treat a green run of this
-check as evidence that the no-internet path works; (2) making the fallback real
-needs the harness to arrive by a route that survives no-internet, i.e. published
-as a Kaggle DATASET and listed in each kernel's `dataset_sources` (the same
-mechanism the hf-token dataset already uses), after which the bundled copies and
-this check can go away entirely.
+Until the probe reports: keeping the copies byte-identical is cheap hygiene,
+but do NOT treat a green run of this check as evidence that the no-internet
+path works — that has never been demonstrated either way. If the probe shows
+the bundle does not ship, making the fallback real needs a delivery route that
+survives no-internet (publishing the harness as a Kaggle DATASET listed in each
+kernel's `dataset_sources`, the mechanism the hf-token dataset already uses),
+after which the copies and this check could go away — a policy change across
+kernels owned by several sessions, so it belongs to the maintainer, not to
+whoever reads this next.
 
 Note also that 7 of the 61 bundled copies are untracked (a `.gitignore` glob
 added after 54 had already been committed), so they cannot propagate through a
