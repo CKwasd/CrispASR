@@ -4213,6 +4213,19 @@ catch_discover_tests(test-core-cqt
     PROPERTIES LABELS "unit;core"
 )
 
+# ─── test-core-midi-writer — core/midi_writer.h Standard MIDI File output ─────
+# Parses the produced bytes back with an independent reader rather than
+# diffing a golden blob: the failures that matter (stuck notes, a note-off
+# ordered after the next note-on at the same tick, zero-length notes) are
+# structural. Header-only, so no backend link.
+add_executable(test-core-midi-writer test-core-midi-writer.cpp)
+target_include_directories(test-core-midi-writer PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-core-midi-writer PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-core-midi-writer
+    TEST_PREFIX "core-midi-writer: "
+    PROPERTIES LABELS "unit;core"
+)
+
 # ─── test-core-istft — core/istft.h inverse-STFT overlap-add ──────────────────
 # Verifies the extracted iSTFT against an independent full-DFT reference
 # (fuzzed) + a forward-STFT→iSTFT sinusoid round-trip.
