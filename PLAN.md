@@ -128,16 +128,28 @@ path — the gate moved to the OLD path, never removed.
 With no env set, sidon / beat-this / cosyvoice3 all now report zero broadcasting
 quantized matmuls. Unit suite 1780/1780.
 
-**CUDA arm: INCONCLUSIVE, not an exoneration.** `tools/kaggle/sidon-quant-cuda`
-ran on a Tesla P100 and reported no defect — but P100 is **sm_60**, and ggml
-disables MMQ below `GGML_CUDA_CC_DP4A == 610` (`ggml_cuda_should_use_mmq`), so
-the pre-fix arm never took the path under test. The tell was in the data: gated
-and ungated arms measured byte-identically (q8_0 rms 0.111276 both), i.e. the
-gate changed nothing. SAME capability-gap trap as the lavapipe Vulkan sweep —
-second occurrence in this issue. The kernel now records `compute_cap` /
-`mmq_reachable` and marks its own verdict `conclusive: false` below 6.1; re-run
-pushed hoping for a T4 (sm_75 has dp4a; Kaggle assigns P100/T4 at random). It
-did establish the fix does NOT regress CUDA.
+**CUDA arm: INCONCLUSIVE, and there is no known way to fix that from here.**
+`tools/kaggle/sidon-quant-cuda` ran three times, every time on a Tesla P100
+(**sm_60**). ggml disables MMQ below `GGML_CUDA_CC_DP4A == 610`
+(`ggml_cuda_should_use_mmq`), so the pre-fix arm never took the path under test;
+the tell was that the gated and ungated arms measured byte-identically (q8_0 rms
+0.111276 both). Same capability-gap trap as the lavapipe Vulkan sweep.
+
+Neither API lever works, both now tested: `--accelerator nvidiaTeslaT4` is
+accepted and silently ignored (the SDK maps it to `machine_shape` and notes the
+valid enum "is not currently included in kagglesdk"), and `"machine_shape":
+"GPU_T4_X2"` in the metadata was independently retested by another session on a
+different chr1s4 kernel — still sm_60
+(`CMAKE_CUDA_ARCHITECTURES_NATIVE=60-real`). So the accelerator is a lottery.
+No local route exists: qemu emulates CPUs, not CUDA devices
+([[feedback_local_arm64_qemu]] does not help here).
+
+The kernel now loses that lottery cheaply — it reads `compute_cap` in its first
+seconds and exits with a `P100_LOTTERY_RETRY` marker before the ~20 min build,
+so a re-push costs ~1 min. Untried levers if this is ever worth resuming: set
+the accelerator once in the Kaggle web UI (may stick for later API pushes,
+unverified), or port the harness to Colab free tier, which hands out T4 far more
+reliably. The run DID establish that the fix does not regress CUDA.
 
 Open: (a) reporter to run `CRISPASR_SIDON_RPE=expand` vs `=bucket` (confirms the
 op); (b) `tools/kaggle/sidon-quant-cuda/` — three arms per quant (fixed graph on

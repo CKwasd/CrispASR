@@ -212,9 +212,23 @@ def main():
     mmq_reachable = cc >= 6.1
     kh.step("gpu", device=gpu_name, compute_cap=cc_raw, mmq_reachable=mmq_reachable)
     if not mmq_reachable:
-        print(f"WARNING: compute capability {cc_raw} < 6.1 — CUDA MMQ is disabled "
-              f"on this GPU, so the pre-fix arm is VACUOUS. Re-run for a T4.",
-              flush=True)
+        # Bail out BEFORE the ~20 min build. There is no working API-side T4
+        # selector for script kernels: --accelerator nvidiaTeslaT4 was accepted
+        # and ignored (3 runs), and "machine_shape": "GPU_T4_X2" in the metadata
+        # was independently retested on another chr1s4 kernel and still landed
+        # sm_60. So the accelerator is a lottery, and the only cheap play is to
+        # lose it fast — a re-push then costs ~1 min instead of a whole run.
+        RESULTS.write_text(json.dumps({
+            "gpu": gpu_name, "compute_cap": cc_raw, "mmq_reachable": False,
+            "verdict": {"conclusive": False,
+                        "reason": "compute capability < 6.1: ggml disables MMQ "
+                                  "(GGML_CUDA_CC_DP4A=610), so the pre-fix arm "
+                                  "cannot exercise the path under test"},
+        }, indent=2))
+        print(f"P100_LOTTERY_RETRY: compute capability {cc_raw} < 6.1 — CUDA MMQ "
+              f"is disabled on this GPU, so every arm would be VACUOUS. "
+              f"Exiting early; re-push to redraw.", flush=True)
+        return
 
     binp = build_crispasr()
     make_clip()
