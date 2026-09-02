@@ -1,5 +1,7 @@
 # CrispASR — Pending work
 
+## NOW — #416 Sidon quantized models decode to silence (Vulkan MMQ)
+
 ## DONE 2026-09-02 — #420 `crispasr --help` was not pipeable
 
 Worktree `.claude/worktrees/fix-420-help-stdout`, branch `fix/420-help-stdout`.
@@ -38,86 +40,6 @@ the reporter's expected count exactly. Existing consumers unaffected:
 NEXT (not started): `-l <bad>` and `--diarize --tinydiarize` are accepted
 silently because their guards live after the backend dispatch. Worth a separate
 issue — validation belongs before `crispasr_run_backend()`.
-
-## NOW — #416 Sidon quantized models decode to silence
-
-Worktree `.claude/worktrees/fix-416-sidon-quant`, branch `fix/416-sidon-quant`.
-Reporter: `sidon-v0.1-f16.gguf` restores correctly, but `q4_k` and `q8_0` both
-write a full-length file of pure silence.
-
-**NOT REPRODUCED YET — root cause still open.** What is established:
-
-- **Not reproducible on x86-64 CPU.** Same 2 s clip, same three HF artifacts:
-  f16 rms 0.128101, q8_0 0.127733, q4_k 0.126898 (peaks 0.612 / 0.595 / 0.583).
-  All three decode normally.
-- **Not a precision effect.** q8_0 is ~lossless; silence there cannot come from
-  rounding, so it has to be a code path only quantized weights take.
-- **GGUF metadata is sound.** All three files carry the same 372 tensors with
-  identical names; only 73 predictor tensors are quantized. The quants declare
-  the DAC snake `alpha`s and `decoder.model.7.weight` with a dropped trailing
-  `1` (`1x1536x1` -> `1x1536`), which is inert — ggml pads `ne` to 4 dims, and
-  `dac_decoder.h` reads `ne[N]` rather than `ggml_n_dims`.
-- **Vulkan is NOT the culprit.** `distance_embedding` is the only quantized
-  tensor feeding a broadcasting matmul (src0 `[64,73,1,1]` broadcast over
-  H=16 heads), which looked like the classic CPU-tolerant/GPU-strict trap. A
-  probe at sidon's exact shapes on a real Vulkan device (lavapipe, llvmpipe)
-  compared CPU vs Vulkan: F16 cos 0.999999, Q8_0 0.999985, Q4_0 0.999985,
-  magnitudes matching. Hypothesis disproven. `test-backend-ops -o MUL_MAT`
-  on the same device showed no failures either.
-- Untested backends: **CUDA and Metal**. Next step is a Kaggle CUDA run, or
-  the reporter's answer, whichever lands first.
-
-Asked the reporter for OS/GPU, `crispasr --version` backends, and a `-ng`
-(force-CPU) re-run — that flag alone separates a GPU-path fault from a
-CPU-variant one (issue #405 territory).
-
-Shipped meanwhile, independent of the root cause:
-
-- **Sidon had no quantizer rules at all** (contributing checklist point 8 was
-  skipped). `self_attn.distance_embedding.weight` (64x73 relative-position
-  LOOKUP TABLE, biasing every attention score in all 8 layers) and
-  `feature_projection.projection.weight` (160x1024, the sole input projection)
-  were both quantized, and because neither row is 256-aligned both silently
-  took the row-fit fallback to legacy **Q4_0** under `--q4_k`. They now stay at
-  source precision: the re-quantized file drops from 9 Q4_0 tensors to none
-  (238 F32 / 70 F16 / 64 Q4_K) for +282 KB (+0.12 %). Spectrally this is a wash
-  on the 2 s clip (mag_corr vs f16 0.9673 fixed vs 0.9726 before, logmag 0.9697
-  vs 0.9668) — it is a correctness//hygiene change, not a measured quality win.
-- **The coverage gap that let this ship:** `tests/env-live-tests.sh` pointed
-  `CRISPASR_MODEL_SIDON` at the f16 build only, so no quantized Sidon was ever
-  executed by any test. Added `CRISPASR_MODEL_SIDON_QUANT` and a live case that
-  asserts the properties a silent/NaN decode breaks (full length, all-finite,
-  rms > 0.01, peak > 0.05, and output energy ordering tracking the input).
-## 2026-09-01 — PR #414 htdemucs GPU-by-default: merged + corrected + tested (#413)
-
-Worktree `.claude/worktrees/fix-414`, branch `integr/pr-414` (PR merge
-commit preserves @tilllt's authorship; their RTX 3090 Ti numbers — fused
-GPU RTF 0.37 vs CPU/BLAS 7.4 — are the motivating measurement).
-
-Two review catches fixed on top of the PR:
-(a) its gate (`want_graph = use_ggml() || (want_gpu && use_fused())`) left
-the DEFAULT on CPU (both envs default off) despite the title, and made
-`FUSED=1` alone select the slow per-layer GPU path;
-(b) `if (params.use_gpu) want_gpu = true` ran after the env read and
-params.use_gpu defaults true from the CLI — so the advertised
-`CRISPASR_HTDEMUCS_GPU=0` opt-out was dead.
-
-Fix: `src/htdemucs_gates.h` — pure resolve() with AUTO defaults that
-encode the measurements (fused-graph-GPU exactly when a real GPU backend
-is present and permitted; CPU hosts keep BLAS; per-layer graphs never
-AUTO-selected), explicit envs force either way, `FUSED=1` implies the
-graph it needs, env beats caller intent in both directions. Resolved once
-per init against a real GPU probe; one unconditional
-"htdemucs: gates graph=X fused=X gpu=X" line for tests/kernels to assert.
-
-Tests: tests/test-htdemucs-gates.cpp locks the full 9-case decision table;
-tests/test-htdemucs-separate-live.sh (live) proves AUTO-stays-BLAS on CPU
-hosts + forced-fused engagement + per-stem BLAS-vs-fused parity (measured
-worst max|diff| 4.3e-4 on q4_k). GPU proof:
-tools/kaggle/htdemucs-default-gpu-ab kernel (branch-pinned) — default-arm
-engagement + FUSED-vs-BLAS per-stem parity (f16+q8_0) + speedup on real
-CUDA; #398's kernel only covered the per-layer graph arm. Merge to main on
-that kernel's green verdict.
 
 ## 2026-09-01 — #419 aligner romanization leaked into display text (FIX)
 
