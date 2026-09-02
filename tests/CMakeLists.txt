@@ -5268,6 +5268,20 @@ catch_discover_tests(test-vibevoice-enc-policy
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test-silero-lid-quant-refusal — #409 tail: quantized silero weights refused (hermetic, unit)
+add_executable(test-silero-lid-quant-refusal test-silero-lid-quant-refusal.cpp)
+target_include_directories(test-silero-lid-quant-refusal PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-silero-lid-quant-refusal PRIVATE Catch2::Catch2WithMain silero-lid)
+catch_discover_tests(test-silero-lid-quant-refusal
+    TEST_SPEC "[silero-quant]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test-num2words-fr-es — French + Spanish number expansion (hermetic, unit)
 add_executable(test-num2words-fr-es test-num2words-fr-es.cpp)
 target_include_directories(test-num2words-fr-es PRIVATE ${PROJECT_SOURCE_DIR}/src)

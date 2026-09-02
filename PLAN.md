@@ -4572,13 +4572,21 @@ q8_0 junk — its top logits sit above the floor while the softmax mass is
 noise; the floor's separation data came from f32-input-conditioning
 failures only.
 
-Still open for the model owner:
-- delete or re-quantize `silero-lid-95-q8_0/q5_0.gguf` on HF and in
-  /mnt/storage/gguf-models (a correct requant needs per-backend
-  quantizer rules + per-stage validation vs the f32 per the PORT
-  PIPELINE; given the model is 16 MB in f32, deleting is defensible);
-- a hermetic regression test needs a small quantized fixture (a
-  crispasr-quantize of the f32 into the test scratch would do).
+Follow-ups CLOSED 2026-09-02:
+- The broken `silero-lid-95-q8_0/q5_0.gguf` existed only in
+  /mnt/storage/gguf-models (verified: HF `cstr/silero-lid-lang95-GGUF`
+  never carried them — it hosts the f32 alone) — deleted after
+  confirming their contents (silero_lid arch, 34 quantized tensors
+  each). No copies elsewhere on the box (`~/.cache/crispasr` and
+  /mnt/volume1 scanned). The old-name `silero-lid-95.gguf` is
+  byte-identical to the canonical f32 and was kept.
+- Hermetic regression test landed as
+  `tests/test-silero-lid-quant-refusal.cpp`: a stub GGUF with one
+  genuinely-quantized (ggml_quantize_chunk) tensor must make
+  silero_lid_init return null, and the identical f32 stub must still
+  load — pinning that the refusal keys on quantization, not fixture
+  shape. No re-quantization attempted: a 16 MB f32 classifier has
+  nothing to gain, per the lid_load comment.
 
 ## RESOLVED 2026-08-29 — silero-lid audio arm verified correct; confidence contract fixed
 
