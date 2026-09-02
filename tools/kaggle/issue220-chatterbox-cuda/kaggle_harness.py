@@ -665,7 +665,18 @@ def resolve_hf_token(secret_name: str = "HF_TOKEN",
     if tok:
         os.environ["HF_TOKEN"] = tok
         os.environ["HUGGING_FACE_HUB_TOKEN"] = tok
-        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+        # Only opt into the fast downloader if it is actually importable.
+        # huggingface_hub raises outright ("enabled but not available") rather
+        # than falling back, so setting this unconditionally turned every
+        # kernel that resolves a token WITHOUT pip-installing hf_transfer into
+        # a hard download failure — it killed the breeze-refdump run at its
+        # first hf_hub_download, minutes into a GPU session (2026-09-03).
+        try:
+            import hf_transfer  # noqa: F401
+
+            os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+        except ImportError:
+            os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
     elif require:
         raise SystemExit(
             "FATAL: no HF token from env/secret/dataset — uploads would 401 "

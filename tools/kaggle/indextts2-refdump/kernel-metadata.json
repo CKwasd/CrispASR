@@ -1,0 +1,13 @@
+{
+  "id": "chr1s4/crispasr-indextts2-refdump",
+  "title": "crispasr-indextts2-refdump",
+  "code_file": "indextts2_refdump.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "dataset_sources": ["chr1s4/crispasr-hf-token"],
+  "competition_sources": [],
+  "kernel_sources": []
+}
