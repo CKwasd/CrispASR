@@ -2507,6 +2507,11 @@ Follow-ups (LOW, not blocking):
   `espeak;piper;tts` — do not "fix" these.
 
 Multilingual + beam spot-checks (LOW, either machine):
+- [ ] **#421 arm64 HiFT SIMDCONV failures** — the `-L unit` fix's first full-ci
+  dispatch ran 1782 tests on arm64 (previously ZERO) and 4 fail: chatterbox +
+  cosyvoice3 SIMDCONV scalar/SIMD identity (tests/test-*-hift-simdconv.cpp:66/68,
+  instant assert). Possible silent vocoder divergence on arm64 Linux/Android.
+  Unclaimed; details + log pointers on the issue.
 - [x] moss-transcribe multilingual check — RESOLVED 2026-09-02, premise was
   WRONG: the upstream card says "intended for English automatic speech
   recognition" (this line had conflated it with the Diarize sibling). Ran the
