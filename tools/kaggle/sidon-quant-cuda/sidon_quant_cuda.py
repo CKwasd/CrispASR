@@ -102,7 +102,8 @@ def build_crispasr():
         raise RuntimeError("cmake configure failed")
     jobs = kh.safe_build_jobs(gpu=True)
     with kh.build_heartbeat("build.ninja", interval_s=30):
-        kh.sh_with_progress(f"cmake --build build -j{jobs} --target crispasr-cli", cwd=str(CLONE))
+        kh.sh_with_progress(f"cmake --build build -j{jobs} --target crispasr-cli crispasr-quantize",
+                            cwd=str(CLONE))
     binp = CLONE / "build" / "bin" / "crispasr"
     if not binp.exists():
         raise RuntimeError("crispasr binary not produced")
@@ -239,6 +240,25 @@ def main():
                             local_dir=str(MODELS), token=HF_TOKEN or None)
     kh.step("models.ready", files=SIDON_FILES)
 
+    # THE PUBLISHED QUANTS CAN NO LONGER REPRODUCE THIS. cstr/Sidon-GGUF was
+    # re-quantized and re-uploaded 2026-09-03, so distance_embedding now ships
+    # as F16 — which makes CRISPASR_SIDON_QUANT_RPE=1 a NO-OP on those files:
+    # the gate only bites when the tensor is actually quantized. Running the
+    # arms on the HF q8_0 would yield a confident "CUDA is fine" from an arm
+    # that never reached the code (and would fail validity gate V3 below,
+    # identical arms). Rebuild the pre-fix file locally; --tensor-type
+    # deliberately overrides the arch guards.
+    legacy = MODELS / "sidon-legacy-q8_0.gguf"
+    qbin = CLONE / "build" / "bin" / "crispasr-quantize"
+    if not qbin.exists():
+        raise RuntimeError("crispasr-quantize not built — cannot rebuild the legacy quant")
+    rq = sh(f"{qbin} {MODELS}/sidon-v0.1-f16.gguf {legacy} q8_0 "
+            f"--tensor-type 'distance_embedding=q8_0'", timeout=1800)
+    if rq.returncode != 0 or not legacy.exists():
+        kh.step("legacy_quant_FAILED", stderr=(rq.stderr or "")[-1500:])
+        raise RuntimeError("legacy quant rebuild failed")
+    kh.step("legacy_quant.ready", path=str(legacy), bytes=legacy.stat().st_size)
+
     results = {"gpu": gpu_name, "compute_cap": cc_raw,
                "mmq_reachable": mmq_reachable, "branch": BRANCH, "runs": {}}
 
@@ -251,7 +271,7 @@ def main():
     #                 have the same defect Vulkan does?)
     #   cpu         — control on the same box
     # f16 needs no cudaq arm: its table is not quantized, so the gate is a no-op.
-    for f in SIDON_FILES:
+    for f in SIDON_FILES + ["sidon-legacy-q8_0.gguf"]:
         short = f.replace("sidon-v0.1-", "").replace(".gguf", "")
         arms = [("cuda", True, False), ("cpu", False, False)]
         if "f16" not in f:
