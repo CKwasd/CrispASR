@@ -158,16 +158,23 @@ def measure(path):
                 peak=peak / 32768.0, nonzero_frac=nz / len(a))
 
 
-def run_sidon(binp, model, tag, gpu):
+def run_sidon(binp, model, tag, gpu, quant_rpe=False):
     out = TMP / f"out_{tag}.wav"
     if out.exists():
         out.unlink()
     ng = "" if gpu else "-ng "
     cmd = (f"{binp} {ng}-m {MODELS / model} -f {CLIP} --s2s "
            f"--s2s-output {out} -t 4")
+    env = dict(os.environ)
+    if quant_rpe:
+        # Restore the PRE-FIX graph: keep the quantized weight in the
+        # broadcasting RPE matmul. Without this the kernel would only be
+        # testing the fix (main already contains it) and could never observe
+        # the defect on CUDA.
+        env["CRISPASR_SIDON_QUANT_RPE"] = "1"
     with kh.build_heartbeat(f"run.{tag}", interval_s=30):
         try:
-            r = sh(cmd, timeout=2400)
+            r = sh(cmd, timeout=2400, env=env)
             rc, err = r.returncode, (r.stderr or "")
         except subprocess.TimeoutExpired:
             rc, err = -99, "TIMEOUT"
@@ -175,7 +182,7 @@ def run_sidon(binp, model, tag, gpu):
     # The #416 signature: rc=0, right length, no energy.
     silent = bool(m and m["n"] > 0 and m["peak"] == 0.0)
     warns = [ln.strip() for ln in err.splitlines() if "WARNING" in ln and "sidon" in ln]
-    res = dict(tag=tag, model=model, gpu=gpu, rc=rc, measured=m,
+    res = dict(tag=tag, model=model, gpu=gpu, quant_rpe=quant_rpe, rc=rc, measured=m,
                silent=silent, sidon_warnings=warns,
                tail=(err[-700:] if rc != 0 else ""))
     kh.step(f"run.{tag}", rc=rc, silent=silent,
@@ -201,14 +208,24 @@ def main():
 
     results = {"gpu": gpu_name, "branch": BRANCH, "runs": {}}
 
-    # Paired arms: every model on CUDA and on CPU, same box, back to back.
-    # The CPU arm is the control that makes a CUDA silence attributable.
+    # main already carries the fix (the RPE table is gathered to F32 before the
+    # multiply), so the interesting arm is the PRE-FIX graph via
+    # CRISPASR_SIDON_QUANT_RPE=1. Three arms per quant:
+    #   cuda        — fixed graph on CUDA (must be healthy: the fix must not
+    #                 regress the backend it was not written for)
+    #   cudaq       — pre-fix quantized RPE matmul on CUDA (does CUDA's MMQ
+    #                 have the same defect Vulkan does?)
+    #   cpu         — control on the same box
+    # f16 needs no cudaq arm: its table is not quantized, so the gate is a no-op.
     for f in SIDON_FILES:
         short = f.replace("sidon-v0.1-", "").replace(".gguf", "")
-        for gpu in (True, False):
-            tag = f"{short}_{'cuda' if gpu else 'cpu'}"
+        arms = [("cuda", True, False), ("cpu", False, False)]
+        if "f16" not in f:
+            arms.insert(1, ("cudaq", True, True))
+        for suffix, gpu, qrpe in arms:
+            tag = f"{short}_{suffix}"
             try:
-                results["runs"][tag] = run_sidon(binp, f, tag, gpu)
+                results["runs"][tag] = run_sidon(binp, f, tag, gpu, quant_rpe=qrpe)
             except Exception as e:
                 results["runs"][tag] = dict(tag=tag, error=repr(e))
             RESULTS.write_text(json.dumps(results, indent=2))
@@ -223,13 +240,18 @@ def main():
 
     quants = [f.replace("sidon-v0.1-", "").replace(".gguf", "")
               for f in SIDON_FILES if "f16" not in f]
+    # The defect on CUDA: pre-fix arm silent while its own CPU control is fine.
     repro = [q for q in quants
-             if not ok(f"{q}_cuda") and ok(f"{q}_cpu") and ok("f16_cuda")]
+             if not ok(f"{q}_cudaq") and ok(f"{q}_cpu") and ok("f16_cuda")]
+    # The fix must leave CUDA healthy whether or not CUDA ever had the defect.
+    fixed_ok = [q for q in quants if ok(f"{q}_cuda")]
     results["verdict"] = {
         "f16_cuda_ok": ok("f16_cuda"),
         "f16_cpu_ok": ok("f16_cpu"),
-        "quants_silent_on_cuda_only": repro,
-        "reproduced": bool(repro),
+        "prefix_silent_on_cuda_only": repro,
+        "cuda_defect_reproduced": bool(repro),
+        "fixed_graph_healthy_on_cuda": sorted(fixed_ok),
+        "fix_regresses_cuda": sorted(set(quants) - set(fixed_ok)),
     }
     RESULTS.write_text(json.dumps(results, indent=2))
     kh.step("verdict", **results["verdict"])
