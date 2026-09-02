@@ -7,6 +7,7 @@
 #include "whisper_params.h"
 
 #include "basic_pitch.h"
+#include "mt3.h"
 #include "core/gguf_loader.h" // core_gguf::open_metadata / kv_str
 #include "piano_transcription.h"
 
@@ -94,6 +95,94 @@ void print_bp_notes_json(const basic_pitch_result& r, const std::string& fname) 
     printf("  ]\n}\n");
 }
 
+// ── MT3 (§250) ──────────────────────────────────────────────────────────────
+//
+// A third model behind --piano. Same task (audio → note events) and the same
+// dispatcher, but MT3 is MULTI-INSTRUMENT: every note carries a General-MIDI
+// program, and drum hits are a separate class. The shared note shape has no
+// slot for that, so rather than inventing a fourth verb the text form grows one
+// trailing tab-separated column ("prog=<n>" or "drum") after the existing five,
+// and the JSON form grows "program" / "instrument" / "is_drum" keys. Readers of
+// the first five columns are unaffected; nothing else about the surface moves.
+// `instrument` is upstream's track index (assign_instruments: programs
+// numbered in first-appearance order skipping 9, drums always 9 — GM ch. 10).
+void print_mt3_notes_text(const mt3_result& r) {
+    for (int i = 0; i < r.n_notes; i++) {
+        const mt3_note_event& n = r.notes[i];
+        char extra[32];
+        if (n.is_drum)
+            snprintf(extra, sizeof(extra), "drum");
+        else
+            snprintf(extra, sizeof(extra), "prog=%d", n.program);
+        printf("%.3f\t%.3f\t%d\t%s\t%d\t%s\n", n.start_time, n.end_time, n.pitch, midi_note_name(n.pitch).c_str(),
+               n.velocity, extra);
+    }
+}
+
+void print_mt3_notes_json(const mt3_result& r, const std::string& fname) {
+    printf("{\n");
+    printf("  \"file\": \"%s\",\n", fname.c_str());
+    printf("  \"n_notes\": %d,\n", r.n_notes);
+    printf("  \"n_segments\": %d,\n", r.n_segments);
+    printf("  \"n_tokens\": %d,\n", r.n_tokens);
+    printf("  \"n_invalid\": %d,\n", r.n_invalid);
+    printf("  \"n_dropped\": %d,\n", r.n_dropped);
+    printf("  \"n_tie_ends\": %d,\n", r.n_tie_ends);
+    printf("  \"n_tied_pitches\": %d,\n", r.n_tied_pitches);
+    printf("  \"notes\": [\n");
+    for (int i = 0; i < r.n_notes; i++) {
+        const mt3_note_event& n = r.notes[i];
+        printf("    {\"onset\": %.3f, \"offset\": %.3f, \"midi\": %d, \"name\": \"%s\", "
+               "\"velocity\": %d, \"program\": %d, \"instrument\": %d, \"is_drum\": %s}%s\n",
+               n.start_time, n.end_time, n.pitch, midi_note_name(n.pitch).c_str(), n.velocity, n.program, n.instrument,
+               n.is_drum ? "true" : "false", i + 1 < r.n_notes ? "," : "");
+    }
+    printf("  ]\n}\n");
+}
+
+int run_mt3(const whisper_params& params, const std::string& model, bool json) {
+    mt3_params mp = mt3_default_params();
+    mp.n_threads = params.n_threads;
+    mp.verbosity = params.no_prints ? 0 : (params.verbose ? 2 : 1);
+    mp.use_gpu = params.use_gpu;
+    mt3_context* ctx = mt3_init_from_file(model.c_str(), mp);
+    if (!ctx) {
+        fprintf(stderr, "crispasr: --piano: failed to load '%s'\n", model.c_str());
+        return 2;
+    }
+    const int sr = (int)mt3_sample_rate(ctx);
+
+    int rc = 0;
+    for (const auto& fname : params.fname_inp) {
+        std::vector<float> mono;
+        std::vector<std::vector<float>> stereo;
+        if (!read_audio_data(fname, mono, stereo, /*stereo=*/false, /*target_rate=*/sr)) {
+            fprintf(stderr, "crispasr: error: cannot read '%s'\n", fname.c_str());
+            rc = 20;
+            continue;
+        }
+        mt3_result res{};
+        if (mt3_transcribe(ctx, mono.data(), (int)mono.size(), &res) != 0) {
+            fprintf(stderr, "crispasr: --piano failed on '%s'\n", fname.c_str());
+            rc = 1;
+            continue;
+        }
+        if (json) {
+            print_mt3_notes_json(res, fname);
+        } else {
+            if (!params.no_prints && params.fname_inp.size() > 1)
+                printf("# %s\n", fname.c_str());
+            print_mt3_notes_text(res);
+        }
+        if (!params.no_prints)
+            fprintf(stderr, "crispasr: %s: %d notes over %d segments\n", fname.c_str(), res.n_notes, res.n_segments);
+        mt3_result_free(&res);
+    }
+
+    mt3_free(ctx);
+    return rc;
+}
+
 int run_basic_pitch(const whisper_params& params, const std::string& model, bool json) {
     basic_pitch_params bp = basic_pitch_default_params();
     bp.n_threads = params.n_threads;
@@ -167,10 +256,12 @@ int crispasr_run_piano(const whisper_params& params) {
     }
     const std::string arch = core_gguf::kv_str(meta, "general.architecture", "");
     core_gguf::free_metadata(meta);
-    // Two models answer --piano. Dispatch on the GGUF's own architecture rather
-    // than on --backend, so a plain `--piano -m <basic-pitch.gguf>` works.
+    // Three models answer --piano. Dispatch on the GGUF's own architecture
+    // rather than on --backend, so a plain `--piano -m <basic-pitch.gguf>` works.
     if (arch == "basic-pitch" || arch == "basic_pitch")
         return run_basic_pitch(params, model, json);
+    if (arch == "mt3")
+        return run_mt3(params, model, json);
     if (arch != "piano-transcription" && arch != "piano_transcription") {
         fprintf(stderr, "crispasr: --piano: '%s' is not a note-event model (arch='%s').\n", model.c_str(),
                 arch.c_str());
