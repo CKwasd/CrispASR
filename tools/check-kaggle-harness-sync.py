@@ -5,25 +5,31 @@ Each tools/kaggle/<kernel>/ directory ships its own copy of
 tools/kaggle/kaggle_harness.py, intended as the fallback used when the
 in-kernel `git clone` fails (CPU workers get no internet at all).
 
-⚠ WHETHER THAT FALLBACK CAN FIRE AT ALL IS OPEN — do not assume it protects
-you. `kaggle kernels pull` of a pushed script kernel returns exactly one .py
-and nothing else (observed 2026-09-03), which is suggestive but NOT conclusive:
-pull is selective by design — its `--metadata` flag *generates*
-kernel-metadata.json rather than fetching an uploaded one — so that observation
-distinguishes nothing about what `push` actually uploads. A runtime probe now
-rides on the sidon-quant-cuda kernel (it lists its own directory before the
-sm_60 early-exit, so any draw answers it); look for the `upload_probe` step.
-The fallback can fire iff `kaggle_harness.py` appears in that listing.
+⚠ THAT FALLBACK DOES NOT WORK — PROVEN IN PRODUCTION 2026-09-03. A
+sidon-quant-cuda draw landed on a worker with no internet; the clone failed
+("could not read Username for 'https://github.com'"), the script took the
+fallback branch, and the run died with:
 
-Until the probe reports: keeping the copies byte-identical is cheap hygiene,
-but do NOT treat a green run of this check as evidence that the no-internet
-path works — that has never been demonstrated either way. If the probe shows
-the bundle does not ship, making the fallback real needs a delivery route that
-survives no-internet (publishing the harness as a Kaggle DATASET listed in each
-kernel's `dataset_sources`, the mechanism the hf-token dataset already uses),
-after which the copies and this check could go away — a policy change across
-kernels owned by several sessions, so it belongs to the maintainer, not to
-whoever reads this next.
+    ModuleNotFoundError: No module named 'kaggle_harness'
+
+That is the exact no-internet scenario these copies exist for, happening for
+real, with the protection absent — so `kaggle kernels push` on a script kernel
+uploads ONLY `code_file` and the bundled copy never reaches the worker.
+
+(Note for anyone re-deriving this: `kaggle kernels pull` returning a single .py
+does NOT establish it — pull is selective by design, its `--metadata` flag
+*generates* kernel-metadata.json rather than fetching one, so it says nothing
+about what push uploaded. The ModuleNotFoundError is the evidence; the pull
+observation is not.)
+
+Consequences: keeping the copies byte-identical is cheap hygiene and nothing
+more — a green run of this check is NOT evidence that the no-internet path
+works, because that path is broken for every script kernel in the tree. The
+only delivery route that survives no internet is publishing the harness as a
+Kaggle DATASET listed in each kernel's `dataset_sources` (the mechanism the
+hf-token dataset already uses), after which these copies and this check can be
+retired. That is a cross-kernel policy change spanning several owners, so it
+belongs to the maintainer rather than to whoever reads this next.
 
 Note also that 7 of the 61 bundled copies are untracked (a `.gitignore` glob
 added after 54 had already been committed), so they cannot propagate through a
