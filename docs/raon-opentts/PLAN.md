@@ -1,11 +1,28 @@
 # Raon-OpenTTS port (F5-TTS variant) — DRY audit + blueprint findings
 
+## RESOLUTION (2026-09-02): validated end-to-end, shipped as `--backend raon`.
+- TTS→ASR roundtrip PASSES (Kaggle P100, kernel chr1str/crispasr-raon-roundtrip):
+  our full pipeline synthesized the gen_text → whisper-tiny read it back at
+  word overlap 0.90. pass=true.
+- Vocoder validated in isolation: cos 0.9979 vs the reference HiFi-GAN output.
+- Converter validated: Kaggle re-ran it → consistent GGUF.
+- GGUF on HF (cstr/raon-opentts-0.3b-GGUF, card license cc-by-nc-4.0 verified);
+  registry entry `raon` NC-gated; docs/tts.md row; f5-tts backend alias.
+- Four shape/env bugs found+fixed en route: ref sample-rate (24k→16k), vocab
+  count (5559→5556), Embedding(N+1) off-by-one (→5555 text_num_embeds), and
+  the Kaggle P100/torch-kernel gotcha (ref-dump forced to CPU).
+- OPEN follow-ups (non-blocking): vocoder perf (CPU HiFi-GAN ~40s/utt after
+  OpenMP; ggml path is the real fix); mel isolated-parity (implicitly
+  confirmed by the roundtrip; a seeded-ref dump would make it explicit); the
+  1B (converter+kernel re-run once perf is addressed).
+
+
 Branch `feat/raon-opentts`. Model: KRAFTON/Raon-OpenTTS-{0.3B,1B}, CC-BY-NC-4.0,
 English, F5-TTS DiT + flow matching + HiFi-GAN vocoder, 16 kHz / 80-mel.
 Reference code cloned to /mnt/volume1/tmp-overflow/raon-ref/Raon-OpenTTS
 (fork of the F5-TTS repo, Apache-2.0 for the vocoder).
 
-## NOW — converter DONE + validated locally; Kaggle ref-dump kernel written.
+## DONE 2026-09-02 — Raon-OpenTTS 0.3B SHIPPED (roundtrip passed). Merging to main.
 
 0.3B converted locally (mmap, <2 GB RSS): 364 DiT + 156 HiFi-GAN + shipped
 slaney fb(513,80)+window(1024), 5559 vocab → raon-opentts-0.3b-f16.gguf 880 MB

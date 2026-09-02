@@ -1081,6 +1081,17 @@ constexpr Entry k_registry[] = {
     {"f5-tts", "f5-tts-v1-base-f16.gguf",
      "https://huggingface.co/cstr/f5-tts-GGUF/resolve/main/f5-tts-v1-base-f16.gguf",
      "~953 MB", nullptr, nullptr},
+    // Raon-OpenTTS 0.3B (#387-adj): KRAFTON's F5-TTS DiT + sbhifigan16k
+    // HiFi-GAN, English zero-shot voice cloning. Rides the f5-tts runtime
+    // (same DiT; norm_type=rmsnorm is dead metadata with post_norm=False).
+    // Single GGUF carries DiT + HiFi-GAN + the shipped slaney mel fb/window.
+    // TTS→ASR roundtrip validated on Kaggle (word overlap 0.90). CPU vocoder
+    // is slow (~40s/utterance); a GPU build runs the DiT on-device.
+    {"raon", "raon-opentts-0.3b-f16.gguf",
+     "https://huggingface.co/cstr/raon-opentts-0.3b-GGUF/resolve/main/raon-opentts-0.3b-f16.gguf",
+     "~959 MB", nullptr, nullptr, nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (KRAFTON/Raon-OpenTTS-0.3B, "
+     "https://huggingface.co/KRAFTON/Raon-OpenTTS-1B)"},
     // Irodori-TTS v3 500M: RF-DiT flow-matching TTS with zero-shot voice
     // cloning via DAC-VAE latents. 48 kHz output, Japanese-focused.
     {"irodori-tts", "irodori-tts-500m-v3-q4_k.gguf",

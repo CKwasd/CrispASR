@@ -203,8 +203,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     if (name == "outetts" || name == "outetts-tts" || name == "oute-tts" || name == "outetts-0.3-1b")
         return crispasr_make_outetts_backend();
 #endif
-    if (name == "f5-tts" || name == "f5_tts" || name == "f5tts" || name == "f5" || name == "raon" ||
-        name == "raon-1b")
+    if (name == "f5-tts" || name == "f5_tts" || name == "f5tts" || name == "f5" || name == "raon" || name == "raon-1b")
         return crispasr_make_f5_tts_backend();
     if (name == "irodori-tts" || name == "irodori_tts" || name == "irodori")
         return crispasr_make_irodori_tts_backend();

@@ -1686,8 +1686,8 @@ static std::vector<float> hifigan_decode(f5_tts_context* ctx, const float* mel_d
                 cpu_leaky_relu(b1, slope);
                 std::vector<float> b2((size_t)ch * T, 0.0f);
                 const std::string p2 = "voc.resblocks." + std::to_string(rb) + ".convs2." + std::to_string(d);
-                cpu_conv1d_dil(b1.data(), ch, T, get(p2 + ".weight").data(), get(p2 + ".bias").data(), ch, rb_kernels[j],
-                               1, b2.data());
+                cpu_conv1d_dil(b1.data(), ch, T, get(p2 + ".weight").data(), get(p2 + ".bias").data(), ch,
+                               rb_kernels[j], 1, b2.data());
                 for (size_t i = 0; i < h.size(); i++)
                     h[i] += b2[i]; // residual
             }
@@ -2560,10 +2560,10 @@ int f5_tts_set_reference(struct f5_tts_context* ctx, const float* pcm_24k, int n
     // shipped slaney filterbank + window and STFT center=false at 16 kHz.
     int T_ref;
     const bool sbmel = (ctx->hp.mel_spec_type == "sbhifigan16k");
-    ctx->ref_mel = compute_mel_spectrogram(
-        pcm_24k, n_samples, ctx->hp.n_fft, ctx->hp.hop_length, ctx->hp.win_length, ctx->hp.mel_dim, T_ref,
-        (float)ctx->hp.sample_rate, sbmel ? &ctx->mel_fb : nullptr, sbmel ? &ctx->mel_window : nullptr,
-        sbmel ? ctx->hp.mel_center : true);
+    ctx->ref_mel =
+        compute_mel_spectrogram(pcm_24k, n_samples, ctx->hp.n_fft, ctx->hp.hop_length, ctx->hp.win_length,
+                                ctx->hp.mel_dim, T_ref, (float)ctx->hp.sample_rate, sbmel ? &ctx->mel_fb : nullptr,
+                                sbmel ? &ctx->mel_window : nullptr, sbmel ? ctx->hp.mel_center : true);
 
     // If mel computation not yet implemented, allow setting ref_mel directly
     // via the diff harness (which provides it as a GGUF tensor)
