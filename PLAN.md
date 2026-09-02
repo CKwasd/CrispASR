@@ -35,6 +35,79 @@ regen rides the next docs pass (file is dirty in other sessions' flows).
 
 ## NOW — #416 Sidon quantized models decode to silence
 
+Worktree `.claude/worktrees/fix-416-sidon-quant`, branch `fix/416-sidon-quant`.
+Reporter Disonantemus: `sidon-v0.1-f16.gguf` restores correctly; `q4_k` and
+`q8_0` write a full-length file of pure silence.
+
+**Localized to the Vulkan MMQ path. Fix + re-quantized artifacts shipped;
+reporter confirmation of the mechanism still pending.**
+
+Reporter's environment (they answered): Arch Linux, Intel i7-4790, **NVIDIA GTX
+1660 SUPER**, release 0.8.31, `ggml backends : cpu,vulkan`. Their own control:
+same model, same clip, `-ng` -> **-20.0 dB** (works), Vulkan -> **-91.0 dB**.
+
+Mechanism: `mul_mat(distance_w, Q)` is the only matmul in sidon whose src0 is a
+quantized weight AND is broadcast (ne2=1) across H=16 heads. ggml routes a
+quantized src0 to the MMQ/Q8_1 pipeline only when the device advertises integer
+dot product (`quantize_y = ctx->device->integer_dot_product && ...`,
+ggml-vulkan.cpp ~8863). Their GPU reports `int dot: 1`. f16 weights never enter
+that path — the "only quantized models fail" signature.
+
+**Correction worth remembering:** an earlier pass declared Vulkan exonerated on
+1536/1536 `test-backend-ops -o MUL_MAT` cases plus an exact-shape probe, run on
+lavapipe. That measured the WRONG code — lavapipe reports `int dot: 0` and the
+local glslc cannot compile `GL_EXT_integer_dot_product`, so the MMQ pipelines
+were never built and only the dequant-to-F16 fallback ran. A green sweep on a
+device whose caps exclude the path under test proves nothing about that path.
+(`GGML_VK_FORCE_INTEGER_DOT_PRODUCT=1` forces the flag, but the shaders still
+need a glslang newer than Ubuntu's 15.1.0 — i.e. built from source.)
+
+Shipped:
+- **Runtime fix** (`6b396bb9`) — gather the 73x64 position table to F32 via
+  `get_rows` before the multiply (not `ggml_cast`: no k-quant CPY kernel on
+  Metal; Vulkan `get_rows` for q4_0/q8_0/q4_K verified via test-backend-ops).
+  f16 output bit-identical (max|diff| 0); q8_0 spectral agreement with f16
+  unchanged. `CRISPASR_SIDON_QUANT_RPE=1` restores the old multiply as the
+  upstream-fix bisection gate.
+- **Quantizer rules** (`f198f967`) — sidon had no entry at all (checklist point
+  8). The position table and the 160x1024 input projection are no longer
+  quantized; neither row is 256-aligned, so both had been silently falling back
+  to legacy Q4_0 under `--q4_k`. 9 Q4_0 tensors -> 0 for +282 KB (+0.12 %).
+- **Re-quantized + re-uploaded** `cstr/Sidon-GGUF` (q8_0/q6_k/q4_k, 2026-09-02).
+  Remote headers verified: all 9 lookup tensors F16 in every published quant.
+  Each decodes correctly under `CRISPASR_SIDON_QUANT_RPE=1` — i.e. the FILES
+  fix affected GPUs on **existing 0.8.31 binaries**, without waiting for a
+  release. Card updated; `license: mit` still set.
+- **Coverage** (`f198f967`) — `env-live-tests.sh` pointed `CRISPASR_MODEL_SIDON`
+  at f16 ONLY, so no quantized Sidon was ever executed. Added
+  `CRISPASR_MODEL_SIDON_QUANT` + a live case, watched failing on injected
+  silence before keeping.
+- **Diagnostics** (`63e7def6`) — a degenerate decode now names the failing stage
+  (predictor vs DAC) and NaN vs all-zero instead of writing a silent WAV rc=0.
+
+Same-shape audit across the other runtimes (asked: is anything else affected?).
+The hazard needs a QUANTIZED weight as mul_mat src0 (so ne2=1) against a src1
+with ne2>1. Of 815 weight-as-src0 matmul sites in `src/`, only three have a
+batched src1:
+
+| runtime | site | src1 batch | weight quantized? |
+|---|---|---|---|
+| cosyvoice3-tts | `mul_mat(attn_o_w, attn)` `[d,T,B]` | **B=2**, CFG batching on by default (`CRISPASR_COSYVOICE3_CFG_BATCH`) | yes — not in the arch exclusion list |
+| qwen3-asr | `mul_mat(audio.conv_out_w, cur)` `[F*C,T,num_chunks]` | >1 for multi-chunk audio | yes — Q8_0 floor, still quantized |
+| beat-this | `mul_mat(to_out.0.weight, out)` `[D*H,N,B]` | only if B>1 | yes — generic rule |
+
+This is a SHAPE-SIGNATURE audit, not a reproduction: it shows these three share
+sidon's exact pattern, not that they fail. Whether they are actually at risk
+turns on the still-open question of whether the ggml MMQ defect is
+broadcast-specific or specific to sidon's dims (ne00=64 / ne01=73). The
+`CRISPASR_SIDON_RPE=expand` vs `=bucket` answer settles that; if it is the
+broadcast, cosyvoice3 is the one to check first since B=2 is its default.
+
+Open: (a) reporter to run `CRISPASR_SIDON_RPE=expand` vs `=bucket` (confirms the
+op); (b) `tools/kaggle/sidon-quant-cuda/` — three arms per quant (fixed graph on
+CUDA, pre-fix graph via the gate, CPU control) answering whether CUDA's MMQ
+shares the defect and whether the fix regresses CUDA.
+
 ## DONE 2026-09-02 — #420 `crispasr --help` was not pipeable
 
 Worktree `.claude/worktrees/fix-420-help-stdout`, branch `fix/420-help-stdout`.
