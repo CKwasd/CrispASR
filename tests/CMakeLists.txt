@@ -42,6 +42,21 @@ catch_discover_tests(test-chatterbox-f0-simd
     TEST_SPEC "[unit][tts][chatterbox][simd]"
     PROPERTIES LABELS "unit;tts;chatterbox")
 
+# #421: these two suites memcmp three arms (hand reference, scalar kernel,
+# SIMD kernel) for BIT-exactness. On aarch64 GCC defaults to
+# -ffp-contract=fast and contracts the reference loop and the kernel loop
+# DIFFERENTLY (different mul/fmadd pairings), so the memcmp fails by
+# 2-6e-6 — a too-strict test, not a kernel bug (proven by cross-compiled
+# repro: 6/6 fail at default, 0/6 with contraction off; x86 agrees only
+# by accident because baseline x86-64 has no FMA). Pinning contraction
+# off for the TEST TUs keeps bit-exactness meaningful — all compared arms
+# live in this one TU — while shipped kernels keep fmadd (faster and more
+# accurate). MSVC does not contract by default, hence the guard.
+if (NOT MSVC)
+    set_source_files_properties(test-chatterbox-hift-simdconv.cpp test-cosyvoice3-hift-simdconv.cpp
+                                PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
+
 add_executable(test-chatterbox-hift-simdconv test-chatterbox-hift-simdconv.cpp)
 target_include_directories(test-chatterbox-hift-simdconv PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-chatterbox-hift-simdconv PRIVATE Catch2::Catch2WithMain Threads::Threads)
