@@ -194,11 +194,25 @@ def run_sidon(binp, model, tag, gpu, quant_rpe=False):
     return res
 
 
-SCRIPT_VERSION = "2026-09-03.1"  # bump when arms/capture/predicate change
+SCRIPT_VERSION = "2026-09-03.2"  # bump when arms/capture/predicate change
 
 
 def main():
     kh.provenance(SCRIPT_VERSION, clone_dir=CLONE)
+    # Settle an open question at zero cost, since this prints before the sm_60
+    # early-exit and therefore rides on any draw, good or bad: does
+    # `kaggle kernels push` upload the WHOLE directory or only code_file?
+    # ~/kaggle_usage.md says "everything in the push directory"; a peer inferred
+    # "only code_file" from `kernels pull` returning a single .py — but pull is
+    # selective by design (its -m flag GENERATES metadata rather than fetching
+    # it), so that observation cannot settle it either way. This lists what the
+    # script can actually see next to itself at runtime, which is the only thing
+    # that decides whether the bundled kaggle_harness.py fallback can ever fire.
+    try:
+        kh.step("upload_probe", script_dir=str(HERE),
+                siblings=sorted(p.name for p in HERE.iterdir()))
+    except Exception as e:
+        kh.step("upload_probe_failed", error=repr(e))
     smi = sh("nvidia-smi --query-gpu=name,driver_version --format=csv,noheader")
     gpu_name = (smi.stdout or "").strip()
     cc_out = sh("nvidia-smi --query-gpu=compute_cap --format=csv,noheader")
