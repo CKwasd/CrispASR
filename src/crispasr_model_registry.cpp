@@ -93,6 +93,21 @@ constexpr Entry k_registry[] = {
      "~458 MB", nullptr, nullptr},
     {"parakeet", "parakeet-tdt-0.6b-v3-q4_k.gguf",
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF/resolve/main/parakeet-tdt-0.6b-v3-q4_k.gguf", "~467 MB", nullptr, nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)"},
+    // Quds v4 (#387): Persian ASR, FastConformer-RNNT fine-tune of the
+    // CC-BY-4.0 NVIDIA stt_fa base, by hojreh (converted from the author's
+    // ONNX export — models/convert-nemo-rnnt-onnx-to-gguf.py). Rides the
+    // parakeet runtime (pred_layers=1, no CTC head in the export). Q8_0 is
+    // transcript-identical to F16 on the CV-fa validation clips.
+    {"quds", "quds-v4-fa-q8_0.gguf",
+     "https://huggingface.co/cstr/quds-v4-fa-GGUF/resolve/main/quds-v4-fa-q8_0.gguf", "~122 MB", nullptr, nullptr,
+     nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (Quds v4 by hojreh, "
+     "https://huggingface.co/hojreh/Quds-v4-onnx; base model nvidia/stt_fa_fastconformer_hybrid_large, CC-BY-4.0)"},
+    {"quds-fa", "quds-v4-fa-q8_0.gguf",
+     "https://huggingface.co/cstr/quds-v4-fa-GGUF/resolve/main/quds-v4-fa-q8_0.gguf", "~122 MB", nullptr, nullptr,
+     nullptr,
+     "CC-BY-NC-4.0 — NON-COMMERCIAL use only (Quds v4 by hojreh, "
+     "https://huggingface.co/hojreh/Quds-v4-onnx; base model nvidia/stt_fa_fastconformer_hybrid_large, CC-BY-4.0)"},
     {"canary", "canary-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/canary-1b-v2-GGUF/resolve/main/canary-1b-v2-q4_k.gguf", "~600 MB", nullptr, nullptr, nullptr, "CC-BY-4.0 (see https://huggingface.co/nvidia/canary-1b-v2)"},
     {"canary-qwen", "canary-qwen-2.5b-q8_0.gguf",

@@ -5054,6 +5054,15 @@ set_tests_properties(test-htdemucs-separate-live PROPERTIES
     LABELS "live;htdemucs"
     TIMEOUT 900)
 
+# ─── test-quds-fa-live — #387 Quds v4 Persian ASR: exact-transcript check
+# on the bundled CC0 Common Voice clip. SKIPs without the model.
+add_test(NAME test-quds-fa-live
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-quds-fa-live.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-quds-fa-live PROPERTIES
+    LABELS "live;quds"
+    TIMEOUT 300)
+
 # ─── test-separate-live — §248 source separation smoke test. SKIPs cleanly
 # without a mel-band-roformer model (CRISPASR_MBR_MODEL / CRISPASR_MODELS_DIR).
 add_test(NAME test-separate-live

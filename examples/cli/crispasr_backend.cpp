@@ -117,7 +117,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
     if (name == "nemotron" || name == "nemotron-streaming" || name == "nemotron-3.5" || name == "nemotron-asr" ||
         name == "nemotron-speech-streaming")
         return crispasr_make_nemotron_backend();
-    if (name == "parakeet" || name == "reazonspeech")
+    if (name == "parakeet" || name == "reazonspeech" || name == "quds" || name == "quds-fa")
         return crispasr_make_parakeet_backend();
     if (name == "canary")
         return crispasr_make_canary_backend();
@@ -311,6 +311,7 @@ std::vector<std::string> crispasr_list_backends() {
         "gigaam",
         "parakeet",
         "reazonspeech",
+        "quds-fa",
         "canary",
         "canary-qwen",
         "lfm2-audio",
@@ -647,6 +648,9 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "parakeet";
     if (contains_ci("reazonspeech"))
         return "parakeet";
+    if (contains_ci("quds"))
+        return "parakeet"; // #387: Persian FastConformer-RNNT rides the parakeet runtime
+
     // Check "fastconformer-ctc" / "stt_en_fc_ctc" style filenames before
     // the broader "canary" match so users who drop a NeMo standalone
     // model next to a canary aligner pick the right backend.

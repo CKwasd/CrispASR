@@ -1069,6 +1069,8 @@ static void lstm_init_state(parakeet_lstm_state& s, int H) {
 
 // Read an F16/F32 ggml tensor into a flat F32 std::vector for CPU stepping.
 static std::vector<float> tensor_to_f32(ggml_tensor* t) {
+    if (!t)
+        return {}; // single-LSTM predictors (#387) have no layer-1 tensors
     const size_t n = ggml_nelements(t);
     std::vector<float> out(n);
     if (t->type == GGML_TYPE_F32) {
@@ -1152,7 +1154,12 @@ static void predictor_step(const parakeet_predictor_weights& W, int token_id, pa
                     state.c0.data(), h0_new.data(), H, H);
     state.h0 = h0_new;
 
-    // Layer 1 — input is layer 0's hidden
+    // Layer 1 — input is layer 0's hidden. Single-LSTM predictors (#387:
+    // quds-fa, and parakeet-tdt_ctc-110m's RNNT head) stop at layer 0.
+    if (W.w_ih_1.empty()) {
+        pred_out = state.h0;
+        return;
+    }
     std::vector<float> h1_new(H);
     lstm_step_layer(state.h0.data(), W.w_ih_1.data(), W.b_ih_1.data(), W.w_hh_1.data(), W.b_hh_1.data(),
                     state.h1.data(), state.c1.data(), h1_new.data(), H, H);
@@ -2914,8 +2921,10 @@ extern "C" struct parakeet_context* parakeet_init_from_file(const char* path_mod
     }
 
     // Hybrid TDT+CTC models with a single-LSTM predictor (parakeet-tdt_ctc-110m
-    // has pred_layers=1) can only decode via the CTC head — TDT decode requires
-    // a 2-layer LSTM. Default to CTC so the model just works out of the box.
+    // has pred_layers=1) default to the CTC head — historically the RNNT
+    // decode required 2 LSTM layers. Since #387 (quds-fa: single-LSTM RNNT
+    // with NO CTC head) both decode paths handle pred_layers=1, so this is a
+    // preference for hybrids, not a requirement.
     if (ctx->model.hparams.pred_layers < 2 && ctx->model.has_ctc) {
         ctx->decode_ctc = true;
         fprintf(stderr, "parakeet: single-LSTM predictor + CTC head detected → defaulting to CTC decode\n");
