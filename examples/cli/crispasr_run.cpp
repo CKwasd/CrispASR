@@ -3245,6 +3245,26 @@ int crispasr_run_backend(const whisper_params& params_in) {
 
     warn_unsupported(*backend, params);
 
+    // A monolingual backend can only ever emit sole_language(); asking it for a
+    // different one is not a warning, it is a request it cannot satisfy. Before
+    // this, `crispasr -m moonshine.gguf -l de audio.wav` transcribed ENGLISH and
+    // exited 0 — the wrong-language output looked like a model quality problem
+    // rather than a rejected flag. Compared through whisper_lang_id() so the
+    // spelled-out form (`-l german`) is caught the same way, with a raw string
+    // compare as the fallback for codes outside whisper's table.
+    if (const char* sole_lang = backend->sole_language(); sole_lang && params.language != "auto") {
+        const int want = whisper_lang_id(params.language.c_str());
+        const int have = whisper_lang_id(sole_lang);
+        const bool same = (want != -1 && have != -1) ? (want == have) : (params.language == sole_lang);
+        if (!same) {
+            fprintf(stderr,
+                    "crispasr: error: backend '%s' is %s-only and cannot transcribe '%s'. "
+                    "Use -l %s, or -l auto, or pick a multilingual backend.\n",
+                    backend->name(), sole_lang, params.language.c_str(), sole_lang);
+            return 14;
+        }
+    }
+
     if (!backend->init(params)) {
         fprintf(stderr, "crispasr: error: failed to initialise backend '%s'\n", backend_name.c_str());
         return 13;

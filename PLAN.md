@@ -1,5 +1,53 @@
 # CrispASR — Pending work
 
+## DONE 2026-09-02 — argument validation ran after backend dispatch
+
+Worktree `.claude/worktrees/fix-validate-before-dispatch`, branch
+`fix/validate-before-dispatch`. Follow-up to the #420 NEXT item.
+
+Root cause: the `--diarize`/`--tinydiarize` conflict check and the `--language`
+check sat at the very END of `main()`, after every `crispasr_run_backend()`
+early return. Only the LEGACY whisper path (explicit `-m file.bin`, no
+`--backend`, no `-m auto`) ever reached them. Every dispatched run — which is
+most of them: `-m auto`, any `--backend`, or a GGUF whose metadata names a
+non-whisper arch — skipped both and accepted the bad argument with exit 0:
+`crispasr -m auto -l zz` transcribed as English and returned success.
+
+The fix is NOT a hoist, and that is the whole subtlety. Whisper's language
+table has 100 entries; other backends legitimately use codes outside it
+(omnivoice alone takes fil/nan/arb/pes), so validating every backend against it
+would REJECT VALID INPUT — a worse bug than the one being fixed. So:
+
+- `--diarize`/`--tinydiarize` is contradictory for every backend → checked
+  immediately after `whisper_params_parse()`, unconditionally.
+- `--language` is checked at the DISPATCH SITE, not at parse time: `params.backend`
+  is still empty there because GGUF auto-detection has not run, so "empty
+  means whisper" is only true further down. Gated on the effective backend
+  (`empty || "whisper"`); the legacy-path check is unchanged.
+
+Third defect found while tracing it and fixed in the same pass: a backend
+declaring `sole_language()` silently ignored a contradicting `-l`.
+`crispasr -m moonshine.gguf -l de audio.wav` transcribed ENGLISH and exited 0 —
+the wrong-language output read as a model-quality problem rather than a
+rejected flag. `crispasr_run.cpp` now errors (rc 14) between backend creation
+and `init()`, comparing through `whisper_lang_id()` so `-l german` is caught
+the same way as `-l de`.
+
+Proof: `tests/test-arg-validation.sh` (ctest `test-arg-validation`, label
+`cli`) — 10 assertions, fully offline and model-free (every case is decided
+before a model loads; HOME and CRISPASR_MODELS_DIR point at empty dirs so a
+network fetch cannot fake a pass), 0.9 s. Green after; watched failing 7/10
+against the pre-fix binary. The 3 that pass in BOTH builds are the
+false-positive guards — `-l fil --backend parakeet` must not be a language
+error, `-l en`/`-l auto` on moonshine must pass through — which is exactly the
+behaviour that must not change.
+
+NOT covered (deliberate, worth its own issue): the session C ABI
+(`src/crispasr_c_api.cpp`) reimplements transcribe inline and does not route
+through `crispasr_run.cpp`, so the `sole_language()` guard does not reach
+bindings/server-session callers. `crispasr-server` also has its own arg parsing
+and its own copy of the whisper-table language check.
+
 ## NOW — #416 Sidon quantized models decode to silence (Vulkan MMQ)
 
 Worktree `.claude/worktrees/fix-416-sidon-quant`, branch `fix/416-sidon-quant`.

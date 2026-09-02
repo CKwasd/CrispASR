@@ -4842,6 +4842,21 @@ set_tests_properties(test-progress-output PROPERTIES
     LABELS "live;progress"
     TIMEOUT 300)
 
+# ─── test-arg-validation — offline regression: argument validation must run
+# BEFORE backend dispatch. The --diarize/--tinydiarize conflict and the
+# --language check used to sit after every crispasr_run_backend() early
+# return, so any dispatched run (-m auto, any --backend, a non-whisper GGUF)
+# skipped them and accepted the bad argument with exit 0. Also guards the
+# opposite hazard: whisper's 100-entry language table must NOT be applied to
+# backends it does not govern. No models, no network.
+add_test(NAME test-arg-validation
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-arg-validation.sh
+            $<TARGET_FILE:crispasr-cli>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-arg-validation PROPERTIES
+    LABELS "cli"
+    TIMEOUT 60)
+
 # ─── test-help-stdout — offline regression (#420): an explicitly requested
 # --help is program OUTPUT, so it must go to stdout with exit 0 and be
 # pipeable (`crispasr --help | less`). Usage printed for a usage ERROR must go

@@ -2306,6 +2306,28 @@ static void output_lrc(const std::vector<crispasr_segment>& segs, std::ofstream&
 
 static void cb_log_disable(enum ggml_log_level, const char*, void*) {}
 
+// --language is validated against whisper's table only when whisper is what
+// will actually run. The table has 100 entries; other backends legitimately use
+// codes outside it (omnivoice alone takes fil/nan/arb/pes), so applying it to
+// every backend would reject valid input — which is why this is gated on the
+// effective backend rather than hoisted unconditionally.
+static bool crispasr_validate_whisper_language(int argc, char** argv, const whisper_params& params) {
+    if (params.language == "auto")
+        return true;
+    if (whisper_lang_id(params.language.c_str()) != -1)
+        return true;
+    fprintf(stderr, "error: unknown language '%s'\n", params.language.c_str());
+    whisper_print_usage(argc, argv, params, stderr);
+    return false;
+}
+
+// True when the run will end up on whisper — either the legacy native path or
+// the unified wrapper. `--backend` empty means whisper by default (`-m auto`
+// downloads a whisper model), so both spellings resolve here.
+static bool crispasr_effective_backend_is_whisper(const whisper_params& params) {
+    return params.backend.empty() || params.backend == "whisper";
+}
+
 int main(int argc, char** argv) {
 #if defined(_WIN32)
     // Set the console output code page to UTF-8, while command line arguments
@@ -2371,6 +2393,22 @@ int main(int argc, char** argv) {
     }
 
     if (whisper_params_parse(argc, argv, params) == false) {
+        whisper_print_usage(argc, argv, params, stderr);
+        return 1;
+    }
+
+    // Argument validation belongs before dispatch. This check used to sit after
+    // every crispasr_run_backend() early return, so it only ever ran on the
+    // legacy whisper path — `crispasr --diarize --tinydiarize` was accepted
+    // silently and exited 0. The pair is contradictory for every backend, so it
+    // is checked unconditionally and as early as possible.
+    //
+    // --language canNOT be validated here: params.backend is not resolved yet
+    // (GGUF auto-detection runs further down), so an empty --backend does not
+    // yet mean whisper. That check lives at the dispatch site below, once the
+    // effective backend is known.
+    if (params.diarize && params.tinydiarize) {
+        fprintf(stderr, "error: cannot use both --diarize and --tinydiarize\n");
         whisper_print_usage(argc, argv, params, stderr);
         return 1;
     }
@@ -2661,6 +2699,14 @@ int main(int argc, char** argv) {
                                       params.require_punctuation;
         if (explicit_backend || model_is_auto || auto_detected_non_whisper || params.stream ||
             !params.tts_text.empty() || !params.vad_import_file.empty() || strict_requested) {
+            // params.backend is resolved by this point (auto-detection above
+            // has run), so "empty or whisper" now genuinely means whisper and
+            // its 100-entry table is the right authority. Without this, every
+            // dispatched run skipped language validation entirely — `-l zz`
+            // transcribed happily and exited 0.
+            if (crispasr_effective_backend_is_whisper(params) &&
+                !crispasr_validate_whisper_language(argc, argv, params))
+                return 1;
             const int rc = crispasr_run_backend(params);
 #if defined(_WIN32)
             // Bypass global C++ destructors (ggml Vulkan device teardown can
@@ -2691,17 +2737,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1) {
-        fprintf(stderr, "error: unknown language '%s'\n", params.language.c_str());
-        whisper_print_usage(argc, argv, params, stderr);
+    if (!crispasr_validate_whisper_language(argc, argv, params))
         exit(1);
-    }
 
-    if (params.diarize && params.tinydiarize) {
-        fprintf(stderr, "error: cannot use both --diarize and --tinydiarize\n");
-        whisper_print_usage(argc, argv, params, stderr);
-        exit(1);
-    }
 
     if (params.no_prints) {
         whisper_log_set(cb_log_disable, NULL);
