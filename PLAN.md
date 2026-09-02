@@ -2854,15 +2854,33 @@ Port ships with `ggml_flash_attn_ext` on encoder+adaptor (`FUNASR_NO_FA=1` to op
 out), fused QKV (DONE), and single-token embed fast path (`CRISPASR_FUNASR_EMBED_FAST`,
 default ON, DONE §180). None affect correctness — pure throughput. Remaining:
 
-- [ ] **Per-step LLM decode graph cache.** JFK decode runs ~37.6 ms/tok vs ~6 ms/tok
-  memory-bound floor (F16 Qwen3-0.6B on M1) → ~30 ms is graph-build/sched overhead.
-  Build the step graph once at `funasr_kv_init` with `kv_indices` runtime input
-  (K/V via `ggml_set_rows` to runtime slot, not static-offset `ggml_cpy`) and
-  `fixed_kv_len = kv_max_ctx`; each step only writes positions/kv_indices/mask/inputs.
-  Expected 5–10 ms/tok (15–25% decode). qwen3_asr could adopt same. Effort: ~1 bench session.
-- [ ] **Encoder graph cache by T_lfr bucket.** Bucket to {128,256,512,1024,2048}
-  (voxcpm2 TSLM pattern), pad inputs + static mask dropping trailing rows; first call
-  per bucket pays build, rest reuse. Expected 10–20 ms/call warm. Effort: ~1 bench session.
+- [x] **Per-step LLM decode graph cache — DONE 2026-09-02, but NOT as recorded
+  here.** The literal design (`fixed_kv_len = kv_max_ctx`, one graph) was
+  already scaffolded default-OFF in the file with an M1 3× regression note,
+  and re-measured on x86 as **+69% decode CPU** — one wasted KV key costs
+  ~0.28 ms/tok through the GQA repeat+cont, so a fixed-Lk graph loses far
+  more to KV bandwidth than it saves in graph prep (~2.1 ms/tok). Shipped
+  instead: **bucketed Lk, width 16** (`CRISPASR_FUNASR_STEP_BUCKET`, measured
+  optimum; break-even w≈15), FIFO of 4 live graphs, padded slots masked to
+  -inf (flash-attn skips fully masked positions → bit-identical by
+  construction), default ON with `CRISPASR_FUNASR_STEP_CACHE=0` opt-out.
+  Byte-identical 18/18 (3 clips × f16/q4_k × pre-change/off/on, re-verified
+  independently), quant-bcast audit clean (0 hits, q4_k+q8_0, both arms).
+  Net on x86: neutral within ±8% noise (decode is weight-bandwidth-bound;
+  step prep was only 2–3.8 ms/tok here, not the ~30 ms the M1 note implied)
+  while removing 93% of per-step graph prep — the win lives on platforms
+  where graph construction is expensive (M1). qwen3_asr adoption: only with
+  the bucketed variant, never fixed-Lk.
+- [x] **Encoder graph cache — exact-T_lfr half DONE 2026-09-02** (default ON,
+  `CRISPASR_FUNASR_ENC_CACHE=0` opt-out): repeat-length calls skip the
+  7.5–23.9 ms graph build (cache hit = 0 ms; sched_alloc 2.4–6.2 ms still
+  paid). The padded-bucket half is **dropped as designed**: the SANM FSMN
+  branch is a width-11 depthwise conv over TIME (`core/sanm.h:128`), so a
+  padded frame leaks into the last 5 real frames of all 70 blocks and
+  zero-padding doesn't save it (LayerNorm of a zero row = bias ≠ 0) — a
+  bit-identical version needs a time mask on V inside `core_sanm` — and the
+  economics are upside down anyway (build is ~10–24 ms against a 2.3–6.1 s
+  encoder; padding T_lfr 183→256 would spend seconds to save milliseconds).
 - [ ] **Two-pass: CTC fast pass → Fun-ASR-Nano LLM rescore.** Upstream checkpoint has
   0 CTC tensors (LLM-style by choice); the only public trained CTC head is
   `csukuangfj/funasr-nano-with-ctc` (Apache-2.0, encoder+adaptor+CTC, no LLM, frozen
