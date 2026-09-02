@@ -75,6 +75,7 @@ SIDON_REPO = "cstr/Sidon-GGUF"
 # q6_k is included even though the reporter did not try it: if q8_0 and q4_k
 # fail it says whether EVERY quant is affected or only some, which separates
 # "quantized weights in general" from "one specific quant type's kernel".
+LEGACY_FILE = "sidon-legacy-q8_0.gguf"  # rebuilt in-kernel; see the note in main()
 SIDON_FILES = ["sidon-v0.1-f16.gguf", "sidon-v0.1-q8_0.gguf",
                "sidon-v0.1-q6_k.gguf", "sidon-v0.1-q4_k.gguf"]
 
@@ -248,7 +249,7 @@ def main():
     # that never reached the code (and would fail validity gate V3 below,
     # identical arms). Rebuild the pre-fix file locally; --tensor-type
     # deliberately overrides the arch guards.
-    legacy = MODELS / "sidon-legacy-q8_0.gguf"
+    legacy = MODELS / LEGACY_FILE
     qbin = CLONE / "build" / "bin" / "crispasr-quantize"
     if not qbin.exists():
         raise RuntimeError("crispasr-quantize not built — cannot rebuild the legacy quant")
@@ -271,7 +272,8 @@ def main():
     #                 have the same defect Vulkan does?)
     #   cpu         — control on the same box
     # f16 needs no cudaq arm: its table is not quantized, so the gate is a no-op.
-    for f in SIDON_FILES + ["sidon-legacy-q8_0.gguf"]:
+    swept = SIDON_FILES + [LEGACY_FILE]
+    for f in swept:
         short = f.replace("sidon-v0.1-", "").replace(".gguf", "")
         arms = [("cuda", True, False), ("cpu", False, False)]
         if "f16" not in f:
@@ -292,8 +294,13 @@ def main():
         m = r.get("measured") or {}
         return bool(r.get("rc") == 0 and m.get("peak", 0) > 0.01)
 
+    # Derive from what was actually SWEPT, not from SIDON_FILES. The published
+    # quants can no longer reproduce (their distance_embedding is F16, so the
+    # gate is a no-op), so a verdict computed over SIDON_FILES alone would read
+    # "not reproduced" from three arms that never reached the code — while
+    # silently excluding sidon-legacy-q8_0, the only model that CAN reproduce.
     quants = [f.replace("sidon-v0.1-", "").replace(".gguf", "")
-              for f in SIDON_FILES if "f16" not in f]
+              for f in swept if "f16" not in f]
     # The defect on CUDA: pre-fix arm silent while its own CPU control is fine.
     repro = [q for q in quants
              if not ok(f"{q}_cudaq") and ok(f"{q}_cpu") and ok("f16_cuda")]
