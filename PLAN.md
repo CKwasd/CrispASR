@@ -4432,6 +4432,38 @@ by the log-mel HiFT vocoder → flow mel cosine(cpu,vk)=0.961 → garbage. The L
 - Default stays the shipped all-CPU route under Vulkan — correct, and the right
   answer unless the lever above ever pays off.
 
+## RESOLVED 2026-09-02 — the pa-in cause found: the QUANTIZED silero-lid artifacts are broken
+
+Closing the loop on the entry below. The pa-in/fr answers reproduced after
+all — but only when the caller loads `silero-lid-95-q8_0.gguf` /
+`-q5_0.gguf` (CrisperWeaver's live-test runner preferred q8_0 from
+/mnt/storage and silently overrode the caller's f32 choice; both bugs
+fixed on their side). Native A/B on jfk.wav, one variable at a time:
+
+    f32   ggml en 0.9985   legacy en 0.9985
+    q8_0  ggml pa-IN 0.017 legacy fr  -nan
+    q5_0  ggml pa-IN 0.016 legacy sn  -nan
+
+The legacy -nan is the tell: that path dereferences tensor->data as f32
+and has no dequantization at all; the ggml path runs but the tiny
+classifier's logits collapse into junk. The Aug-28 "stale artifact"
+attribution was wrong — the artifact was fine, the loaded MODEL differed.
+
+Done in this change: `lid_load` refuses quantized tensors with an error
+naming the f32 file, so both paths fail loudly instead of misdetecting.
+Note: the #409 evidence floor (raw top logit >= -2.0) did NOT catch the
+q8_0 junk — its top logits sit above the floor while the softmax mass is
+noise; the floor's separation data came from f32-input-conditioning
+failures only.
+
+Still open for the model owner:
+- delete or re-quantize `silero-lid-95-q8_0/q5_0.gguf` on HF and in
+  /mnt/storage/gguf-models (a correct requant needs per-backend
+  quantizer rules + per-stage validation vs the f32 per the PORT
+  PIPELINE; given the model is 16 MB in f32, deleting is defensible);
+- a hermetic regression test needs a small quantized fixture (a
+  crispasr-quantize of the f32 into the test scratch would do).
+
 ## RESOLVED 2026-08-29 — silero-lid audio arm verified correct; confidence contract fixed
 
 Full-pipeline verification against the upstream ONNX (`lang_classifier_95.onnx`

@@ -159,6 +159,26 @@ static bool lid_load(lid_model& m, const char* path, ggml_backend_t backend, ggm
     m.buf_cpu = wl.buf_cpu;
     m.tensors = std::move(wl.tensors);
 
+    // The published q8_0 / q5_0 quantizations of this model are broken:
+    // the ggml graph deflates every logit into junk (clean English reads
+    // pa-IN at p~=0.02) and the legacy path dereferences tensor->data as
+    // f32 and computes NaN confidences. A 16 MB f32 classifier has
+    // nothing to gain from quantization - refuse loudly instead of
+    // misdetecting. Verified natively 2026-09-02 (jfk.wav: f32 -> en
+    // p=0.9985 on both paths; q8_0 -> pa-IN / -nan). Lift this only
+    // after a re-quantization is validated per-stage against the f32.
+    for (const auto& kv : m.tensors) {
+        const ggml_tensor* t = kv.second;
+        if (t && ggml_is_quantized(t->type)) {
+            fprintf(stderr,
+                    "silero_lid: quantized tensor '%s' (%s) in '%s' - this backend supports\n"
+                    "  f32/f16 weights only (the published q8_0/q5_0 files misdetect); use\n"
+                    "  silero-lid-lang95-f32.gguf\n",
+                    kv.first.c_str(), ggml_type_name(t->type), path);
+            return false;
+        }
+    }
+
     // Bind top-level
     m.frontend_w = lid_get(m, "lid.frontend.weight");
     m.adaptive_norm_filter = lid_get(m, "lid.adaptive_norm.filter");
