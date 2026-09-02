@@ -52,23 +52,40 @@ Shipped:
 - **Diagnostics** (`63e7def6`) — a degenerate decode now names the failing stage
   (predictor vs DAC) and NaN vs all-zero instead of writing a silent WAV rc=0.
 
-Same-shape audit across the other runtimes (asked: is anything else affected?).
-The hazard needs a QUANTIZED weight as mul_mat src0 (so ne2=1) against a src1
-with ne2>1. Of 815 weight-as-src0 matmul sites in `src/`, only three have a
-batched src1:
+Cross-runtime exposure (asked: is anything else affected?). Static greps could
+not answer it — two independent heuristics over `src/` EACH missed sites the
+other found. There is now a runtime detector, `core_quant_bcast::audit`
+(`CRISPASR_AUDIT_QUANT_BCAST=1`), hooked at every graph-compute site in sidon /
+qwen3-asr / beat-this / cosyvoice3. Validated both ways on the known case: 8
+sidon sites reported as `[64,73,1,1] x [64,175,16,1] r2=16` with the fix off,
+zero with it on.
 
-| runtime | site | src1 batch | weight quantized? |
+Sites found by reading, each behind a DEFAULT-OFF gate. `mul_mat_fold_batch`
+folds the batch into the token dim (exact for a linear) rather than
+dequantizing — sidon's approach only worked because its table is 9 KB, whereas
+qwen3-asr's `conv_out_w` is 6.9 M parameters:
+
+| runtime | sites | gate | status |
 |---|---|---|---|
-| cosyvoice3-tts | `mul_mat(attn_o_w, attn)` `[d,T,B]` | **B=2**, CFG batching on by default (`CRISPASR_COSYVOICE3_CFG_BATCH`) | yes — not in the arch exclusion list |
-| qwen3-asr | `mul_mat(audio.conv_out_w, cur)` `[F*C,T,num_chunks]` | >1 for multi-chunk audio | yes — Q8_0 floor, still quantized |
-| beat-this | `mul_mat(to_out.0.weight, out)` `[D*H,N,B]` | only if B>1 | yes — generic rule |
+| beat-this | `qkv_w`, `gates_w`, `out_w`; ne2 = folded time axis, large | `CRISPASR_BEATTHIS_FOLD_BCAST` | no local model — unexercised |
+| cosyvoice3-tts | `attn_o_w` (1 of 4; the others are 2-D), B=2 under default CFG batching | `CRISPASR_COSYVOICE3_FOLD_BCAST` | no local model — unexercised |
+| qwen3-asr | `audio.conv_out_w`, ne2 = num_chunks | `CRISPASR_QWEN3ASR_FOLD_BCAST` | **detector reports ZERO** on a real 66 s multi-chunk run (rc=0, 132 words = 6x the source line) — not exposed |
 
-This is a SHAPE-SIGNATURE audit, not a reproduction: it shows these three share
-sidon's exact pattern, not that they fail. Whether they are actually at risk
-turns on the still-open question of whether the ggml MMQ defect is
-broadcast-specific or specific to sidon's dims (ne00=64 / ne01=73). The
-`CRISPASR_SIDON_RPE=expand` vs `=bucket` answer settles that; if it is the
-broadcast, cosyvoice3 is the one to check first since B=2 is its default.
+Defaults stay OFF: the ggml defect is not confirmed to be broadcast-specific
+rather than specific to sidon's dims, and flipping defaults across three
+backends on an unconfirmed mechanism is the wrong trade. One-liner once the
+reporter's `expand`/`bucket` answer lands.
+
+**CUDA arm: INCONCLUSIVE, not an exoneration.** `tools/kaggle/sidon-quant-cuda`
+ran on a Tesla P100 and reported no defect — but P100 is **sm_60**, and ggml
+disables MMQ below `GGML_CUDA_CC_DP4A == 610` (`ggml_cuda_should_use_mmq`), so
+the pre-fix arm never took the path under test. The tell was in the data: gated
+and ungated arms measured byte-identically (q8_0 rms 0.111276 both), i.e. the
+gate changed nothing. SAME capability-gap trap as the lavapipe Vulkan sweep —
+second occurrence in this issue. The kernel now records `compute_cap` /
+`mmq_reachable` and marks its own verdict `conclusive: false` below 6.1; re-run
+pushed hoping for a T4 (sm_75 has dp4a; Kaggle assigns P100/T4 at random). It
+did establish the fix does NOT regress CUDA.
 
 Open: (a) reporter to run `CRISPASR_SIDON_RPE=expand` vs `=bucket` (confirms the
 op); (b) `tools/kaggle/sidon-quant-cuda/` — three arms per quant (fixed graph on
