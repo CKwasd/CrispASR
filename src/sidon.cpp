@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include "gguf.h"
 
+#include "core/quant_bcast.h"
 #include "core/cpu_ops.h"
 #include "core/dac_decoder.h"
 #include "core/fft.h"
@@ -910,6 +911,7 @@ std::vector<float> sidon_extract_hidden(sidon_context* ctx, const float* pcm_16k
         return {};
     }
     set_predictor_inputs(ctx, feats, T);
+    core_quant_bcast::audit(ctx->predictor_graph, "sidon");
     if (ggml_backend_sched_graph_compute(ctx->predictor_sched, ctx->predictor_graph) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "sidon: predictor graph compute failed\n");
         release_predictor_workspace(ctx);
@@ -1045,6 +1047,7 @@ std::vector<float> sidon_restore(sidon_context* ctx, const float* samples, int n
 
     set_predictor_inputs(ctx, feats, T);
     const auto predictor_start = clock::now();
+    core_quant_bcast::audit(ctx->predictor_graph, "sidon");
     if (ggml_backend_sched_graph_compute(ctx->predictor_sched, ctx->predictor_graph) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "sidon: predictor graph compute failed\n");
         release_predictor_workspace(ctx);
@@ -1145,6 +1148,7 @@ std::vector<float> sidon_restore(sidon_context* ctx, const float* samples, int n
         }
         const float* chunk_features = predictor_features.data() + (size_t)chunk_start * hidden;
         ggml_backend_tensor_set(ctx->decoder_input, chunk_features, 0, (size_t)chunk_frames * hidden * sizeof(float));
+        core_quant_bcast::audit(ctx->decoder_graph, "sidon");
         if (ggml_backend_sched_graph_compute(ctx->decoder_sched, ctx->decoder_graph) != GGML_STATUS_SUCCESS) {
             std::fprintf(stderr, "sidon: decoder graph compute failed\n");
             release_decoder_workspace(ctx);

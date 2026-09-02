@@ -10,6 +10,7 @@
 
 #include "beat_this.h"
 
+#include "core/quant_bcast.h"
 #include "core/crispasr_env.h"
 #include "core/fft.h"
 #include "core/gguf_loader.h"
@@ -155,6 +156,14 @@ ggml_tensor* bt_norm(ggml_context* c, ggml_tensor* x, ggml_tensor* gamma) {
     return ggml_mul(c, ggml_rms_norm(c, x, 1e-12f), gamma);
 }
 
+// #416: these three matmuls pair a quantized weight (ne2=1) with an activation
+// whose ne2 is the folded time axis (see the einops note above), so ggml
+// broadcasts src0 across it. Gated OFF — see src/core/quant_bcast.h.
+static inline ggml_tensor* MM(ggml_context* c, ggml_tensor* w, ggml_tensor* x) {
+    static const bool fold = core_quant_bcast::fold_enabled("CRISPASR_BEATTHIS_FOLD_BCAST");
+    return fold ? core_quant_bcast::mul_mat_fold_batch(c, w, x) : ggml_mul_mat(c, w, x);
+}
+
 // Attention branch. `x` is ne (C, N, B); returns the BRANCH, ne (C, N, B) —
 // the caller adds the residual. `pos` is an I32 vector 0..N-1.
 ggml_tensor* bt_attention(ggml_context* c, const bt_attn& a, ggml_tensor* x, ggml_tensor* pos) {
@@ -165,7 +174,7 @@ ggml_tensor* bt_attention(ggml_context* c, const bt_attn& a, ggml_tensor* x, ggm
     // `x = self.norm(x)` before computing both qkv and gates.
     ggml_tensor* xn = bt_norm(c, x, a.gamma);
 
-    ggml_tensor* qkv = ggml_mul_mat(c, a.qkv_w, xn); // (3*H*D, N, B)
+    ggml_tensor* qkv = MM(c, a.qkv_w, xn); // (3*H*D, N, B)
     const size_t esz = ggml_element_size(qkv);
 
     // to_qkv's output is packed "(qkv h d)" with d fastest, so q/k/v are three
@@ -212,14 +221,14 @@ ggml_tensor* bt_attention(ggml_context* c, const bt_attn& a, ggml_tensor* x, ggm
     // per head, broadcast over that head's head_dim and over the sequence, and
     // applied BEFORE to_out. Dropping it leaves output that is plausible and
     // wrong — it scales rather than reshapes the activation.
-    ggml_tensor* g = ggml_add(c, ggml_mul_mat(c, a.gates_w, xn), a.gates_b); // (H, N, B)
+    ggml_tensor* g = ggml_add(c, MM(c, a.gates_w, xn), a.gates_b); // (H, N, B)
     g = ggml_sigmoid(c, g);
     out = ggml_mul(c, out, ggml_reshape_4d(c, g, 1, H, N, B)); // broadcasts over head_dim
 
     // "b h n d -> b n (h d)": D is fastest and H next, so the flattened row is
     // already (h d) per token and this is a pure reshape.
     out = ggml_reshape_3d(c, out, D * H, N, B);
-    return ggml_mul_mat(c, a.out_w, out);
+    return MM(c, a.out_w, out);
 }
 
 // FeedForward branch. GELU is the EXACT erf form: torch nn.GELU defaults to
@@ -657,6 +666,7 @@ static bool bt_run(struct beat_this_context* ctx, const float* logmel, int T, co
         fill_pos(pos_t);
         for (int i = 0; i < 3; i++)
             fill_pos(pos_f[i]);
+        core_quant_bcast::audit(gf, "beat-this");
         ok = ggml_backend_graph_compute(ctx->backend, gf) == GGML_STATUS_SUCCESS;
     }
     if (ok) {

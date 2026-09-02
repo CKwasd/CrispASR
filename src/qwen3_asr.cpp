@@ -13,6 +13,7 @@
 // See qwen3-asr-todo.md for the full plan.
 
 #include "qwen3_asr.h"
+#include "core/quant_bcast.h"
 #include "core/crispasr_env.h"
 #include "../crisp_audio/include/crisp_audio.h"
 #include "crispasr_imatrix.h"
@@ -890,7 +891,11 @@ static ggml_cgraph* qwen3_asr_build_graph_encoder(qwen3_asr_context* ctx, int T_
     // Permute (T,F,C,B) → (F,C,T,B): source axis 0(T)→pos 2, 1(F)→0, 2(C)→1, 3(B)→3
     cur = ggml_cont(ctx0, ggml_permute(ctx0, cur, 2, 0, 1, 3));
     cur = ggml_reshape_3d(ctx0, cur, F_out * C_out, T_out, num_chunks);
-    cur = ggml_mul_mat(ctx0, m.audio.conv_out_w, cur); // (d, T_out, num_chunks)
+    // #416: conv_out_w is quantized and `cur` carries num_chunks in ne2, so
+    // ggml broadcasts src0 across chunks. Gated OFF — see src/core/quant_bcast.h.
+    cur = core_quant_bcast::fold_enabled("CRISPASR_QWEN3ASR_FOLD_BCAST")
+              ? core_quant_bcast::mul_mat_fold_batch(ctx0, m.audio.conv_out_w, cur)
+              : ggml_mul_mat(ctx0, m.audio.conv_out_w, cur); // (d, T_out, num_chunks)
 
     // ------- Add positional embedding (broadcasts over batch) -------
     // pe_in ne = (d, T_out, 1) → broadcast against (d, T_out, num_chunks)
@@ -1676,6 +1681,7 @@ extern "C" float* qwen3_asr_run_conv(qwen3_asr_context* ctx, const float* mel_fe
     ggml_tensor* mel_in = ggml_graph_get_tensor(gf, "mel_batched");
     ggml_backend_tensor_set(mel_in, mel_padded.data(), 0, mel_padded.size() * sizeof(float));
 
+    core_quant_bcast::audit(gf, "qwen3-asr");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: conv graph compute failed\n");
         return nullptr;
@@ -1794,6 +1800,7 @@ extern "C" float* qwen3_asr_run_encoder(qwen3_asr_context* ctx, const float* mel
     ggml_tensor* mask_in = ggml_graph_get_tensor(gf, "attn_mask");
     ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(float));
 
+    core_quant_bcast::audit(gf, "qwen3-asr");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: encoder graph compute failed\n");
         return nullptr;
@@ -1956,6 +1963,7 @@ extern "C" float* qwen3_asr_run_llm_kv(qwen3_asr_context* ctx, const float* inpu
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
 
+    core_quant_bcast::audit(gf, "qwen3-asr");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: llm_kv graph compute failed\n");
         return nullptr;
@@ -2011,6 +2019,7 @@ extern "C" float* qwen3_asr_embed_tokens(qwen3_asr_context* ctx, const int32_t* 
     }
     ggml_tensor* ids_in = ggml_graph_get_tensor(gf, "input_ids");
     ggml_backend_tensor_set(ids_in, input_ids, 0, (size_t)n_tokens * sizeof(int32_t));
+    core_quant_bcast::audit(gf, "qwen3-asr");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: embed graph compute failed\n");
         return nullptr;
@@ -2052,6 +2061,7 @@ extern "C" float* qwen3_asr_run_llm_from_embeds(qwen3_asr_context* ctx, const fl
     ggml_tensor* mask_in = ggml_graph_get_tensor(gf, "causal_mask");
     ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(float));
 
+    core_quant_bcast::audit(gf, "qwen3-asr");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: llm-from-embeds graph compute failed\n");
         return nullptr;
@@ -2110,6 +2120,7 @@ extern "C" float* qwen3_asr_run_llm(qwen3_asr_context* ctx, const int32_t* input
     ggml_tensor* mask_in = ggml_graph_get_tensor(gf, "causal_mask");
     ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(float));
 
+    core_quant_bcast::audit(gf, "qwen3-asr");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: llm graph compute failed\n");
         return nullptr;
@@ -2416,6 +2427,7 @@ extern "C" float* qwen3_asr_run_aligner(struct qwen3_asr_context* ctx, const flo
         ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
 
+    core_quant_bcast::audit(gf, "qwen3-asr");
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: aligner graph compute failed\n");
         return nullptr;

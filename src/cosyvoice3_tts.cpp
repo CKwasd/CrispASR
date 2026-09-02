@@ -32,6 +32,7 @@
 
 #include "cosyvoice3_prompt_policy.h" // #334 min/max token-per-text laws
 
+#include "core/quant_bcast.h"
 #include "core/attention.h"
 #include "core/bpe.h"
 #include "core/ffn.h"
@@ -533,6 +534,7 @@ inline bool cv3_sched_alloc(cosyvoice3_tts_context* ctx, ggml_cgraph* gf) {
                                 : ggml_backend_sched_alloc_graph(ctx->sched, gf);
 }
 inline ggml_status cv3_sched_compute(cosyvoice3_tts_context* ctx, ggml_cgraph* gf) {
+    core_quant_bcast::audit(gf, "cosyvoice3");
     if (ctx->dispatch_cpu) // §304 hybrid: compute HiFT on the CPU backend
         return ggml_backend_graph_compute(ctx->backend_cpu, gf);
     return ctx->use_gpu_gallocr ? ggml_backend_graph_compute(ctx->backend, gf)
@@ -3153,7 +3155,15 @@ ggml_tensor* cv3_dit_block_apply_batched(ggml_context* ctx0, ggml_tensor* x, ggm
     V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
     ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, attn_scale, 0.0f, 0.0f);
     attn = ggml_reshape_3d(ctx0, attn, d, T, B);
-    attn = ggml_add(ctx0, ggml_mul_mat(ctx0, b.attn_o_w, attn), b.attn_o_b);
+    // #416: attn_o_w is quantized and `attn` carries B in ne2 — B=2 whenever CFG
+    // batching is on, which is the default. This is the only one of the four
+    // attn_o_w sites with a 3-D src1; the others reshape to 2-D and are
+    // unaffected. Gated OFF — see src/core/quant_bcast.h.
+    attn = ggml_add(ctx0,
+                    core_quant_bcast::fold_enabled("CRISPASR_COSYVOICE3_FOLD_BCAST")
+                        ? core_quant_bcast::mul_mat_fold_batch(ctx0, b.attn_o_w, attn)
+                        : ggml_mul_mat(ctx0, b.attn_o_w, attn),
+                    b.attn_o_b);
     ggml_tensor* x_after_attn = ggml_add(ctx0, x, ggml_mul(ctx0, attn, gate_msa));
 
     ggml_tensor* lnx_f = ggml_norm(ctx0, x_after_attn, ln_eps);

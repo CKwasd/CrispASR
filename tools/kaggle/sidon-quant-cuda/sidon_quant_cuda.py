@@ -195,7 +195,26 @@ def run_sidon(binp, model, tag, gpu, quant_rpe=False):
 def main():
     smi = sh("nvidia-smi --query-gpu=name,driver_version --format=csv,noheader")
     gpu_name = (smi.stdout or "").strip()
-    kh.step("gpu", device=gpu_name)
+    cc_out = sh("nvidia-smi --query-gpu=compute_cap --format=csv,noheader")
+    cc_raw = (cc_out.stdout or "").strip().splitlines()[0] if cc_out.stdout else ""
+    try:
+        cc = float(cc_raw)
+    except ValueError:
+        cc = 0.0
+    # ggml disables the integer MMQ path below compute capability 6.1:
+    #   GGML_CUDA_CC_DP4A == 610, and ggml_cuda_should_use_mmq() returns false
+    #   when highest_compiled_arch(cc) < that. __dp4a does not exist before 6.1.
+    # Kaggle hands out P100 (sm_60, NO dp4a) or T4 (sm_75, dp4a) at random, so a
+    # P100 run CANNOT exercise the path this kernel exists to test — it silently
+    # measures dequant+cuBLAS on both arms and "proves" CUDA is fine.
+    # This is the same capability-gap trap that made a lavapipe Vulkan sweep
+    # falsely exonerate Vulkan for #416. Label the run instead of hiding it.
+    mmq_reachable = cc >= 6.1
+    kh.step("gpu", device=gpu_name, compute_cap=cc_raw, mmq_reachable=mmq_reachable)
+    if not mmq_reachable:
+        print(f"WARNING: compute capability {cc_raw} < 6.1 — CUDA MMQ is disabled "
+              f"on this GPU, so the pre-fix arm is VACUOUS. Re-run for a T4.",
+              flush=True)
 
     binp = build_crispasr()
     make_clip()
@@ -206,7 +225,8 @@ def main():
                             local_dir=str(MODELS), token=HF_TOKEN or None)
     kh.step("models.ready", files=SIDON_FILES)
 
-    results = {"gpu": gpu_name, "branch": BRANCH, "runs": {}}
+    results = {"gpu": gpu_name, "compute_cap": cc_raw,
+               "mmq_reachable": mmq_reachable, "branch": BRANCH, "runs": {}}
 
     # main already carries the fix (the RPE table is gathered to F32 before the
     # multiply), so the interesting arm is the PRE-FIX graph via
@@ -250,6 +270,15 @@ def main():
         "f16_cpu_ok": ok("f16_cpu"),
         "prefix_silent_on_cuda_only": repro,
         "cuda_defect_reproduced": bool(repro),
+        # Without MMQ the pre-fix arm never differs from the fixed one, so a
+        # "not reproduced" here says nothing about CUDA. Two independent tells:
+        # the capability check, and gated/ungated arms measuring identically.
+        "conclusive": bool(mmq_reachable),
+        "gate_had_no_effect": [
+            q for q in quants
+            if (results["runs"].get(f"{q}_cuda", {}).get("measured") or {}).get("rms")
+            == (results["runs"].get(f"{q}_cudaq", {}).get("measured") or {}).get("rms")
+        ],
         "fixed_graph_healthy_on_cuda": sorted(fixed_ok),
         "fix_regresses_cuda": sorted(set(quants) - set(fixed_ok)),
     }
