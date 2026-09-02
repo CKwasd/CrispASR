@@ -194,7 +194,11 @@ def run_sidon(binp, model, tag, gpu, quant_rpe=False):
     return res
 
 
+SCRIPT_VERSION = "2026-09-03.1"  # bump when arms/capture/predicate change
+
+
 def main():
+    kh.provenance(SCRIPT_VERSION, clone_dir=CLONE)
     smi = sh("nvidia-smi --query-gpu=name,driver_version --format=csv,noheader")
     gpu_name = (smi.stdout or "").strip()
     cc_out = sh("nvidia-smi --query-gpu=compute_cap --format=csv,noheader")

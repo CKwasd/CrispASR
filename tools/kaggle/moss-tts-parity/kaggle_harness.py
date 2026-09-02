@@ -108,6 +108,37 @@ def _push_progress_to_hf(force: bool = False) -> None:
         pass
 
 
+def provenance(script_version: str, clone_dir: "str | os.PathLike | None" = None) -> dict:
+    """Log BOTH halves of what a run actually exercised, because they drift
+    apart silently.
+
+    Kernels `git clone` CrispASR at runtime, so the C++ UNDER TEST is always
+    fresh from main — but the HARNESS (arms, env gating, capture, pass/fail
+    predicate) freezes at the last `kaggle kernels push`. `git push` does NOT
+    update a Kaggle kernel. So a run can build and exercise the newest code
+    while scoring it with an outdated verdict, and nothing in the log looks
+    wrong (2026-09-03: a verdict fix sat correct in main while the kernel kept
+    running the old script). Print the clone's SHA and the script's own version
+    constant so the two halves are visible and comparable in the log.
+
+    `script_version` should be a literal in the kernel script — bump it when
+    you change the arms, the capture, or the predicate.
+    """
+    sha = "unknown"
+    root = str(clone_dir) if clone_dir else os.environ.get("CRISPASR_CLONE", "")
+    if root:
+        try:
+            r = subprocess.run(["git", "-C", root, "rev-parse", "--short", "HEAD"],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode == 0:
+                sha = (r.stdout or "").strip() or "unknown"
+        except Exception:
+            pass
+    info = {"script_version": script_version, "clone_sha": sha}
+    step("provenance", **info)
+    return info
+
+
 def step(name: str, **extra) -> None:
     """Append one checkpoint to the local JSONL, print it (flushed), and
     roll the file up to HF (rate-limited, best-effort)."""

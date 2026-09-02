@@ -145,6 +145,9 @@ sys.path.insert(0, str(CLONE / "tools" / "kaggle"))
 import kaggle_harness as kh  # noqa: E402
 
 kh.init_progress()
+# Bump when the arms, capture or predicate change (see kh.provenance).
+SCRIPT_VERSION = "2026-09-03.1"
+kh.provenance(SCRIPT_VERSION, clone_dir=CLONE)
 HF_TOKEN = kh.resolve_hf_token()
 step("cloned", crispasr_ref=CRISPASR_REF, hf_token_ok=bool(HF_TOKEN))
 
