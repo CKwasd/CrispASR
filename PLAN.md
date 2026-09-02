@@ -2507,8 +2507,16 @@ Follow-ups (LOW, not blocking):
   `espeak;piper;tts` — do not "fix" these.
 
 Multilingual + beam spot-checks (LOW, either machine):
-- [ ] moss-transcribe is zh/en but only English (jfk) validated — run one German +
-  one Chinese clip (de fixtures under `audio_samples/`).
+- [x] moss-transcribe multilingual check — RESOLVED 2026-09-02, premise was
+  WRONG: the upstream card says "intended for English automatic speech
+  recognition" (this line had conflated it with the Diarize sibling). Ran the
+  clips anyway (`samples/paraformer_zh.wav` + a bananamind-de synthesized
+  German sentence — `audio_samples/` never existed): both come back as rough
+  ENGLISH translations at rc 0, faithful to the model (prompt mirrors the
+  upstream processor, instruction-less). Actioned: moss-transcribe now
+  declares `sole_language()="en"` on the adapter + the session guard table,
+  so `-l zh` is an explicit pre-dispatch rejection instead of silently wrong
+  output, and `-l auto` short-circuits without an LID download (#227).
 - [ ] Run higgs/ark `-bs 4` on a noisy/accented clip to see if beam improves WER
   (only proven no-regression == greedy on easy JFK).
 

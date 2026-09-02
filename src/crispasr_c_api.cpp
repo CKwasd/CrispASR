@@ -4946,6 +4946,11 @@ static const char* session_sole_language(const std::string& backend, const std::
     }
     if (backend == "gigaam")
         return "ru";
+    // Upstream card: English-only preview; zh/de audio yields rough English
+    // translations at rc 0 without this (verified 2026-09-02). The diarize
+    // sibling is a different checkpoint and is deliberately NOT listed here.
+    if (backend == "moss-transcribe")
+        return "en";
     return nullptr;
 }
 
