@@ -211,9 +211,10 @@ the reporter's expected count exactly. Existing consumers unaffected:
 `tests/test_strict_pipeline.sh` captures with `2>&1`, and `ci.yml`'s bare
 `crispasr --help` still exits 0.
 
-NEXT (not started): `-l <bad>` and `--diarize --tinydiarize` are accepted
-silently because their guards live after the backend dispatch. Worth a separate
-issue — validation belongs before `crispasr_run_backend()`.
+NEXT — DONE as of `0face104` (validation moved before backend dispatch; see the
+2026-09-02 arg-validation entry above): `-l <bad>` and `--diarize --tinydiarize`
+are no longer accepted silently. Remaining sibling gaps are tracked below
+(session C ABI + crispasr-server carry their own copies of the hole).
 
 ## 2026-09-01 — #419 aligner romanization leaked into display text (FIX)
 
@@ -2492,9 +2493,18 @@ x86 CPU-only Linux validation of moss-transcribe / higgs-stt / ark-asr passed at
 Follow-ups (LOW, not blocking):
 - [ ] Fix handover to `cmake --build build` (all targets) before `ctest -L unit` —
   VPS run only built `crispasr`/`crispasr-diff`, ran 2 unit tests. Or have VPS build all.
-- [ ] Install Go toolchain on VPS (`root@168.119.190.252`) to close the one SKIPPED
-  Go link check, or leave to CI.
+- [x] Install Go toolchain on VPS — DONE 2026-09-02: go1.23.4 at
+  `/mnt/volume1/go-toolchain/go`, symlinked as `~/.local/bin/go` (on PATH).
 - [ ] Optional: promote to a standing post-push Linux smoke (Routine/cron).
+- [x] Orphaned ctest-label audit (2026-09-02, follow-up to the dead-`cli` find):
+  cross-checked every `LABELS` in tests/CMakeLists.txt against every `-L` filter
+  in .github/workflows + ci/. ONE real orphan found and fixed: `ci/run.sh` ran
+  `ctest -L main` (upstream whisper.cpp's label — nothing here carries it), so
+  both build.yml CPU jobs tested NOTHING while green; now `-L unit`, which also
+  gives the unit suite its only Debug-build run. Labels that exist but are
+  deliberately not CI-run (model-gated, local/live only): `live`, `base`,
+  `small`, `medium`, `large`, `tiny;en`, `benchmark`, `integration`,
+  `espeak;piper;tts` — do not "fix" these.
 
 Multilingual + beam spot-checks (LOW, either machine):
 - [ ] moss-transcribe is zh/en but only English (jfk) validated — run one German +
@@ -2503,8 +2513,10 @@ Multilingual + beam spot-checks (LOW, either machine):
   (only proven no-regression == greedy on easy JFK).
 
 Backend-wiring coverage gaps (LOW cleanup; re-list via `python tools/check-backend-wiring.py`):
-- [ ] **missing reference dumper**: `fastconformer-ctc`, `wav2vec2`, `m2m100`,
-  `kyutai-stt`, `gemma4-e2b`. Mostly intentional (m2m100 text-only MT, gemma4-e2b
+- [x] **missing reference dumper** — RESOLVED by 2026-09-02: all five now exist
+  in `tools/reference_backends/` (`fastconformer_ctc.py`, `wav2vec2.py`,
+  `m2m100.py`, `kyutai_stt.py`, `gemma4_e2b.py`). Original caveat kept for
+  the record (m2m100 text-only MT, gemma4-e2b
   shares gemma path, encoder components diff via host backends) — confirm per-backend
   before adding, not a blanket gap.
 
@@ -2871,8 +2883,10 @@ a handful of genuine CUDA-path bugs. Most resolved (vibevoice/lfm2-audio §206/k
 fastpitch+speecht5 §204/chatterbox §205 — all in HISTORY). Remaining open:
 
 TODO (open):
-- [ ] **f5-tts** — runs once given a reference voice but TIMEOUT at 120 s in re-test. Bump smoke
-  timeout (≥240 s) and re-run to settle pass-vs-stuck; passes on M1 Metal locally.
+- [ ] **f5-tts** — runs once given a reference voice but TIMEOUT at 120 s in re-test.
+  Timeout half DONE (registry already carries `timeout_s=600` for f5-tts,
+  `tools/test-all-backends.py` — ≥240 satisfied); the Kaggle re-run to settle
+  pass-vs-stuck is still pending; passes on M1 Metal locally.
 - [ ] **orpheus** (TTS) — fixed §215 (Metal + CPU bucket both ASR-roundtrip verbatim on M1), stays
   opt-in `CRISPASR_ORPHEUS_BUCKET=1` (~30% slower on M1 unified memory, may win on CUDA).
   **CUDA cross-check still pending** (Kaggle `chr1str/crispasr-orpheus-talker-cuda` end-to-end
