@@ -42,6 +42,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_glm_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_kyutai_stt_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_firered_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend_lang(const char* sole_lang);
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_streaming_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_gemma4_e2b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend();
@@ -256,7 +257,12 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_moonshine_streaming_backend();
     if (name == "gemma4-e2b" || name == "gemma4e2b" || name == "gemma4")
         return crispasr_make_gemma4_e2b_backend();
-    if (name == "moonshine" || name == "moonshine-de" || name == "moonshine-tiny-de")
+    // The de fine-tunes share the runtime but are NOT en-only — the variant's
+    // language must ride along or the sole-language guard rejects `-l de` and
+    // the #227 auto shortcut mislabels output (found 2026-09-02).
+    if (name == "moonshine-de" || name == "moonshine-tiny-de")
+        return crispasr_make_moonshine_backend_lang("de");
+    if (name == "moonshine")
         return crispasr_make_moonshine_backend();
     if (name.rfind("omniasr", 0) == 0)
         return crispasr_make_omniasr_backend();
@@ -745,6 +751,11 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "gemma4-e2b";
     if (contains_ci("moonshine") && contains_ci("streaming"))
         return "moonshine-streaming";
+    // The de fine-tune must resolve to its variant name so the factory hands
+    // it the right sole language (a plain "moonshine" would be treated as
+    // en-only by the pre-dispatch guard).
+    if (contains_ci("moonshine") && contains_ci("-de"))
+        return "moonshine-de";
     if (contains_ci("moonshine"))
         return "moonshine";
     if (contains_ci("fun-asr") || contains_ci("funasr") || contains_ci("fun_asr"))

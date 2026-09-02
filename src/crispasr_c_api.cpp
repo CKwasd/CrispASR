@@ -4925,9 +4925,56 @@ static void apply_session_hygiene(crispasr_session_result* r, bool include_merge
     r->segments = std::move(res);
 }
 
+// Session mirror of the CLI's sole_language() guard (0face104): the C ABI
+// reimplements dispatch inline and never routes through the CLI adapters, so
+// bindings callers could still ask moonshine for German and get English back
+// at rc 0 — the classic three-surface trap. Table mirrors the adapters'
+// sole_language() overrides; comparison goes through whisper_lang_id() so
+// "german" is caught like "de", raw string compare as the out-of-table
+// fallback — the same semantics as examples/cli/crispasr_run.cpp.
+static const char* session_sole_language(const std::string& backend, const std::string& model_path) {
+    if (backend == "moonshine" || backend == "moonshine-streaming") {
+        // Fine-tune variants (moonshine-base-de etc.) share the arch string, so
+        // a session can legitimately hold a non-English moonshine under the
+        // plain backend name. A filename hint of a language variant means the
+        // en-only claim is not safe — no guard rather than a false reject
+        // (mirrors the CLI's filename-detect fix for moonshine-de).
+        auto has = [&](const char* n) { return model_path.find(n) != std::string::npos; };
+        if (has("-de") || has("_de") || has("-ar") || has("_ar"))
+            return nullptr;
+        return "en";
+    }
+    if (backend == "gigaam")
+        return "ru";
+    return nullptr;
+}
+
+static bool session_language_satisfiable(const crispasr_session* s, const char* per_call_lang) {
+    const char* sole = session_sole_language(s->backend, s->model_path);
+    if (!sole)
+        return true;
+    // Per-call hint wins over the sticky source_language, matching the
+    // precedence transcribe itself uses.
+    const std::string want = (per_call_lang && *per_call_lang) ? per_call_lang : s->source_language;
+    if (want.empty() || want == "auto")
+        return true;
+    const int want_id = whisper_lang_id(want.c_str());
+    const int have_id = whisper_lang_id(sole);
+    const bool same = (want_id != -1 && have_id != -1) ? (want_id == have_id) : (want == sole);
+    if (!same) {
+        fprintf(stderr,
+                "crispasr[session]: backend '%s' is %s-only and cannot transcribe '%s'; "
+                "set language to '%s' or 'auto', or pick a multilingual backend\n",
+                s->backend.c_str(), sole, want.c_str(), sole);
+    }
+    return same;
+}
+
 CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_session* s, const float* pcm,
                                                                     int n_samples, const char* language) {
     if (!s || !pcm || n_samples <= 0)
+        return nullptr;
+    if (!session_language_satisfiable(s, language))
         return nullptr;
 
     // Best-of-N: run N independent transcriptions and keep the one with the

@@ -361,6 +361,37 @@ static bool form_bool(const httplib::Request& req, const std::string& key, bool 
 // request field name (e.g. "voice", "input"). Both default to "" and are
 // omitted from the JSON body when empty so the on-wire shape stays
 // minimal for non-OpenAI consumers.
+// Pre-dispatch language validation, mirroring the CLI's 0face104 fix plus the
+// sole-language guard. The server parses its own request fields, so it carried
+// the same hole the CLI had: an unknown `language` reached the backend and
+// transcribed the wrong thing at HTTP 200. Whisper's 100-entry table governs
+// only whisper (omnivoice alone legitimately takes fil/nan/arb/pes, so the
+// check is gated on the effective backend, which at request time is the
+// backend the server loaded); monolingual backends reject any other language
+// outright, compared through whisper_lang_id() so "german" is caught like
+// "de". Returns an error message, empty when the request is satisfiable.
+static std::string validate_request_language(const std::string& backend, const std::string& lang) {
+    if (lang.empty() || lang == "auto")
+        return "";
+    const bool is_whisper = backend.empty() || backend == "whisper";
+    if (is_whisper && whisper_lang_id(lang.c_str()) == -1)
+        return "unknown language '" + lang + "'";
+    const char* sole = nullptr;
+    if (backend == "moonshine" || backend == "moonshine-streaming")
+        sole = "en";
+    else if (backend == "gigaam")
+        sole = "ru";
+    if (sole) {
+        const int want = whisper_lang_id(lang.c_str());
+        const int have = whisper_lang_id(sole);
+        const bool same = (want != -1 && have != -1) ? (want == have) : (lang == sole);
+        if (!same)
+            return "backend '" + backend + "' is " + std::string(sole) + "-only and cannot transcribe '" + lang +
+                   "'; use '" + sole + "' or 'auto'";
+    }
+    return "";
+}
+
 static void json_error(httplib::Response& res, int status, const std::string& message, const std::string& code = "",
                        const std::string& param = "") {
     res.status = status;
@@ -1794,6 +1825,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         // Per-request parameter overrides.
         whisper_params rp = params;
         rp.language = form_string(req, "language", rp.language);
+        if (std::string lerr = validate_request_language(params.backend, rp.language); !lerr.empty()) {
+            json_error(res, 400, lerr, "invalid_request_error", "language");
+            return;
+        }
         rp.source_lang = form_string(req, "source_lang", rp.source_lang);
         rp.target_lang = form_string(req, "target_lang", rp.target_lang);
         rp.translate = form_bool(req, "translate", rp.translate);
@@ -1984,6 +2019,10 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         // Parse OpenAI form fields + CrispASR extensions.
         std::string response_format = form_string(req, "response_format", "json");
         std::string language = form_string(req, "language", params.language);
+        if (std::string lerr = validate_request_language(params.backend, language); !lerr.empty()) {
+            json_error(res, 400, lerr, "invalid_request_error", "language");
+            return;
+        }
         std::string prompt = form_string(req, "prompt", "");
         float temperature = form_float(req, "temperature", params.temperature);
         uint64_t seed = form_u64(req, "seed", params.seed);

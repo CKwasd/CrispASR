@@ -1,7 +1,10 @@
 # Install & build
 
 This page covers the full build matrix. For a quick sanity build, see
-the **Quick install** section in the [README](../README.md).
+the **Quick install** section in the [README](../README.md). If you only want a
+working binary and a first transcription, start at
+[getting-started.md](getting-started.md) instead — it picks the release asset
+for you and stops there.
 
 ## Prebuilt Linux tarballs — which one to download (#355)
 
