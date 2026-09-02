@@ -2517,8 +2517,15 @@ Multilingual + beam spot-checks (LOW, either machine):
   declares `sole_language()="en"` on the adapter + the session guard table,
   so `-l zh` is an explicit pre-dispatch rejection instead of silently wrong
   output, and `-l auto` short-circuits without an LID download (#227).
-- [ ] Run higgs/ark `-bs 4` on a noisy/accented clip to see if beam improves WER
-  (only proven no-regression == greedy on easy JFK).
+- [x] higgs/ark `-bs 4` noisy-clip beam test — DONE 2026-09-02 on Kaggle T4
+  (`tools/kaggle/beam-noisy-ab/`, chr1s4/crispasr-beam-noisy-ab-higgs-ark v2):
+  jfk + additive white noise at 10 dB and 5 dB SNR (seed 42), both backends,
+  greedy vs `-bs 4`. Result: **WER 0.000 in every cell** — even 5 dB noise
+  doesn't dent either model on this clip, and beam-4 wins nothing while
+  costing ~3x wall (higgs 2s->7s, ark 4s->12s per clip). Greedy stays the
+  right default. Residual (only if someone cares later): white noise is not
+  accent — a FLEURS accented-speech rerun would need new fixtures; the
+  harness takes any wav list.
 
 Backend-wiring coverage gaps (LOW cleanup; re-list via `python tools/check-backend-wiring.py`):
 - [x] **missing reference dumper** — RESOLVED by 2026-09-02: all five now exist
