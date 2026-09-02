@@ -598,6 +598,11 @@ suffixes.
 - `CRISPASR_F5_DURATION_CLAMP` — clamp the per-char speech rate into a sane English band so a reference whose audio/transcript lengths are mismatched can't truncate (or balloon) the output (#294). Default on; set `0` to restore the exact upstream `ref_T / ref_text_len * gen_text_len / speed` estimate.
 - `CRISPASR_F5_EMBED_GPU`
 - `CRISPASR_F5_F16_ACT`
+- `CRISPASR_F5_HIFIGAN_CPU` — `1` restores the pre-`a72fb66d` CPU-loop
+  HiFi-GAN decode (A/B fallback; the default ggml `core_hifigan` graph path
+  is ~250x faster on GPU and cosine-1.000000 identical).
+- `CRISPASR_F5_VOCODE_MEL` — debug probe: vocode this mel dump directly,
+  bypassing the DiT (used for the CPU-vs-graph vocoder parity A/B).
 - `CRISPASR_F5_FORCE_SCALAR`
 - `CRISPASR_F5_REF_MAX_SEC` — clip the reference audio to this many seconds before it drives the duration estimate (upstream parity: 12 s). Default `12`; set `0` to disable the clip.
 - `CRISPASR_F5_REF_TRIM_SILENCE` — strip leading/trailing silence and collapse internal silences >~1 s in the reference audio (upstream parity). Default on; set `0` to disable.
@@ -654,7 +659,13 @@ suffixes.
 - `CRISPASR_FUNASR_LLM_LAYERS`
 - `CRISPASR_FUNASR_NAN_CHECK`
 - `CRISPASR_FUNASR_NO_FA`
-- `CRISPASR_FUNASR_STEP_CACHE`
+- `CRISPASR_FUNASR_ENC_CACHE` — `0` disables the exact-T_lfr encoder graph
+  cache (repeat-length calls skip the 7.5–23.9 ms graph rebuild). Default on.
+- `CRISPASR_FUNASR_STEP_BUCKET` — width of the cached decode-graph Lk buckets
+  (default 16, the measured optimum; `>= kv_max_ctx` reproduces the old
+  fixed-Lk design, which is a ~69% decode regression — A/B arm only).
+- `CRISPASR_FUNASR_STEP_CACHE` — `0` disables the bucketed per-step decode
+  graph cache (bit-identical either way). Default on.
 
 ### Gemma-4 E2B
 
@@ -1110,6 +1121,11 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 - `CRISPASR_PARLER_DUMP_ENC`
 - `CRISPASR_PARLER_PROMPT_IDS`
 - `CRISPASR_PARLER_TTS_BENCH`
+
+### Piano transcription
+
+- `CRISPASR_PIANO_SERIAL` — `1` restores the single-threaded conv/GRU/linear
+  compute (the default parallel path is bit-identical; #305, ~1.7x).
 
 ### Piper
 
