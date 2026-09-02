@@ -33,14 +33,23 @@ rejected flag. `crispasr_run.cpp` now errors (rc 14) between backend creation
 and `init()`, comparing through `whisper_lang_id()` so `-l german` is caught
 the same way as `-l de`.
 
-Proof: `tests/test-arg-validation.sh` (ctest `test-arg-validation`, label
-`cli`) — 10 assertions, fully offline and model-free (every case is decided
+Proof: `tests/test-arg-validation.sh` (ctest `test-arg-validation`, labels
+`unit;cli`) — 10 assertions, fully offline and model-free (every case is decided
 before a model loads; HOME and CRISPASR_MODELS_DIR point at empty dirs so a
 network fetch cannot fake a pass), 0.9 s. Green after; watched failing 7/10
 against the pre-fix binary. The 3 that pass in BOTH builds are the
 false-positive guards — `-l fil --backend parakeet` must not be a language
 error, `-l en`/`-l auto` on moonshine must pass through — which is exactly the
 behaviour that must not change.
+
+Follow-up caught by reading the CI log rather than trusting the green tick:
+the new test did NOT run in CI at first. `linux-unit` filters `ctest -L unit`,
+and CI only ever uses `-L unit` / `-L gh` — nothing runs `-L cli`. Both #420's
+`test-help-stdout` and this file were labelled `cli` (copied from
+`test-dry-run-resolve`, which had the same defect), so all three never executed
+anywhere. All are offline, model-free and sub-second — exactly what `unit`
+means here — so they are relabelled `unit;cli`, verified by running CI's exact
+filter locally.
 
 NOT covered (deliberate, worth its own issue): the session C ABI
 (`src/crispasr_c_api.cpp`) reimplements transcribe inline and does not route

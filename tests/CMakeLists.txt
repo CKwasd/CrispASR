@@ -4854,7 +4854,7 @@ add_test(NAME test-arg-validation
             $<TARGET_FILE:crispasr-cli>
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 set_tests_properties(test-arg-validation PROPERTIES
-    LABELS "cli"
+    LABELS "unit;cli"
     TIMEOUT 60)
 
 # ─── test-help-stdout — offline regression (#420): an explicitly requested
@@ -4867,7 +4867,7 @@ add_test(NAME test-help-stdout
             $<TARGET_FILE:crispasr-cli>
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 set_tests_properties(test-help-stdout PROPERTIES
-    LABELS "cli"
+    LABELS "unit;cli"
     TIMEOUT 60)
 
 # ─── test-dry-run-resolve — offline regression: --dry-run-resolve must preview
@@ -4878,7 +4878,7 @@ add_test(NAME test-dry-run-resolve
             $<TARGET_FILE:crispasr-cli>
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
 set_tests_properties(test-dry-run-resolve PROPERTIES
-    LABELS "cli"
+    LABELS "unit;cli"
     TIMEOUT 60)
 
 # ─── test-bundle-linux-runtime — the Linux packaging bundler. Registered as a
