@@ -1,5 +1,5 @@
 {
-  "id": "chr1s4/crispasr-beam-noisy-ab",
+  "id": "chr1s4/crispasr-beam-noisy-ab-higgs-ark",
   "title": "CrispASR beam noisy AB higgs ark",
   "code_file": "beam_noisy_ab.py",
   "language": "python",
