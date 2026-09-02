@@ -1,39 +1,6 @@
 # CrispASR — Pending work
 
 ## NOW — #416 Sidon quantized models decode to silence (Vulkan MMQ)
-## 2026-09-02 — #387 Quds v4 Persian ASR: ported from the author's ONNX export
-
-Worktree `.claude/worktrees/feat-387-quds`, branch `feat/387-quds-fa`.
-Author added CC-BY-NC-4.0 (license IS the redistribution permission — the
-voxtral precedent) but only ships ONNX. Ported directly from it:
-
-- `models/convert-nemo-rnnt-onnx-to-gguf.py` — generic NeMo FastConformer-
-  RNNT ONNX→GGUF (parakeet contract): anonymous `onnx::{MatMul,Conv,LSTM}_*`
-  initializers recovered via consumer-node scopes, MatMul [in,out]→[out,in],
-  ONNX LSTM iofc→torch ifgo unpack, folded-BN → identity stats, fb/window
-  COPIED from the CC-BY-4.0 NVIDIA base .nemo (never recomputed).
-- Runtime: single-LSTM predictors (pred_layers=1, no CTC) now decode on both
-  the CPU and ggml RNNT paths (was: 2 layers hardcoded; the old CTC fallback
-  comment is now a hybrid preference, not a requirement).
-- Backend alias `quds`/`quds-fa` → parakeet runtime; registry entries (q8_0
-  default) with the CC-BY-NC-4.0 acceptance gate + attribution.
-- HF: cstr/quds-v4-fa-GGUF (f16 219M / q8_0 122M / q4_k 77M), card license
-  verified landed.
-
-Validation (decoded-output first, real audio): 5 Common Voice fa clips
-(CC0) — q8_0 and f16 transcripts BYTE-IDENTICAL to the upstream ONNX under
-onnx_asr (the model card's own runner) on 4/5; on cv0 ours keeps an onset
-word the reference drops (closer to the human sentence — their front-end
-trims onsets, not a port defect). q4_k shows minor word drift (documented
-on the card; q8_0 is the default). Out-of-domain English (jfk) diverges
-after a shared prefix — near-tie flips on garbage input, per the MOSS
-lesson. `samples/fa-common-voice.wav` (CC0, 3.2 s) + exact-transcript
-live test `test-quds-fa-live.sh` lock it.
-
-Follow-ups: CTC head when the author uploads the .nemo; feature-matrix
-regen rides the next docs pass (file is dirty in other sessions' flows).
-
-## NOW — #416 Sidon quantized models decode to silence
 
 Worktree `.claude/worktrees/fix-416-sidon-quant`, branch `fix/416-sidon-quant`.
 Reporter Disonantemus: `sidon-v0.1-f16.gguf` restores correctly; `q4_k` and
@@ -107,6 +74,38 @@ Open: (a) reporter to run `CRISPASR_SIDON_RPE=expand` vs `=bucket` (confirms the
 op); (b) `tools/kaggle/sidon-quant-cuda/` — three arms per quant (fixed graph on
 CUDA, pre-fix graph via the gate, CPU control) answering whether CUDA's MMQ
 shares the defect and whether the fix regresses CUDA.
+
+## 2026-09-02 — #387 Quds v4 Persian ASR: ported from the author's ONNX export
+
+Worktree `.claude/worktrees/feat-387-quds`, branch `feat/387-quds-fa`.
+Author added CC-BY-NC-4.0 (license IS the redistribution permission — the
+voxtral precedent) but only ships ONNX. Ported directly from it:
+
+- `models/convert-nemo-rnnt-onnx-to-gguf.py` — generic NeMo FastConformer-
+  RNNT ONNX→GGUF (parakeet contract): anonymous `onnx::{MatMul,Conv,LSTM}_*`
+  initializers recovered via consumer-node scopes, MatMul [in,out]→[out,in],
+  ONNX LSTM iofc→torch ifgo unpack, folded-BN → identity stats, fb/window
+  COPIED from the CC-BY-4.0 NVIDIA base .nemo (never recomputed).
+- Runtime: single-LSTM predictors (pred_layers=1, no CTC) now decode on both
+  the CPU and ggml RNNT paths (was: 2 layers hardcoded; the old CTC fallback
+  comment is now a hybrid preference, not a requirement).
+- Backend alias `quds`/`quds-fa` → parakeet runtime; registry entries (q8_0
+  default) with the CC-BY-NC-4.0 acceptance gate + attribution.
+- HF: cstr/quds-v4-fa-GGUF (f16 219M / q8_0 122M / q4_k 77M), card license
+  verified landed.
+
+Validation (decoded-output first, real audio): 5 Common Voice fa clips
+(CC0) — q8_0 and f16 transcripts BYTE-IDENTICAL to the upstream ONNX under
+onnx_asr (the model card's own runner) on 4/5; on cv0 ours keeps an onset
+word the reference drops (closer to the human sentence — their front-end
+trims onsets, not a port defect). q4_k shows minor word drift (documented
+on the card; q8_0 is the default). Out-of-domain English (jfk) diverges
+after a shared prefix — near-tie flips on garbage input, per the MOSS
+lesson. `samples/fa-common-voice.wav` (CC0, 3.2 s) + exact-transcript
+live test `test-quds-fa-live.sh` lock it.
+
+Follow-ups: CTC head when the author uploads the .nemo; feature-matrix
+regen rides the next docs pass (file is dirty in other sessions' flows).
 
 ## DONE 2026-09-02 — #420 `crispasr --help` was not pipeable
 
