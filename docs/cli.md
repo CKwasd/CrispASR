@@ -1422,17 +1422,32 @@ beats and you never have to merge two lists to reconstruct the grid.
 
 Another standalone task: audio in, **note events** out — onset, offset, MIDI
 pitch, name and velocity. Routes to its own dispatcher before any ASR backend
-is built, like `--pitch` / `--chords` / `--separate`. Two backends share the
+is built, like `--pitch` / `--chords` / `--separate`. Three backends share the
 surface, selected by GGUF architecture: **`piano-transcription`** (ByteDance
-CRNN, 88-key piano, the higher-accuracy piano specialist) and
-**`basic-pitch`** (Spotify, ~110 KB, polyphonic any-instrument, #250 — no
-pedal events).
+CRNN, 88-key piano, the higher-accuracy piano specialist), **`basic-pitch`**
+(Spotify, ~110 KB, polyphonic any-instrument, #250 — no pedal events), and
+**`mt3`** (Google Magenta, ~96 MB, MULTI-INSTRUMENT — every note carries a
+General MIDI program and drums are a separate class; alias
+`music-transcription`).
+
+`--piano-format` takes `text` (default), `json`, or **`midi`**. The MIDI form
+writes a format-1 Standard MIDI File — one track per program, drums on GM
+channel 10 — to the matching `-of` name, or the input path with its extension
+replaced. That is the only form that reaches a DAW or notation editor; text and
+JSON are for inspection and diffing.
+
+MT3's per-note program survives into `--piano-format json` (`program`,
+`instrument`, `is_drum` keys) and adds one trailing column to the text form
+(`prog=<n>` or `drum`) after the existing five. It is NOT carried by the
+session C ABI, whose note quad is fixed-width.
 
 ```bash
 crispasr --piano -m auto --auto-download -f piano.wav
 crispasr --piano --piano-format json -m piano-transcription-f16.gguf -f piano.wav
 # any-instrument polyphonic, tiny model:
 crispasr --piano --backend basic-pitch -m auto --auto-download -f guitar.wav
+# multi-instrument, straight to a MIDI file:
+crispasr --piano --backend mt3 -m auto --auto-download -f band.wav --piano-format midi
 ```
 
 Default output is one tab-separated line per note — `onset_sec`, `offset_sec`,
