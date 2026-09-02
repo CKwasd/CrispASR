@@ -156,11 +156,15 @@ ggml_tensor* bt_norm(ggml_context* c, ggml_tensor* x, ggml_tensor* gamma) {
     return ggml_mul(c, ggml_rms_norm(c, x, 1e-12f), gamma);
 }
 
-// #416: these three matmuls pair a quantized weight (ne2=1) with an activation
+// #416: these matmuls pair a quantized weight (ne2=1) with an activation
 // whose ne2 is the folded time axis (see the einops note above), so ggml
 // broadcasts src0 across it. Gated OFF — see src/core/quant_bcast.h.
 static inline ggml_tensor* MM(ggml_context* c, ggml_tensor* w, ggml_tensor* x) {
-    static const bool fold = core_quant_bcast::fold_enabled("CRISPASR_BEATTHIS_FOLD_BCAST");
+    // Default ON: verified on a locally-quantized q8_0 build — the detector
+    // reports 29 broadcasting quantized matmuls without the fold and 0 with it,
+    // and the emitted beats are byte-identical either way. Set
+    // CRISPASR_BEATTHIS_FOLD_BCAST=0 to restore the legacy path.
+    static const bool fold = core_quant_bcast::fold_enabled("CRISPASR_BEATTHIS_FOLD_BCAST", true);
     return fold ? core_quant_bcast::mul_mat_fold_batch(c, w, x) : ggml_mul_mat(c, w, x);
 }
 
@@ -235,9 +239,9 @@ ggml_tensor* bt_attention(ggml_context* c, const bt_attn& a, ggml_tensor* x, ggm
 // approximate='none'. ggml_gelu is the tanh approximation and drifts.
 ggml_tensor* bt_feedforward(ggml_context* c, const bt_ff& f, ggml_tensor* x) {
     ggml_tensor* h = bt_norm(c, x, f.gamma);
-    h = ggml_add(c, ggml_mul_mat(c, f.w1, h), f.b1);
+    h = ggml_add(c, MM(c, f.w1, h), f.b1);
     h = ggml_gelu_erf(c, h);
-    return ggml_add(c, ggml_mul_mat(c, f.w2, h), f.b2);
+    return ggml_add(c, MM(c, f.w2, h), f.b2);
 }
 
 // Named intermediates, so one graph can serve every parity stage without the

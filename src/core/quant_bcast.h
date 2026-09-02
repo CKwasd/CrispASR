@@ -16,9 +16,10 @@
 // defeat quantization entirely. Hence the fold below.
 //
 // ⚠ The underlying ggml defect is NOT yet confirmed to be broadcast-specific
-// rather than specific to sidon's dimensions, so every caller of the fold is
-// gated OFF by default. Do not flip a default on this file's say-so; confirm
-// the mechanism first.
+// rather than specific to sidon's dimensions. A caller may only default the
+// fold ON once it has been shown, by running the detector below, that (a) the
+// backend genuinely has exposed sites and (b) folding them leaves the decoded
+// output unchanged. Anything unverified stays OFF.
 #pragma once
 
 #include "ggml.h"
@@ -47,11 +48,16 @@ inline ggml_tensor* mul_mat_fold_batch(ggml_context* c, ggml_tensor* w, ggml_ten
     return ggml_reshape_4d(c, y, y->ne[0], n, b2, b3);
 }
 
-// Gate helper: `CRISPASR_<BACKEND>_FOLD_BCAST=1` opts a backend into the fold.
-// Default OFF — see the warning above.
-inline bool fold_enabled(const char* env_name) {
+// Gate helper. `CRISPASR_<BACKEND>_FOLD_BCAST` overrides the backend's default;
+// "0" forces the legacy broadcasting matmul back, anything else forces the fold.
+// Per the project convention, once a path is verified the NEW path becomes the
+// default and the OLD one keeps a gate — never the reverse, and never removed,
+// because that gate is the bisection mechanism.
+inline bool fold_enabled(const char* env_name, bool default_on = false) {
     const char* e = std::getenv(env_name);
-    return e && e[0] && e[0] != '0';
+    if (!e || !e[0])
+        return default_on;
+    return e[0] != '0';
 }
 
 // Detector. Static greps for this pattern undercount badly: two independent
