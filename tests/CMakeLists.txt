@@ -5282,6 +5282,17 @@ catch_discover_tests(test-silero-lid-quant-refusal
         WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
 )
 
+# ─── test-script-mismatch — issue #419 wrong-script warning decision table (hermetic, unit)
+add_executable(test-script-mismatch test-script-mismatch.cpp)
+target_include_directories(test-script-mismatch PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-script-mismatch PRIVATE Catch2::Catch2WithMain)
+catch_discover_tests(test-script-mismatch
+    TEST_SPEC "[script-mismatch]"
+    PROPERTIES
+        LABELS unit
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+)
+
 # ─── test-num2words-fr-es — French + Spanish number expansion (hermetic, unit)
 add_executable(test-num2words-fr-es test-num2words-fr-es.cpp)
 target_include_directories(test-num2words-fr-es PRIVATE ${PROJECT_SOURCE_DIR}/src)

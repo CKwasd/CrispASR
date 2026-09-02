@@ -84,6 +84,30 @@ Hosted live run 33333867440 used public Nano Q4_K plus Turbo S3Gen Q4_K: both
 paths emitted the same 40-token trajectory and byte-identical decoded PCM.
 `CRISPASR_CHATTERBOX_KV_CONT=1` retains the old path as a diagnostic A/B.
 
+## #419 canary Russian-as-translit — root mechanism found, diagnostics shipped, 2026-09-02 (issue open pending reporter data)
+
+The reported symptom (Russian recognized correctly but emitted in Latin
+translit) could NOT be reproduced with the registry canary-1b-v2-q4_k under
+any constructible condition: CPU, CUDA (P100 kernel
+`chr1s4/crispasr-issue419-canary-ru-gpu`), Vulkan/llvmpipe, single-pass,
+streamed 56 s, 0.8-3 s VAD-sized slices, 44.1 kHz stereo input, and the
+reporter's exact flags — all proper Cyrillic. The vocab carries 2175
+Cyrillic pieces + `<|ru|>`, and the prompt builder hard-fails on unknown
+tokens. The one arm that reproduces the symptom exactly is `-l en` on
+Russian audio: wrong-language conditioning makes the model render the words
+it heard in Latin, fluently and silently. (The reverse is robust: `-l ru`
+on English audio TRANSLATES into Cyrillic Russian.)
+
+Shipped so the failure diagnoses itself from any log: a one-line
+`canary: languages src=.. tgt=..` effective-conditioning print, and a
+wrong-script warning (`core/script_mismatch.h`, hermetic decision table in
+tests/test-script-mismatch.cpp — ru/uk/bg/el vs a UTF-8 letter-script
+census, 20-letter evidence bar, code-switch tolerant) that names the likely
+causes when a Cyrillic/Greek target produces Latin-dominated text. The
+issue stays open until the reporter can share the resolved-model line and
+a sample; the leading hypothesis is that their frontend's -l/--source-lang
+never reached the process.
+
 ## #418 VibeVoice-ASR aborted on Intel Arc Vulkan — encoder CPU fallback + BitNet TQ guard, fixed 2026-09-01
 
 An Arc B580 user transcribing a 1-hour file hit `ggml-vulkan

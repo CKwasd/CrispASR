@@ -17,7 +17,7 @@ per-backend porting detail (Per-model port notes + the family cross-reference).
 Reach for the topic groups when you are stuck on a *technique*, and the
 cross-reference when you already know which model you are touching.
 
-## Index by topic (296 lessons)
+## Index by topic (297 lessons)
 
 **Security & untrusted input** (2)
 
@@ -244,7 +244,7 @@ cross-reference when you already know which model you are touching.
 - L15527 — #300 streaming diarization SHIPPED
 - L16123 — #89 parakeet-ja long-form FIXED
 
-**Tokenizers, prompts, language & text** (17)
+**Tokenizers, prompts, language & text** (18)
 
 - L974 — MOSS-TTS-Local 4B stop runaway was a PROMPT-TOKENIZATION bug — non-compositional BPE, not the forward (#249, 2026-07)
 - L1024 — Cross-lingual TTS needs the target language plumbed through /v1/audio/speech (#249/#304, 2026-07)
@@ -263,6 +263,7 @@ cross-reference when you already know which model you are touching.
 - L15820 — #329 TTS target language
 - L16894 — cohere language whitelist + probe LID
 - L17012 — CV3 phase 6 speech_tokenizer_v3 ggml port
+- L18715 — Wrong-language conditioning makes canary TRANSLITERATE — a silent failure that reads like a tokenizer bug
 
 **Mel, codecs & the audio front-end** (17)
 

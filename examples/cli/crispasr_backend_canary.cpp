@@ -15,6 +15,7 @@
 #include "whisper_params.h"
 
 #include "canary.h"
+#include "core/script_mismatch.h" // #419 wrong-script warning
 
 #include <algorithm>
 #include <cstdio>
@@ -133,6 +134,18 @@ public:
             return out;
         }
 
+        // Issue #419: print the EFFECTIVE language conditioning once. Canary
+        // conditioned on the wrong language transliterates rather than
+        // failing (Russian through <|en|> → "vikingi, otvazhnye voyny"), and
+        // the reported case pointed at a frontend whose -l/--source-lang may
+        // never have reached this process — one stderr line makes that
+        // diagnosable from any log.
+        static bool s_lang_logged = false;
+        if (!params.no_prints && !s_lang_logged) {
+            s_lang_logged = true;
+            fprintf(stderr, "canary: languages src='%s' tgt='%s'\n", src.c_str(), tgt.c_str());
+        }
+
         // Long-form handling follows canary-1b-v2's own `.transcribe()`
         // dynamic chunking (blueprint port in src/canary.cpp): audio that
         // fits one 40 s chunk is a single pass; longer audio is split into
@@ -191,6 +204,28 @@ public:
         }
 
         canary_result_free(r);
+
+        // Issue #419: canary conditioned on the WRONG language renders speech
+        // in the wrong SCRIPT — Russian decoded as <|en|> comes out as Latin
+        // transliteration ("vikingi, otvazhnye voyny"), silently. With the
+        // language tokens actually set to ru, every backend produces proper
+        // Cyrillic (verified CPU / CUDA / Vulkan, single + streamed + short
+        // slices). So a script contradiction means the conditioning did not
+        // arrive — say so, name the effective langs and the model, and give
+        // the user something actionable instead of translit subtitles.
+        if (!params.no_prints && core_script::mismatch(tgt, seg.text)) {
+            core_script::ScriptCounts sc;
+            core_script::mismatch(tgt, seg.text, &sc);
+            fprintf(stderr,
+                    "canary: WARNING: target language '%s' expects %s but the transcript is "
+                    "Latin-dominated (%d Latin vs %d %s letters). The model was likely "
+                    "conditioned on the wrong language: verify -l/--source-lang actually reach "
+                    "this process (frontends sometimes drop them) and that the model resolved to "
+                    "canary-1b-v2 (run with -v to see the path). See issue #419.\n",
+                    tgt.c_str(), tgt == "el" ? "Greek" : "Cyrillic", sc.latin, tgt == "el" ? sc.greek : sc.cyrillic,
+                    tgt == "el" ? "Greek" : "Cyrillic");
+        }
+
         out.push_back(std::move(seg));
         return out;
     }
