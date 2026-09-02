@@ -16,7 +16,13 @@ no flow-matching, no diffusion, no masked/parallel decode. 24 kHz mono, codec fr
 `config.text_encoder_config`: 26L, d=1152, 4H/1KVH, head_dim 256, `query_pre_attn_scalar` 256,
 `gelu_pytorch_tanh`, vocab 262158, `sliding_window` 512. `layer_types` = 5×sliding then 1×full
 (full at 5,11,17,23), with **two RoPE configs** (full → theta 1e6 + linear factor 8.0; sliding →
-theta 1e4 default). `"use_bidirectional_attention": false` → **causal**, despite the name.
+theta 1e4 default). ⚠ **CORRECTED 2026-09-03 (phase 1):** the config key
+`"use_bidirectional_attention": false` is a DECOY — `breeze_config.py:19-20` registers the
+local `t5gemma2_compat.py`, where `is_causal=False` (:429) and `causal=False` is passed into
+flash-attn (:395, :407): the text encoder is **BIDIRECTIONAL**. Full-attention layers get no
+mask at all; sliding layers span a SYMMETRIC `[i-255, i+256]` (:712-720). Also `1+w` norms,
+`embed_scale=sqrt(1152)`, `attn_scale=query_pre_attn_scalar^-0.5`, `rope_type="linear"`
+(`inv_freq/=8`, `attention_scaling=1.0`).
 Per-layer tensors are Gemma-3 shaped: `pre_self_attn_layernorm`, `post_self_attn_layernorm`,
 `pre_feedforward_layernorm`, `post_feedforward_layernorm`, `self_attn.{q,k}_norm`. LoRA (r=8) and
 the 12 added special tokens are already `merged_into_base: true` → nothing to apply.
@@ -52,7 +58,9 @@ identical name set, shapes, and safetensors `data_offsets`; 170.6 M params, Apac
 already ships the GGUF (`cstr/qwen3-tts-tokenizer-12hz-GGUF`) and a working ggml encoder+decoder in
 `src/qwen3_tts.cpp` — `latent_dim=1024`, `decoder_dim=1536`, `upsample_rates{8,5,4,3}` at
 qwen3_tts.cpp:557-563 match exactly, plus chunked streaming decode (qwen3_tts.h:284).
-The 96 M `codec_model.*` Mimi tensors in the main checkpoint are a training leftover — **drop**.
+The `codec_model.*` Mimi tensors in the main checkpoint are a training leftover — **drop**.
+(Phase-1 exact count: 350 tensors / **79.3 M** params, not the 96 M estimated here; with
+`embed_text_tokens` 536.9 M the drop totals 351 tensors / 1.23 GB bf16.)
 
 ### 1.5 Conditioning / CFG
 `breeze_infer/templates.py`: `[S0]`..`[S9]` speaker prefix (:31-37), `<ins_bos>`/`<ins_eos>`
@@ -65,7 +73,7 @@ depend on it.
 ### 1.6 Sizes / license
 3.48 B params, 6.97 GB bf16 (2 shards) + 682 MB fp32 audio tokenizer. Per-component: backbone
 1409 M, text_encoder 1000 M, embed_text_tokens 537 M (droppable), depth_decoder 434 M, codec_model
-96 M (droppable), lm_head 4.2 M, text_encoder_proj 2.4 M.
+79.3 M (droppable), lm_head 4.2 M, text_encoder_proj 2.4 M.
 **After dropping dead weight: ~2.85 B → Q4_K ≈ 1.7-1.8 GB.**
 License: **BreezeBlue Research and Non-Commercial License** (`LICENSE`, 424 lines; code Apache-2.0).
 §1.3 explicitly names **quantization** as a Derivative Model → our GGUFs inherit NC. §4 permits
@@ -147,3 +155,12 @@ existing form (cf. `voxtral-tts` :389, `raon-opentts` :1093): `"other — NON-CO
 string, and the "Derived from Breeze TTS 2 …" model-card line; §4's naming clause bars "Breeze" as
 the *primary product* name — `cstr/breeze-tts-2-GGUF` and backend key `breeze-tts2` are descriptive
 attribution and fine.
+
+
+## Phase-1 addenda (2026-09-03)
+
+Three config decoys now known, all confirmed against the code: the nested `backbone_config`
+governs rope (not the top-level keys), backbone `rms_norm_eps` is **1e-6** from that nested
+block (not the top-level 1e-5), and `use_bidirectional_attention` is inverted by the compat
+module (see above). Converter, port notes and the Kaggle ref-dump kernel are in the tree;
+see `docs/breeze-tts-2-port-notes.md`.
