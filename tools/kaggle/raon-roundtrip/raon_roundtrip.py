@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Raon-OpenTTS end-to-end TTS→ASR roundtrip — the acceptance gate (#387-adj).
 
-Builds CrispASR from feat/raon-opentts on Kaggle (GPU: fast DiT ODE that is
+Builds CrispASR from main on Kaggle (GPU: fast DiT ODE that is
 minutes-on-CPU on the VPS), synthesizes with `--backend raon` on a real
 English reference voice, and transcribes the result with whisper-tiny. PASS =
-the transcript covers the gen_text (proves DiT + sbhifigan mel + CPU HiFi-GAN
+the transcript covers the gen_text (proves DiT + sbhifigan mel + ggml HiFi-GAN
 produce intelligible speech of the requested words). Proof-of-work: rc==0,
 non-trivial wav, word overlap — a crash or silent no-op cannot mint a pass.
 
-GPU build so the DiT runs on-device (ggml-cuda ships sm_60/75, so P100/T4 are
-fine — unlike torch, which lacks P100 kernels). The vocoder stays CPU.
+GPU build so both the DiT and the HiFi-GAN vocoder run on-device (#387 perf:
+the vocoder now uses the shared GPU-capable core_hifigan graph; ggml-cuda ships
+sm_60/75, so P100/T4 are fine — unlike torch, which lacks P100 kernels).
 Datasets: chr1str/crispasr-hf-token, chr1str/crispasr-ccache.
 """
 
@@ -30,7 +31,7 @@ MODELS.mkdir(parents=True, exist_ok=True)
 RESULTS = WORK / "raon_roundtrip.json"
 
 CRISPASR_URL = "https://github.com/CrispStrobe/CrispASR.git"
-CRISPASR_REF = os.environ.get("CRISPASR_REF", "feat/raon-opentts")
+CRISPASR_REF = os.environ.get("CRISPASR_REF", "main")
 CLONE = TMP / "CrispASR"
 
 GEN_TEXT = "The quick brown fox jumps over the lazy dog near the riverbank."
@@ -108,7 +109,7 @@ ref_wav = CLONE / "samples" / "jfk.wav"
 ref_text = "And so my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
 step("models", gguf=os.path.basename(gguf), whisper=whisper.exists(), ref=ref_wav.exists())
 
-# ── synth (GPU DiT + CPU HiFi-GAN) ─────────────────────────────────────────
+# ── synth (GPU DiT + GPU HiFi-GAN, #387) ─────────────────────────────────────────
 out_wav = WORK / "raon_synth.wav"
 synth_cmd = (f"{CLI} --backend raon -m {gguf} --voice {ref_wav} "
              f"--ref-text \"{ref_text}\" --tts \"{GEN_TEXT}\" --tts-output {out_wav} "
