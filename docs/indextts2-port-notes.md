@@ -68,12 +68,16 @@ python models/convert-indextts2-to-gguf.py \
   --outtype f16 --check-companions
 ```
 
-> **Stale-KV note.** The `indextts2-gpt-f16.gguf` currently on disk was written
-> before `indextts2.emo_perceiver.num_layers` was corrected from 1 to 2 (the
-> PerceiverResampler `depth` default, §2) and before
-> `emo_perceiver.{dim_context,dim_head,heads}` were added. Its **tensors are
-> correct**; only those KV entries are. Re-run the converter with
-> `--only gpt` before phase 2 reads that metadata.
+Read back from the shipped files: `indextts2.emo_perceiver.num_layers = 2`,
+`num_latents = 1`, `dim = 1024`, `dim_context = 512`, `dim_head = 64`,
+`heads = 4`, `ff_mult = 2`; `gpt.{layers,heads} = 24,20`;
+`number_text_tokens = 60509`; `mel_pos_size = 1818`; `text_pos_size = 602`;
+`w2v_bert.layer = 17`; `sample_rate = 22050`; `emo.num`/`emo.bias`/`emo.labels`
+8 entries each; `w2v_bert.mean` 1024; `tokenizer.ggml.tokens` 60 509;
+`indextts2.tokenizer.languages` 106. Tensors `spk_matrix (192,73)`,
+`emo_matrix (1280,73)`, `lang_embedding.weight (1280,107)` and
+`emo_perc.layers.1.*` (the second Perceiver layer) all present. Longest GGUF
+tensor name across the three files: 72 chars (s2mel), 41 (codec), 39 (gpt).
 
 ---
 
