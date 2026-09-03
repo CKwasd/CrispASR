@@ -1229,9 +1229,18 @@ All three optimisation gates are output-equivalent: the per-stage diff reports
 
 - `CRISPASR_SIDON_FASTCONV` — DAC convolution mode (`off`, `k1-f16`, `k1-f32`, or `full`). Unset defaults to
   `k1-f16` on CUDA and `off` on Vulkan/CPU.
-- `CRISPASR_SIDON_RPE` — relative-position-bias formulation: `bucket-direct` (default), `bucket`, or `expand`
-  (legacy `[head_dim, T, T]` expansion, ~1 GiB more predictor workspace at `T≈2825`; keeps the Vulkan
-  `mul_mat` batching branch). All three are algebraically equivalent.
+- `CRISPASR_SIDON_RPE` — relative-position-bias formulation: `bucket-direct`, `bucket`, or `expand` (legacy
+  `[head_dim, T, T]` expansion; keeps the Vulkan `mul_mat` batching branch). All three are algebraically
+  equivalent. Unset defaults to **AUTO**, resolved per graph build because the choice depends on the input
+  length: `expand` on a GPU backend while its extra transient footprint (`4·T²·(head_dim+1−heads)`, i.e.
+  `196·T²` bytes for the shipped model — 58 MiB at `T=557`, 1.64 GiB at the 3000-frame cap) fits
+  `CRISPASR_SIDON_RPE_BUDGET_MB`, and `bucket-direct` otherwise. AUTO exists because `expand` measured **2.7×
+  faster in the predictor** on the #416 reporter's GTX 1660 SUPER (213.80 ms vs 575.25 ms at `T=557`, same
+  file and binary). AUTO stays off on CPU: that speedup is one device's measurement and CPU behaviour is
+  left exactly as it was. An explicit value is honoured as given and never auto-overridden — it is the #416
+  bisection handle. The decision table is unit-locked in `tests/test-sidon-rpe-gates.cpp`.
+- `CRISPASR_SIDON_RPE_BUDGET_MB` — AUTO's budget in MiB for `expand`'s extra transient footprint (default
+  `256`, which admits `expand` up to `T≈1170`, ~23 s of audio). `0` disables AUTO, pinning `bucket-direct`.
 - `CRISPASR_SIDON_DECODER_CHUNK_FRAMES` — maximum DAC core size in feature frames (default `512`). `0` decodes
   the whole utterance in one graph (~4.5 GiB at `T≈2825` vs ~0.79 GiB chunked). Chunked output is bit-exact
   against the whole-utterance decode.

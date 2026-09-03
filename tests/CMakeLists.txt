@@ -3319,6 +3319,24 @@ catch_discover_tests(test-htdemucs-gates
     PROPERTIES LABELS "unit;htdemucs"
 )
 
+# ─── test-sidon-rpe-gates — unit tests for the #416 follow-up length-aware
+# relative-position-bias selection (AUTO expand on GPU while its extra
+# transient footprint fits the budget, bucket-direct otherwise; an explicit
+# CRISPASR_SIDON_RPE is never auto-overridden).
+add_executable(test-sidon-rpe-gates
+    test-sidon-rpe-gates.cpp
+)
+target_include_directories(test-sidon-rpe-gates PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-sidon-rpe-gates PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-sidon-rpe-gates
+    TEST_SPEC "[sidon]"
+    PROPERTIES LABELS "unit;sidon"
+)
+
 # ─── test-uroman — Catch2 unit tests for core/uroman.h romanization.
 # Validates Arabic + Cyrillic romanization for CTC forced alignment (#252).
 add_executable(test-uroman
