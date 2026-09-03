@@ -309,6 +309,21 @@ def metrics(est, ref_a, sl=None):
     return sdr, cos, mag, len(ef) // max(rr.shape[1], 1)
 
 
+def sdr_and_resid(est, ref_a, sl):
+    """SDR plus the RAW residual energy, so an exactly-zero residual can be
+    reported as a STATE rather than as a number. crispasr-dc's improvement on
+    the FLOOR_DB heuristic below: `residual == 0` is unambiguous, whereas a dB
+    threshold would also swallow an arm that is legitimately very close but not
+    identical — which is a real result, not a floor artefact."""
+    n = min(len(est), len(ref_a))
+    e = to_i16(est[:n])[sl].reshape(-1)
+    r = to_i16(ref_a[:n])[sl].reshape(-1)
+    d = r - e
+    resid = float(d @ d)
+    sdr = 10 * np.log10(float(r @ r) / max(resid, 1e-20))
+    return sdr, resid
+
+
 print(f"\n{'arm':<12}{'SDR dB':>10}{'cosine':>12}{'|est|/|ref|':>14}{'samples':>10}", flush=True)
 whole = {}
 for name, _ in ARMS:
@@ -371,9 +386,9 @@ else:
         if mask.sum() == 0 or (~mask).sum() == 0:
             print(f"{name:<12}  degenerate mask — cannot localise", flush=True)
             continue
-        b_sdr, _, _, _ = metrics(cpp[name], A, sl=mask)
-        i_sdr, _, _, _ = metrics(cpp[name], A, sl=~mask)
-        local[name] = (b_sdr, i_sdr, n_bnd)
+        b_sdr, b_res = sdr_and_resid(cpp[name], A, mask)
+        i_sdr, i_res = sdr_and_resid(cpp[name], A, ~mask)
+        local[name] = (b_sdr, i_sdr, n_bnd, b_res, i_res)
         print(f"{name:<12}{b_sdr:14.2f}{i_sdr:14.2f}{b_sdr - i_sdr:10.2f}"
               f"{mask.mean():10.3f}{n_bnd:6d}", flush=True)
 
@@ -381,7 +396,7 @@ else:
     # Power is a property of the STIMULUS and is reported separately from the
     # measurement, so an underpowered run can never be read as "no artefact"
     # (v1's gate conflated exactly these two).
-    nb = local.get("B_default", (None, None, 0))[2]
+    nb = local.get("B_default", (None, None, 0, 0.0, 0.0))[2]
     if nb < 2:
         print(f"UNDERPOWERED: arm B has only {nb} internal boundary/boundaries on this clip.", flush=True)
         print("Any null below is weak evidence — lengthen the clip rather than trusting it.", flush=True)
@@ -389,7 +404,7 @@ else:
         print(f"POWER: arm B has {nb} internal boundaries on this clip.", flush=True)
 
     if "B_default" in local:
-        b_sdr, i_sdr, _ = local["B_default"]
+        b_sdr, i_sdr, _, b_res, i_res = local["B_default"]
         d = b_sdr - i_sdr
         print(f"Arm B boundary-vs-interior SDR delta = {d:+.2f} dB "
               f"(boundary {b_sdr:.2f}, interior {i_sdr:.2f}).", flush=True)
@@ -399,11 +414,19 @@ else:
         # differing signal energy manufactures a spurious delta (measured -3.68
         # dB on identical arrays — enough to trip the artefact threshold below as
         # a FALSE POSITIVE). Anything past ~120 dB is the floor, not a result.
-        if max(b_sdr, i_sdr) > FLOOR_DB:
-            print(f"AT MEASUREMENT FLOOR (>{FLOOR_DB:.0f} dB): arm B is numerically identical to arm A", flush=True)
-            print("in at least one region, so the delta above is an epsilon artefact and carries", flush=True)
-            print("no information. Segmentation either did not engage or is an exact no-op —", flush=True)
-            print("check the segmentation log line before reading anything into this.", flush=True)
+        if b_res == 0.0 or i_res == 0.0:
+            where = "boundary" if b_res == 0.0 else "interior"
+            if b_res == 0.0 and i_res == 0.0:
+                where = "both"
+            print(f"BIT-IDENTICAL to arm A in the {where} region(s) — reporting the STATE, not a", flush=True)
+            print("number. The residual is exactly zero there, so SDR is pinned by the epsilon and", flush=True)
+            print("any delta would be fabricated from the regions' differing signal energy.", flush=True)
+            print("Segmentation either did not engage or is an exact no-op — read the", flush=True)
+            print("segmentation log line before concluding anything.", flush=True)
+        elif max(b_sdr, i_sdr) > FLOOR_DB:
+            print(f"NEAR THE MEASUREMENT FLOOR (>{FLOOR_DB:.0f} dB): the arms differ, but by so little that", flush=True)
+            print("the delta is dominated by numerical noise. Reported for completeness, not as a", flush=True)
+            print("verdict.", flush=True)
         elif d < ARTEFACT_DB:
             print("ARTEFACT LOCALISED AT THE CROSSFADES: the overlap windows reconstruct", flush=True)
             print("measurably worse than segment interiors. This is a real finding — the", flush=True)
