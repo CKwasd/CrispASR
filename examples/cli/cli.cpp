@@ -1464,10 +1464,11 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
         "irodori: text CFG (default 3.0); speaker CFG via CRISPASR_IRODORI_CFG_SPEAKER; "
         "vibevoice: 0 = model default, try 1.5 or a new --seed to re-roll BGM onsets)\n",
         "default");
-    fprintf(out,
-            "             --tts-speed X            [%-7.2f] speaking-rate multiplier (omnivoice/f5/piper/melotts/"
-            "fastpitch): >1 faster/shorter, <1 slower/longer\n",
-            params.tts_speed);
+    fprintf(
+        out,
+        "             --tts-speed X            [%-7.2f] speaking-rate multiplier (kokoro/omnivoice/f5/piper/melotts/"
+        "fastpitch): >1 faster/shorter, <1 slower/longer\n",
+        params.tts_speed);
     fprintf(out, "             --tts-trim-silence       [%-7s] trim leading silence from TTS output\n",
             params.tts_trim_silence ? "true" : "false");
     fprintf(out,
