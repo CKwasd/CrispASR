@@ -402,6 +402,50 @@ static bool nemotron_load_model(nemotron_model& model, nemotron_vocab& vocab,
         // training config. The prompt_kernel one-hot encoding must match this
         // exact mapping or the encoder output will be conditioned on the wrong
         // language (#81).
+        //
+        // PREFER THE MODEL'S OWN TABLE. The GGUF carries nemotron.prompt_langs
+        // (STRING[]) paired with nemotron.prompt_ids (UINT32[]), which is the
+        // prompt_dictionary the checkpoint was actually trained with. Reading it
+        // beats the hard-coded list below on three counts, measured against
+        // nemotron-3.5-asr-streaming-0.6b: the file lists 121 names where the
+        // literal table reaches 75, so 51 languages — af-ZA, am-ET, fa-IR,
+        // bn-IN, gu-IN, haw-US and more — were simply UNREACHABLE BY NAME; the
+        // `auto` entry supplies id 101 from the model instead of a magic number
+        // in our source; and a future checkpoint that renumbers its prompts
+        // cannot silently disagree with us. The literal table is kept as a
+        // FALLBACK (emplace, never overwrite) for GGUFs that predate these KVs
+        // and for five short aliases the file omits (he, ja, th, vi, zh).
+        size_t n_lang_from_gguf = 0;
+        {
+            const int k_langs = gguf_find_key(gctx, "nemotron.prompt_langs");
+            const int k_ids = gguf_find_key(gctx, "nemotron.prompt_ids");
+            if (k_langs >= 0 && k_ids >= 0 && gguf_get_kv_type(gctx, k_langs) == GGUF_TYPE_ARRAY &&
+                gguf_get_kv_type(gctx, k_ids) == GGUF_TYPE_ARRAY &&
+                gguf_get_arr_type(gctx, k_langs) == GGUF_TYPE_STRING &&
+                (gguf_get_arr_type(gctx, k_ids) == GGUF_TYPE_INT32 ||
+                 gguf_get_arr_type(gctx, k_ids) == GGUF_TYPE_UINT32) &&
+                gguf_get_arr_n(gctx, k_langs) == gguf_get_arr_n(gctx, k_ids)) {
+                const size_t n = gguf_get_arr_n(gctx, k_langs);
+                // The shipped files store these as INT32 (GGUF_TYPE_INT32 == 5).
+                // An earlier revision of this check tested only GGUF_TYPE_UINT32
+                // (== 4) and therefore never matched, silently falling through to
+                // the literal table below — correct behaviour, but inert. Prompt
+                // ids are small non-negative, so either signedness reads the same.
+                const int32_t* ids = (const int32_t*)gguf_get_arr_data(gctx, k_ids);
+                for (size_t i = 0; i < n; ++i) {
+                    const char* code = gguf_get_arr_str(gctx, k_langs, i);
+                    if (!code || !*code)
+                        continue;
+                    const int id = (int)ids[i];
+                    lang_to_prompt[code] = id;
+                    std::string lo = code;
+                    for (auto& c : lo)
+                        c = (char)std::tolower((unsigned char)c);
+                    lang_to_prompt[lo] = id;
+                    ++n_lang_from_gguf;
+                }
+            }
+        }
         {
             // clang-format off
             const struct { const char* code; int id; } prompts[] = {
@@ -417,49 +461,54 @@ static bool nemotron_load_model(nemotron_model& model, nemotron_vocab& vocab,
                 {"sl-SI", 62}, {"he-IL", 64}, {"fr-CA", 100}, {"nn-NO", 104},
             };
             // clang-format on
+            // emplace, not assign: whatever the GGUF said WINS. This block is
+            // a fallback for files predating the KVs, never an override of them.
             for (const auto& p : prompts) {
-                lang_to_prompt[p.code] = p.id;
+                lang_to_prompt.emplace(p.code, p.id);
                 std::string lo = p.code;
                 for (auto& c : lo)
                     c = (char)std::tolower((unsigned char)c);
-                lang_to_prompt[lo] = p.id;
+                lang_to_prompt.emplace(lo, p.id);
             }
-            // Short ISO 639-1 aliases → first matching locale
-            lang_to_prompt["en"] = 0;   // en-US
-            lang_to_prompt["es"] = 3;   // es-US
-            lang_to_prompt["zh"] = 4;   // zh-CN
-            lang_to_prompt["hi"] = 6;   // hi-IN
-            lang_to_prompt["ar"] = 7;   // ar-AR
-            lang_to_prompt["fr"] = 8;   // fr-FR
-            lang_to_prompt["de"] = 9;   // de-DE
-            lang_to_prompt["ja"] = 10;  // ja-JP
-            lang_to_prompt["ru"] = 11;  // ru-RU
-            lang_to_prompt["pt"] = 13;  // pt-PT
-            lang_to_prompt["ko"] = 14;  // ko-KR
-            lang_to_prompt["it"] = 15;  // it-IT
-            lang_to_prompt["nl"] = 16;  // nl-NL
-            lang_to_prompt["pl"] = 17;  // pl-PL
-            lang_to_prompt["tr"] = 18;  // tr-TR
-            lang_to_prompt["uk"] = 19;  // uk-UA
-            lang_to_prompt["ro"] = 20;  // ro-RO
-            lang_to_prompt["el"] = 21;  // el-GR
-            lang_to_prompt["cs"] = 22;  // cs-CZ
-            lang_to_prompt["hu"] = 23;  // hu-HU
-            lang_to_prompt["sv"] = 24;  // sv-SE
-            lang_to_prompt["da"] = 25;  // da-DK
-            lang_to_prompt["fi"] = 26;  // fi-FI
-            lang_to_prompt["nb"] = 27;  // nb-NO
-            lang_to_prompt["sk"] = 28;  // sk-SK
-            lang_to_prompt["hr"] = 29;  // hr-HR
-            lang_to_prompt["bg"] = 30;  // bg-BG
-            lang_to_prompt["lt"] = 31;  // lt-LT
-            lang_to_prompt["th"] = 32;  // th-TH
-            lang_to_prompt["vi"] = 33;  // vi-VN
-            lang_to_prompt["et"] = 60;  // et-EE
-            lang_to_prompt["lv"] = 61;  // lv-LV
-            lang_to_prompt["sl"] = 62;  // sl-SI
-            lang_to_prompt["he"] = 64;  // he-IL
-            lang_to_prompt["nn"] = 104; // nn-NO
+            // Short ISO 639-1 aliases → first matching locale. emplace: the GGUF
+            // supplies most of these itself; five (he, ja, th, vi, zh) it omits,
+            // and "auto" is here only for files predating nemotron.prompt_langs.
+            lang_to_prompt.emplace("en", 0);     // en-US
+            lang_to_prompt.emplace("es", 3);     // es-US
+            lang_to_prompt.emplace("zh", 4);     // zh-CN
+            lang_to_prompt.emplace("hi", 6);     // hi-IN
+            lang_to_prompt.emplace("ar", 7);     // ar-AR
+            lang_to_prompt.emplace("fr", 8);     // fr-FR
+            lang_to_prompt.emplace("de", 9);     // de-DE
+            lang_to_prompt.emplace("ja", 10);    // ja-JP
+            lang_to_prompt.emplace("ru", 11);    // ru-RU
+            lang_to_prompt.emplace("pt", 13);    // pt-PT
+            lang_to_prompt.emplace("ko", 14);    // ko-KR
+            lang_to_prompt.emplace("it", 15);    // it-IT
+            lang_to_prompt.emplace("nl", 16);    // nl-NL
+            lang_to_prompt.emplace("pl", 17);    // pl-PL
+            lang_to_prompt.emplace("tr", 18);    // tr-TR
+            lang_to_prompt.emplace("uk", 19);    // uk-UA
+            lang_to_prompt.emplace("ro", 20);    // ro-RO
+            lang_to_prompt.emplace("el", 21);    // el-GR
+            lang_to_prompt.emplace("cs", 22);    // cs-CZ
+            lang_to_prompt.emplace("hu", 23);    // hu-HU
+            lang_to_prompt.emplace("sv", 24);    // sv-SE
+            lang_to_prompt.emplace("da", 25);    // da-DK
+            lang_to_prompt.emplace("fi", 26);    // fi-FI
+            lang_to_prompt.emplace("nb", 27);    // nb-NO
+            lang_to_prompt.emplace("sk", 28);    // sk-SK
+            lang_to_prompt.emplace("hr", 29);    // hr-HR
+            lang_to_prompt.emplace("bg", 30);    // bg-BG
+            lang_to_prompt.emplace("lt", 31);    // lt-LT
+            lang_to_prompt.emplace("th", 32);    // th-TH
+            lang_to_prompt.emplace("vi", 33);    // vi-VN
+            lang_to_prompt.emplace("et", 60);    // et-EE
+            lang_to_prompt.emplace("lv", 61);    // lv-LV
+            lang_to_prompt.emplace("sl", 62);    // sl-SI
+            lang_to_prompt.emplace("he", 64);    // he-IL
+            lang_to_prompt.emplace("nn", 104);   // nn-NO
+            lang_to_prompt.emplace("auto", 101); // native automatic language identification
         }
 
         core_gguf::free_metadata(gctx);

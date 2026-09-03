@@ -116,6 +116,9 @@ public:
         if (!ctx_)
             return out;
 
+        if (!params.language.empty())
+            nemotron_set_language(ctx_, params.language.c_str());
+
         nemotron_set_temperature(ctx_, params.temperature, params.seed);
         nemotron_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
 
@@ -192,6 +195,8 @@ public:
             CrispasrBackend::transcribe_streaming(samples, n_samples, 0, params, on_text);
             return;
         }
+        if (!params.language.empty())
+            nemotron_set_language(ctx_, params.language.c_str());
         std::string accumulated;
         bool first_tok = true;
         // nemotron_transcribe_cb fires per-emitted non-blank RNN-T token
@@ -223,9 +228,11 @@ public:
         on_text(accumulated.c_str(), true);
     }
 
-    std::unique_ptr<CrispasrRealtimeSession> create_realtime_session(const whisper_params&) override {
+    std::unique_ptr<CrispasrRealtimeSession> create_realtime_session(const whisper_params& params) override {
         if (!ctx_)
             return nullptr;
+        if (!params.language.empty())
+            nemotron_set_language(ctx_, params.language.c_str());
         return std::make_unique<NemotronRealtimeSession>(ctx_);
     }
 
