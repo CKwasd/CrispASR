@@ -77,7 +77,8 @@ struct nemotron_result* nemotron_transcribe_ex(struct nemotron_context* ctx, con
 // Default is preset 0.
 void nemotron_set_context_preset(struct nemotron_context* ctx, int preset);
 
-// Set the language for prompt features. Pass ISO-639-1 code (e.g. "en", "de").
+// Set the language for prompt features. Pass ISO-639-1 code (e.g. "en", "de"),
+// or "auto" to use the model-native automatic language prompt (prompt_id=101).
 // Default is "en" (prompt_id=0).
 void nemotron_set_language(struct nemotron_context* ctx, const char* lang_code);
 
