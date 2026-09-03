@@ -224,6 +224,7 @@ print("\n[5/9] Prepare input (20 s music with vocals)", flush=True)
 import soundfile as sf  # noqa: E402
 import librosa  # noqa: E402
 
+KIM_HOP = 441   # stft_hop_length for this checkpoint; T = samples / hop
 CLIP_S = float(os.environ.get("MBR_CLIP_S", "20"))
 CLIP_OFF_S = float(os.environ.get("MBR_CLIP_OFF_S", "10"))
 SR = 44100
@@ -248,47 +249,15 @@ print(f"  rms={np.sqrt((stereo**2).mean()):.4f} peak={np.abs(stereo).max():.3f} 
 if dur <= 8.0:
     raise SystemExit(f"input {dur:.2f}s does not exceed the 8 s trained chunk — it would never segment")
 
-# ── 6. reference, unsegmented — AND WRITTEN TO DISK (v1 could not reuse it) ──
-print("\n[6/9] Reference (unsegmented ground truth)", flush=True)
-sys.path.insert(0, str(REPO / "tools" / "reference_backends"))
-import torch  # noqa: E402
-import mel_band_roformer as mbr_ref  # noqa: E402
-
-model, ref_cfg = mbr_ref._load(str(CKPT_DIR))
-model.eval()
-print(f"  reference cfg: dim={ref_cfg.get('dim')} depth={ref_cfg.get('depth')} "
-      f"heads={ref_cfg.get('heads')} num_bands={ref_cfg.get('num_bands')}", flush=True)
-dev = "cuda" if torch.cuda.is_available() else "cpu"
-model = model.to(dev)
-if dev == "cuda":
-    torch.cuda.reset_peak_memory_stats()
-with torch.no_grad():
-    x = torch.from_numpy(stereo.T).unsqueeze(0).to(dev)  # (1, ch, T)
-    t0 = time.time()
-    ref_out = model(x)
-    fwd_s = time.time() - t0
-if dev == "cuda":
-    peak_gb = torch.cuda.max_memory_allocated() / 1e9
-    print(f"  reference forward: {fwd_s:.1f}s, peak VRAM {peak_gb:.2f} GB "
-          f"(headroom check for the 20 s sizing)", flush=True)
-else:
-    print(f"  reference forward: {fwd_s:.1f}s (CPU)", flush=True)
-ref = ref_out.squeeze(0).detach().cpu().numpy()
-if ref.ndim == 3:
-    ref = ref[0]
-ref_pcm = np.clip(ref.T, -1.0, 1.0)  # (T, ch)
-del model, ref_out
-torch.cuda.empty_cache()
-REF_WAV = OUT / "ref_vocals.wav"
-sf.write(str(REF_WAV), ref_pcm, SR, subtype="PCM_16")   # v1 hole: ref never hit disk
-print(f"  reference vocals: {ref_pcm.shape}, rms={np.sqrt((ref_pcm**2).mean()):.5f} "
-      f"-> {REF_WAV.name}", flush=True)
-
-# ── 7. C++ arms, capturing the ACTUAL segment geometry ─────────────
+# ── 6. C++ arms, capturing the ACTUAL segment geometry ─────────────
+# Deliberately BEFORE the torch reference: the within-arm localisation in
+# step 9 is the primary result and uses arm A as its reference, so it needs no
+# torch at all. Running the arms first banks that result before the GPU
+# lottery (below) can touch it.
 # The geometry is parsed from the runtime's own log line rather than assumed,
 # so a change to resolve_segment_len cannot silently invalidate the analysis
 # below. Also records which branch fired (trained chunk vs 8 s fallback).
-print("\n[7/9] C++ arms", flush=True)
+print("\n[6/9] C++ arms", flush=True)
 import re  # noqa: E402
 
 SEG_RE = re.compile(r"segmented\s+(\d+)\s+samples into\s+(\d+)\s+chunks of\s+(\d+)\s+\(stride\s+(\d+)")
@@ -326,6 +295,85 @@ if gB:
     print(f"  default seg_len = {gB['seg_len']} samples = {gB['seg_len']/SR:.3f}s  [{branch}]", flush=True)
 if geom.get("A_noseg") is not None:
     print("  !! WARNING: arm A segmented; NO_SEGMENT did not take effect — A is not a clean reference", flush=True)
+
+# ── 7. reference, unsegmented — SECONDARY and NON-FATAL ────────────
+print("\n[7/9] Reference (unsegmented ground truth) — secondary arm", flush=True)
+sys.path.insert(0, str(REPO / "tools" / "reference_backends"))
+import torch  # noqa: E402
+import mel_band_roformer as mbr_ref  # noqa: E402
+
+model, ref_cfg = mbr_ref._load(str(CKPT_DIR))
+model.eval()
+print(f"  reference cfg: dim={ref_cfg.get('dim')} depth={ref_cfg.get('depth')} "
+      f"heads={ref_cfg.get('heads')} num_bands={ref_cfg.get('num_bands')}", flush=True)
+# GPU LOTTERY. Kaggle's current torch dropped P100 (sm_60): a P100 draw raises
+# "no kernel image is available for execution on the device" inside the first
+# forward. The C++ half is unaffected — ggml-CUDA compiles sm_60 itself — so
+# only this oracle is exposed. Probe the capability instead of discovering it
+# mid-forward, and fall back to CPU rather than shortening the clip, which
+# would trade the experiment's power (arm B's 3 boundaries) for convenience.
+dev = "cpu"
+if torch.cuda.is_available():
+    cap = torch.cuda.get_device_capability()
+    sm = f"sm_{cap[0]}{cap[1]}"
+    archs = list(torch.cuda.get_arch_list())
+    print(f"  GPU {torch.cuda.get_device_name(0)} is {sm}; torch supports {archs}", flush=True)
+    if sm in archs:
+        dev = "cuda"
+    else:
+        # O(T^2) attention on CPU: the time transformer materialises
+        # (bands x heads x T x T) f32 scores when SDPA cannot use a
+        # memory-efficient kernel. T here is fixed by the clip, so state the
+        # estimate rather than hoping.
+        T_est = stereo.shape[0] // KIM_HOP
+        est_gb = 60 * 8 * (T_est ** 2) * 4 / 1e9
+        print(f"  {sm} UNSUPPORTED by this torch -> CPU fallback. T={T_est}, "
+              f"worst-case time-attention scores ~{est_gb:.1f} GB "
+              f"(Kaggle GPU instances have ~29 GB RAM; flash/SDPA may use far less).", flush=True)
+
+ref_pcm = None
+REF_WAV = None
+ref_device_used = dev
+try:
+    model = model.to(dev)
+    if dev == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    with torch.no_grad():
+        x = torch.from_numpy(stereo.T).unsqueeze(0).to(dev)  # (1, ch, T)
+        t0 = time.time()
+        ref_out = model(x)
+        fwd_s = time.time() - t0
+    if dev == "cuda":
+        print(f"  reference forward: {fwd_s:.1f}s, peak VRAM "
+              f"{torch.cuda.max_memory_allocated()/1e9:.2f} GB", flush=True)
+    else:
+        print(f"  reference forward: {fwd_s:.1f}s (CPU)", flush=True)
+    ref = ref_out.squeeze(0).detach().cpu().numpy()
+    if ref.ndim == 3:
+        ref = ref[0]
+    ref_pcm = np.clip(ref.T, -1.0, 1.0)  # (T, ch)
+    del ref_out
+    REF_WAV = OUT / "ref_vocals.wav"
+    sf.write(str(REF_WAV), ref_pcm, SR, subtype="PCM_16")   # v1 hole: ref never hit disk
+    print(f"  reference vocals: {ref_pcm.shape}, rms={np.sqrt((ref_pcm**2).mean()):.5f} "
+          f"-> {REF_WAV.name}", flush=True)
+except Exception as _e:
+    # NON-FATAL BY DESIGN. This arm validates the PORT in absolute terms, which
+    # PLAN.md already records as cos=1.0 per stage with bit-exact
+    # reconstruction. The SEGMENTATION question — the reason this run exists —
+    # is answered by the within-arm localisation against arm A, which is
+    # already computed above and needs no torch. Losing this arm degrades the
+    # report; it does not void the experiment.
+    ref_device_used = f"{dev} (FAILED)"
+    print(f"  !! REFERENCE ARM UNAVAILABLE on {dev}: {type(_e).__name__}: {str(_e)[:200]}", flush=True)
+    print("  Continuing: the within-arm segmentation measurement does not depend on it.", flush=True)
+finally:
+    try:
+        del model
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 # ── 8. whole-clip metrics vs the torch reference ───────────────────
 # SDR := 10*log10(||ref||^2 / ||ref-est||^2) — signal-to-residual against the
@@ -367,9 +415,16 @@ def sdr_and_resid(est, ref_a, sl):
     return sdr, resid
 
 
-print(f"\n{'arm':<12}{'SDR dB':>10}{'cosine':>12}{'|est|/|ref|':>14}{'samples':>10}", flush=True)
 whole = {}
-for name, _ in ARMS:
+if ref_pcm is None:
+    print("SKIPPED: the torch reference arm is unavailable, so there is no absolute", flush=True)
+    print("ground truth to score against. This costs the PORT-validation arm only —", flush=True)
+    print("the segmentation result in step 9 is unaffected and is the reason for the run.", flush=True)
+    ARMS_FOR_WHOLE = []
+else:
+    ARMS_FOR_WHOLE = ARMS
+    print(f"\n{'arm':<12}{'SDR dB':>10}{'cosine':>12}{'|est|/|ref|':>14}{'samples':>10}", flush=True)
+for name, _ in ARMS_FOR_WHOLE:
     if name not in cpp:
         print(f"{name:<12}{'VOID':>10}", flush=True)
         continue
@@ -496,6 +551,7 @@ summary = {
     "clip": {"source": Path(music_path).name, "offset_s": CLIP_OFF_S,
              "dur_s": round(dur, 3), "sr": SR, "samples": int(stereo.shape[0])},
     "geometry": geom,
+    "reference_arm": {"available": ref_pcm is not None, "device": ref_device_used},
     "whole_clip_sdr_vs_torch_ref": {k: round(v, 4) for k, v in whole.items()},
     "within_arm_vs_A": {
         k: {"boundary_sdr": round(v[0], 4), "interior_sdr": round(v[1], 4),
