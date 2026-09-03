@@ -69,7 +69,7 @@ OUT = WORK / "out"
 
 CRISPASR_REF = os.environ.get("CRISPASR_REF", "main")
 CRISPASR_REPO = os.environ.get("CRISPASR_REPO", "https://github.com/CrispStrobe/CrispASR.git")
-SCRIPT_VERSION = "seg-evidence-v1"
+SCRIPT_VERSION = "seg-evidence-v1.1-ggufdep"
 
 
 def run(cmd, check=True, env=None, timeout=None, cwd=None):
@@ -117,7 +117,10 @@ assert CLI.exists(), "crispasr-cli missing"
 
 # ── 3. deps + checkpoint ───────────────────────────────────────────
 print("\n[3/8] Reference deps + Kim checkpoint", flush=True)
-run("pip install -q 'bs-roformer==0.3.10' soundfile librosa 2>&1 | tail -5", check=False)
+# `gguf` is NOT in the Kaggle image and the converter imports it (v1 run
+# 2026-09-03 died here after the full build + 913 MB checkpoint download).
+run("pip install -q 'bs-roformer==0.3.10' soundfile librosa gguf 2>&1 | tail -5", check=False)
+run([sys.executable, "-c", "import gguf; print('gguf', gguf.__version__)"], check=True)
 from huggingface_hub import snapshot_download  # noqa: E402
 
 CKPT_DIR = Path(snapshot_download("KimberleyJSN/melbandroformer",
@@ -175,6 +178,12 @@ ref_pcm = np.clip(ref.T, -1.0, 1.0)  # (T, ch)
 del model, ref_out
 torch.cuda.empty_cache()
 print(f"  reference vocals: {ref_pcm.shape}, rms={np.sqrt((ref_pcm**2).mean()):.5f}", flush=True)
+# Write the reference so the comparison can be REDONE offline against it. v1
+# kept it in memory only, which meant a failed or unexpected verdict could not
+# be re-analysed without paying for the whole run again.
+REF_WAV = OUT / "ref_vocals.wav"
+sf.write(str(REF_WAV), ref_pcm.astype(np.float32), 44100, subtype="PCM_16")
+print(f"  wrote {REF_WAV}", flush=True)
 
 # ── 7. C++ arms ────────────────────────────────────────────────────
 print("\n[7/8] C++ arms", flush=True)
@@ -246,3 +255,25 @@ else:
 print("\nNOTE: the reference has no chunking of its own, so 'ref' is the unsegmented", flush=True)
 print("ground truth. A_noseg vs ref measures the PORT; B_default vs ref measures", flush=True)
 print("SEGMENTATION on top of it.", flush=True)
+
+# ── 9. shrink the kernel output ────────────────────────────────────
+# The clone + build tree live under /kaggle/working and would otherwise BE the
+# kernel output — retrieving even the log from the v1 run meant walking the
+# whole repo. Keep only what the offline analysis needs.
+print("\n[9/9] Pruning output", flush=True)
+import shutil  # noqa: E402
+
+for junk in (REPO, BUILD, WORK / "hf"):
+    try:
+        shutil.rmtree(junk, ignore_errors=True)
+    except Exception as e:
+        print(f"  prune {junk}: {e}", flush=True)
+try:
+    GGUF.unlink(missing_ok=True)  # regenerable from the checkpoint
+except Exception:
+    pass
+kept = sorted(p for p in WORK.rglob("*") if p.is_file())
+print(f"  kept {len(kept)} files, "
+      f"{sum(p.stat().st_size for p in kept)/1e6:.1f} MB", flush=True)
+for p in kept[:20]:
+    print(f"    {p.relative_to(WORK)}  {p.stat().st_size/1e6:.2f} MB", flush=True)
