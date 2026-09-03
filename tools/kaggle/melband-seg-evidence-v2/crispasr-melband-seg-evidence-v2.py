@@ -150,13 +150,19 @@ print("\n[1b/9] Python deps (before the expensive build)", flush=True)
 # at conversion AFTER the full CUDA build and the 913 MB checkpoint download —
 # ~16 minutes of quota for a ModuleNotFoundError. This is exactly how v1 died.
 run("pip install -q 'bs-roformer==0.3.10' gguf soundfile librosa 2>&1 | tail -5", check=False)
-import importlib  # noqa: E402
-
-for _m in ("gguf", "soundfile", "librosa"):
-    if importlib.util.find_spec(_m) is None:
-        raise SystemExit(f"FATAL: '{_m}' missing after pip install — would fail later at a "
-                         f"far more expensive point; aborting before the build.")
-print("  deps present: gguf, soundfile, librosa", flush=True)
+# Assert the EXACT symbols the converter imports, not a proxy for them.
+# crispasr-dc's v1.2 died on its own guard — it asserted gguf.__version__,
+# which the package does not define — so the check for a missing dependency
+# became a second way to fail. find_spec() has the same weakness in milder
+# form: it proves a module is importable, not that the names exist in it.
+try:
+    from gguf import GGMLQuantizationType, GGUFWriter  # noqa: F401  (exactly what the converter imports)
+    import librosa  # noqa: F401
+    import soundfile  # noqa: F401
+except Exception as _e:
+    raise SystemExit(f"FATAL: dependency check failed ({_e!r}) — aborting BEFORE the CUDA build "
+                     f"and the 913 MB checkpoint download, which is where v1 discovered this.")
+print("  deps OK: gguf.GGUFWriter + gguf.GGMLQuantizationType, soundfile, librosa", flush=True)
 
 print("\n[2/9] Build CUDA", flush=True)
 kh.install_build_toolchain()
