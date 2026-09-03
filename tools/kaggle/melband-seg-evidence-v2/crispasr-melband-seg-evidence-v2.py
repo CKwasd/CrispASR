@@ -126,6 +126,42 @@ def run(cmd, check=True, env=None, timeout=None, cwd=None):
     return r
 
 
+# ── 0. SELF-CHECK: the primary measurement must not depend on the oracle ──
+# The whole point of the arms-before-reference restructure is that step 9 (the
+# within-arm segmentation measurement) is computed from the C++ arms alone, so
+# losing the torch oracle to a P100 draw costs only the secondary arm. That
+# independence is INVISIBLE — nothing about step 9 looks like it would break if
+# someone added one convenient `ref_pcm` reference — so it is enforced here
+# rather than remembered. Runs first: it costs milliseconds and a violation
+# should never reach a GPU.
+#
+# This exists because I claimed to a colleague that it existed before it did.
+# A guard that is described but absent is indistinguishable, from the outside,
+# from a guard that is present and working.
+def _assert_primary_is_oracle_independent() -> None:
+    try:
+        src = Path(__file__).read_text(encoding="utf-8")
+    except Exception as e:  # no __file__ (exec/stdin): say so, do not pretend
+        print(f"  !! self-check SKIPPED, source unreadable ({type(e).__name__}) — "
+              f"the oracle-independence invariant is UNVERIFIED for this run", flush=True)
+        return
+    start = src.find('print("\n[9/9] Within-arm')
+    end = src.find("summary = {", start if start >= 0 else 0)
+    if start < 0 or end < 0:
+        raise SystemExit("self-check FAILED: cannot locate the step-9 block; the markers it "
+                         "keys on moved. Fix the markers or the check, do not delete it.")
+    block = src[start:end]
+    if "ref_pcm" in block:
+        raise SystemExit(
+            "self-check FAILED: step 9 references `ref_pcm`. The within-arm measurement is the "
+            "PRIMARY result and must be computable from the C++ arms alone — otherwise a GPU "
+            "draw that kills the torch oracle also kills the segmentation answer, which is the "
+            "single point of failure this design removed.")
+    print("  self-check OK: step 9 (primary) does not reference the torch oracle", flush=True)
+
+
+_assert_primary_is_oracle_independent()
+
 # ── 1. clone ───────────────────────────────────────────────────────
 print("[1/9] Clone", flush=True)
 OUT.mkdir(parents=True, exist_ok=True)
