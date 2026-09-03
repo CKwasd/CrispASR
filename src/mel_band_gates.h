@@ -29,34 +29,19 @@
 //                              graph is explicitly forced off)
 #pragma once
 
+// Shared decision table: core/backend_path_gates.h (this was byte-identical
+// to htdemucs_gates.h). The segment-length logic below is mel-band specific.
+#include "core/backend_path_gates.h"
+
 #include <cstdlib>
 
 namespace mel_band_gates {
 
-struct Resolved {
-    bool use_graph = false;
-    bool use_fused = false;
-    bool gpu_backend = false;
-};
+using Resolved = core_backend_gates::Resolved;
 
 inline Resolved resolve(const char* env_gpu, const char* env_ggml, const char* env_fused, bool caller_use_gpu,
                         bool have_real_gpu) {
-    bool want_gpu = caller_use_gpu;
-    if (env_gpu && *env_gpu)
-        want_gpu = atoi(env_gpu) != 0;
-    const bool gpu = want_gpu && have_real_gpu;
-
-    Resolved r;
-    const bool ggml_forced = env_ggml && *env_ggml;
-    const bool fused_forced = env_fused && *env_fused;
-    const bool fused_forced_on = fused_forced && atoi(env_fused) != 0;
-
-    r.use_graph =
-        ggml_forced ? (atoi(env_ggml) != 0) : (gpu || fused_forced_on); // FUSED=1 alone implies the graph it needs
-    r.use_fused = fused_forced ? fused_forced_on : gpu;                 // AUTO: fused exactly on GPU
-    r.use_fused = r.use_fused && r.use_graph;                           // fused cannot outlive the graph path
-    r.gpu_backend = gpu && r.use_graph;                                 // CPU path is CPU by construction
-    return r;
+    return core_backend_gates::resolve(env_gpu, env_ggml, env_fused, caller_use_gpu, have_real_gpu);
 }
 
 // Segment length in SAMPLES for the Demucs-style split (review #422).
