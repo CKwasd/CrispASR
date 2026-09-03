@@ -188,6 +188,25 @@ for p in sorted(CKPT_DIR.rglob("*")):
     if p.is_file() and p.suffix in (".ckpt", ".yaml", ".yml", ".pt", ".bin"):
         print(f"    {p.name}  {p.stat().st_size/1e6:.1f} MB", flush=True)
 
+# ── 3b. the config the checkpoint does not ship ────────────────────
+# KimberleyJSN/melbandroformer contains ONLY MelBandRoformer.ckpt. Both the
+# converter and the reference loader glob for *.yaml and exit, because the band
+# layout is not recoverable from the weights. v1 and v2 both died here, ~5 min
+# in, AFTER the CUDA build and the 913 MB download. The values are recorded in
+# docs/mel-band-roformer/PLAN.md and synthesised by a shared helper so the next
+# person to convert or reference-dump this checkpoint does not rediscover it.
+print("\n[3b/9] Synthesise the Kim config (checkpoint ships no YAML)", flush=True)
+sys.path.insert(0, str(REPO / "tools"))
+from melband_kim_config import verify_against_checkpoint, write_config  # noqa: E402
+
+write_config(CKPT_DIR)
+
+# A synthesised config is exactly the kind of thing that is silently
+# almost-right: a wrong dim/depth/num_bands/dim_freqs_in still BUILDS and RUNS
+# and emits subtly wrong audio. strict=True turns that into a shape mismatch in
+# seconds. Cheap check, run BEFORE the conversion and the reference forward.
+verify_against_checkpoint(CKPT_DIR)
+
 # ── 4. convert to GGUF from the SAME checkpoint ────────────────────
 print("\n[4/9] Convert -> GGUF (same weights both sides)", flush=True)
 GGUF = WORK / "melband-vocals-f32.gguf"
