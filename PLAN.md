@@ -151,28 +151,43 @@ path — the gate moved to the OLD path, never removed.
 With no env set, sidon / beat-this / cosyvoice3 all now report zero broadcasting
 quantized matmuls. Unit suite 1780/1780.
 
-**CUDA arm: INCONCLUSIVE, and there is no known way to fix that from here.**
-`tools/kaggle/sidon-quant-cuda` ran three times, every time on a Tesla P100
-(**sm_60**). ggml disables MMQ below `GGML_CUDA_CC_DP4A == 610`
-(`ggml_cuda_should_use_mmq`), so the pre-fix arm never took the path under test;
-the tell was that the gated and ungated arms measured byte-identically (q8_0 rms
-0.111276 both). Same capability-gap trap as the lavapipe Vulkan sweep.
+**The int-dot arm: BOTH routes closed, recorded as open rather than closed.**
+The fix in 6b396bb9 has still never EXECUTED on a device taking ggml's MMQ path.
+It stands on the code-path argument, CPU equivalence, and the reporter's own
+confirmation — which is real evidence, but not the same thing.
 
-Neither API lever works, both now tested: `--accelerator nvidiaTeslaT4` is
-accepted and silently ignored (the SDK maps it to `machine_shape` and notes the
-valid enum "is not currently included in kagglesdk"), and `"machine_shape":
-"GPU_T4_X2"` in the metadata was independently retested by another session on a
-different chr1s4 kernel — still sm_60
-(`CMAKE_CUDA_ARCHITECTURES_NATIVE=60-real`). So the accelerator is a lottery.
-No local route exists: qemu emulates CPUs, not CUDA devices
-([[feedback_local_arm64_qemu]] does not help here).
+*Route 1, local lavapipe (forced int-dot).* Compiler solved: LunarG's SDK glslc
+(shaderc v2026.3) compiles `dotPacked4x8AccSatEXT`, where Ubuntu's emits the
+exact "extension not supported" string ggml's CMake probe matches — so
+`-DVulkan_GLSLC_EXECUTABLE=/mnt/volume1/tmp-overflow/1.4.357.1/x86_64/bin/glslc`
+turns the MMQ pipelines ON (configure confirms "GL_EXT_integer_dot_product
+supported by glslc"). BLOCKED ON MEMORY, structurally: ggml's generated
+`mul_mm.comp.cpp` is a 122 MB single TU needing ~2-3 GB, while the box holds
+4.3 GB resident across 17 concurrent Claude sessions. That does not drain with
+time, so polling a free-MB threshold cannot succeed — poll
+`pgrep -c -f 'cc1plus|clang++|nvcc'` reaching 0 instead. Two attempts OOM-killed
+(gcc at 777 MB, clang at 1.75 GB); clang peaks 1.16 GB vs gcc, so use clang at
+-j1. Note ggml's own "int dot: %d" device line prints a LOCAL variable holding
+raw extension presence, NOT the gated `device->integer_dot_product` — it reads
+identically with and without the force flag and cannot confirm the flag took.
 
-The kernel now loses that lottery cheaply — it reads `compute_cap` in its first
-seconds and exits with a `P100_LOTTERY_RETRY` marker before the ~20 min build,
-so a re-push costs ~1 min. Untried levers if this is ever worth resuming: set
-the accelerator once in the Kaggle web UI (may stick for later API pushes,
-unverified), or port the harness to Colab free tier, which hands out T4 far more
-reliably. The run DID establish that the fix does not regress CUDA.
+*Route 2, Kaggle.* DEAD, and structurally rather than by lottery
+(`tools/kaggle/sidon-vulkan-probe`, 79236e62). The image ships no NVIDIA Vulkan
+ICD — only intel/lvp/radeon/virtio — and its only Vulkan device is llvmpipe, so
+a Kaggle run would test nothing a local lavapipe run doesn't. Installing
+libnvidia-gl-580 places `nvidia_icd.json` but then vulkaninfo enumerates ZERO
+devices, llvmpipe included: the distro ICD does not match Kaggle's injected
+container driver and breaks the loader. A T4 draw would not help. (It was also
+the 7th consecutive P100.)
+
+⚠ ARM B REMAINS THE GATE whenever this is retried: `CRISPASR_SIDON_QUANT_RPE=1`
+MUST produce silence. If it does not, the forced int-dot did not take and ARM A
+proves nothing — see the confirmed precedent of `ggml_flash_attn_ext_set_prec`
+being a silent no-op on sm_60, a hint the API accepts and the kernel ignores.
+Arms use the OLD GGUFs at /mnt/storage/gguf-models/sidon/ (RPE table still
+Q8_0/Q4_0); the republished HF ones are F16 and are NOT valid arms.
+
+
 
 Open: (a) reporter to run `CRISPASR_SIDON_RPE=expand` vs `=bucket` (confirms the
 op); (b) `tools/kaggle/sidon-quant-cuda/` — three arms per quant (fixed graph on
