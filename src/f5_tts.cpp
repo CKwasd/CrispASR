@@ -101,6 +101,34 @@ static bool f5_f16_act_enabled() {
     return v != 0;
 }
 
+// DiT attention: default to a manual mul_mat/soft_max_ext/mul_mat SDPA path (F32
+// throughout), which is correct on every backend. Fused ggml_flash_attn_ext is
+// faster but accumulates the KQ product in F16 on flash kernels that ignore the
+// GGML_PREC_F32 hint (observed on P100/sm_60) — measured to drift ~16x more than
+// f16-weight rounding alone on the 0.3B and to NaN on the deeper/wider 1B. So
+// flash is OPT-IN: CRISPASR_F5_FLASH=1 selects it (safe only where the prec hint
+// is honoured). CRISPASR_F5_NO_FLASH=1 is still accepted (forces manual) for
+// back-compat. TODO: replace the env gate with an init-time probe that runs both
+// paths once and auto-selects manual where they diverge (self-calibrating, no
+// hardware allowlist).
+static bool f5_use_flash_attn() {
+    // READ PER CALL, NOT CACHED IN A STATIC. A `static int v` initialised once
+    // per process makes this switch untestable in-process: flipping
+    // CRISPASR_F5_FLASH on a live context would change nothing, so an A/B of
+    // flash vs manual would silently compare one path against ITSELF and pass.
+    // This repo has shipped exactly that bug — tests/test_sidon_live.cpp
+    // compared one RPE mode against itself for its entire existence because
+    // CRISPASR_SIDON_RPE was read once in init. The measurements that justified
+    // this switch were all separate processes and are unaffected, but a gate
+    // that cannot be toggled is not a gate. getenv here is on the DiT
+    // graph-construction path, not a per-frame loop.
+    const char* no = crispasr_env::get("CRISPASR_F5_NO_FLASH");
+    const char* yes = crispasr_env::get("CRISPASR_F5_FLASH");
+    const bool force_manual = (no && *no && *no != '0');
+    const bool opt_in_flash = (yes && *yes && *yes != '0');
+    return opt_in_flash && !force_manual;
+}
+
 // Opt-in (#294): compute the InputEmbedding (input_proj + 2× grouped conv-pos +
 // Mish + residual) on the GPU backend instead of host BLAS/scalar. On the default
 // (32 steps) that host stage is ~26% of the ODE loop on M1 and a larger share on a
@@ -327,8 +355,12 @@ struct f5_dit_graph_cache {
     ggml_tensor* t_emb_in = nullptr;  // (dim,)  — timestep embedding (shared over B)
     ggml_tensor* pos_in = nullptr;    // (T,) i32 — constant [0..T-1] (shared over B)
     ggml_tensor* output = nullptr;    // (mel_dim, T, B) — velocity/velocities
+    // #387-adj DiT diff probe (CRISPASR_F5_DIT_PROBE): per-block residual-stream
+    // outputs, tapped as graph outputs so they survive gallocr for read-back.
+    std::vector<ggml_tensor*> block_taps;
 
     void reset() {
+        block_taps.clear();
         if (galloc) {
             ggml_gallocr_free(galloc);
             galloc = nullptr;
@@ -1191,10 +1223,31 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T, int B) {
         k = ggml_permute(cache.gctx, k, 0, 2, 1, 3);
         v = ggml_permute(cache.gctx, v, 0, 2, 1, 3);
 
-        // Flash attention (bidirectional, no mask)
+        // Attention (bidirectional, no mask). q/k/v are (head_dim, T, n_heads, B) here.
         float attn_scale = 1.0f / sqrtf((float)head_dim);
-        ggml_tensor* attn_out = ggml_flash_attn_ext(cache.gctx, q, k, v, nullptr, attn_scale, 0.0f, 0.0f);
-        attn_out = ggml_reshape_3d(cache.gctx, attn_out, dim, T, B);
+        ggml_tensor* attn_out;
+        if (f5_use_flash_attn()) {
+            // Fused flash-attention (opt-in). Request F32 KQ accumulation — honored
+            // by most backends, but silently ignored by some flash kernels (P100/
+            // sm_60), which is why manual SDPA is the default. Sibling backends
+            // (bark_tts, beat_this, chatterbox) set this hint too.
+            attn_out = ggml_flash_attn_ext(cache.gctx, q, k, v, nullptr, attn_scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
+        } else {
+            // Manual SDPA, F32 throughout — correct on every backend (default).
+            ggml_tensor* kq = ggml_mul_mat(cache.gctx, k, q); // (T_k, T_q, n_heads, B)
+            kq = ggml_soft_max_ext(cache.gctx, kq, nullptr, attn_scale, 0.0f);
+            ggml_tensor* v_t = ggml_cont(cache.gctx, ggml_transpose(cache.gctx, v)); // (T_k, head_dim, n_heads, B)
+            ggml_tensor* kqv = ggml_mul_mat(cache.gctx, v_t, kq);                    // (head_dim, T_q, n_heads, B)
+            // → (head_dim, n_heads, T, B), matching flash_attn_ext's output layout.
+            attn_out = ggml_cont(cache.gctx, ggml_permute(cache.gctx, kqv, 0, 2, 1, 3));
+        }
+        // Collapse heads to inner_dim = n_heads*head_dim, NOT dim: F5 Attention
+        // sets inner_dim independently (dim_head defaults to 64), so inner_dim !=
+        // dim in general (1B: dim=1408, inner=1536). attn_o then maps inner→dim.
+        // (0.3B is unaffected: inner==dim==1024 there.)
+        const int inner_dim = n_heads * head_dim;
+        attn_out = ggml_reshape_3d(cache.gctx, attn_out, inner_dim, T, B);
 
         // O-proj + gated residual
         ggml_tensor* attn_proj = ggml_mul_mat(cache.gctx, blk.attn_o_weight, A(attn_out));
@@ -1217,6 +1270,12 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T, int B) {
 
         // Gated residual
         x = ggml_add(cache.gctx, x_res, ggml_mul(cache.gctx, ff, gate_mlp));
+
+        // #387-adj: tap this block's residual-stream output for the DiT diff.
+        if (crispasr_env::present("CRISPASR_F5_DIT_PROBE")) {
+            ggml_set_output(x);
+            cache.block_taps.push_back(x);
+        }
     }
 
     // Final AdaLN + projection → velocity (mel_dim, T)
@@ -1243,6 +1302,10 @@ static bool f5_dit_cache_build(f5_tts_context* ctx, int T, int B) {
     // Build graph
     cache.gf = ggml_new_graph_custom(cache.gctx, 8192, false);
     ggml_build_forward_expand(cache.gf, cache.output);
+    // #387-adj: keep the tapped per-block outputs reachable so gallocr preserves
+    // them for read-back after compute.
+    for (ggml_tensor* tap : cache.block_taps)
+        ggml_build_forward_expand(cache.gf, tap);
 
     // Reserve then allocate memory layout on the compute backend (GPU when
     // use_gpu; falls back to backend_cpu otherwise). The DiT weights already
@@ -2702,6 +2765,14 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
     int mel_dim = hp.mel_dim;
     int text_dim = hp.text_dim;
 
+    // #387-adj: enable per-stage dumps (ode_step_N, vocos_input, …) from the
+    // environment so a real synthesis' ODE trajectory can be inspected without
+    // a CLI flag. Only sets when the caller hasn't already set a dump dir.
+    if (ctx->dump_dir.empty()) {
+        if (const char* dd = crispasr_env::get("CRISPASR_F5_DUMP_DIR"))
+            ctx->dump_dir = dd;
+    }
+
     // #387 vocoder-parity probe: CRISPASR_F5_VOCODE_MEL=<file>[:T] reads a raw
     // f32 mel (T × mel_dim, row-major), runs ONLY the vocoder, and returns the
     // audio — bypassing the DiT so the CPU HiFi-GAN can be diffed against the
@@ -2728,6 +2799,186 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
             fprintf(stderr, "f5_tts: VOCODE_MEL probe T=%d mel=%d → %zu samples\n", T, mel_dim, audio.size());
             return (int)audio.size();
         }
+    }
+
+    // #387-adj DiT diff probe: CRISPASR_F5_DIT_PROBE=<dir> injects a reference
+    // input-embed output (hidden.bin, T×dim f32) + timestep embedding
+    // (temb.bin, dim f32) straight into ONE DiT forward, then dumps our velocity
+    // (cpp_velocity.bin, T×mel) and every per-block residual output
+    // (cpp_block_<k>.bin, T×dim). Diffing these against the Python reference
+    // localizes the first divergent DiT stage without the ODE loop or the
+    // input/text front-end. shape.txt: "<T>".
+    if (const char* pdir = crispasr_env::get("CRISPASR_F5_DIT_PROBE")) {
+        const int dim = hp.dim;
+        std::string dir(pdir);
+        auto rd_bin = [&](const std::string& name, size_t nfloats) {
+            std::vector<float> v(nfloats);
+            FILE* f = fopen((dir + "/" + name).c_str(), "rb");
+            if (!f) {
+                fprintf(stderr, "f5_tts: DIT_PROBE missing %s\n", name.c_str());
+                return std::vector<float>();
+            }
+            size_t got = fread(v.data(), sizeof(float), nfloats, f);
+            fclose(f);
+            v.resize(got);
+            return v;
+        };
+        auto wr_bin = [&](const std::string& name, const std::vector<float>& v) {
+            FILE* f = fopen((dir + "/" + name).c_str(), "wb");
+            if (f) {
+                fwrite(v.data(), sizeof(float), v.size(), f);
+                fclose(f);
+            }
+        };
+        int T = 0;
+        if (FILE* sf = fopen((dir + "/shape.txt").c_str(), "r")) {
+            if (fscanf(sf, "%d", &T) != 1)
+                T = 0;
+            fclose(sf);
+        }
+        std::vector<float> hidden = rd_bin("hidden.bin", (size_t)T * dim);
+        std::vector<float> temb = rd_bin("temb.bin", (size_t)dim);
+        if (T > 0 && (int)hidden.size() == T * dim && (int)temb.size() == dim) {
+            std::vector<float> velocity = f5_dit_run(ctx, hidden.data(), T, temb.data());
+            wr_bin("cpp_velocity.bin", velocity);
+            auto& cache = ctx->dit_cache;
+            for (size_t k = 0; k < cache.block_taps.size(); k++) {
+                std::vector<float> b((size_t)T * dim);
+                ggml_backend_tensor_get(cache.block_taps[k], b.data(), 0, b.size() * sizeof(float));
+                wr_bin("cpp_block_" + std::to_string(k) + ".bin", b);
+            }
+            fprintf(stderr, "f5_tts: DIT_PROBE T=%d dim=%d → velocity + %zu block taps\n", T, dim,
+                    cache.block_taps.size());
+        } else {
+            fprintf(stderr, "f5_tts: DIT_PROBE bad inputs (T=%d hidden=%zu temb=%zu)\n", T, hidden.size(), temb.size());
+        }
+        *pcm_out = (float*)malloc(sizeof(float));
+        (*pcm_out)[0] = 0.0f;
+        *sample_rate_out = hp.sample_rate;
+        return 1;
+    }
+
+    // #387-adj input-path probe: CRISPASR_F5_INPUT_PROBE=<dir> reads the raw
+    // DiT inputs a reference forward used — x.bin (T×mel), cond.bin (T×mel),
+    // tokens.bin (nt i32, raw char indices), t.txt (float), shape.txt "<T> <nt>"
+    // — runs ONLY our input path and dumps cpp_temb.bin (dim), cpp_text_embed.bin
+    // (T×text_dim) and cpp_hidden.bin (T×dim). The DiT-block diff already proved
+    // the transformer stack byte-exact given matched hidden+temb, so this
+    // localizes the divergence to time-embed / text-encoder / input-embed.
+    if (const char* pdir = crispasr_env::get("CRISPASR_F5_INPUT_PROBE")) {
+        std::string dir(pdir);
+        auto rd = [&](const std::string& nm, size_t nf) {
+            std::vector<float> v(nf);
+            FILE* f = fopen((dir + "/" + nm).c_str(), "rb");
+            size_t got = f ? fread(v.data(), sizeof(float), nf, f) : 0;
+            if (f)
+                fclose(f);
+            v.resize(got);
+            return v;
+        };
+        auto wr = [&](const std::string& nm, const std::vector<float>& v) {
+            FILE* f = fopen((dir + "/" + nm).c_str(), "wb");
+            if (f) {
+                fwrite(v.data(), sizeof(float), v.size(), f);
+                fclose(f);
+            }
+        };
+        int T = 0, nt = 0;
+        float t_val = 0.5f;
+        if (FILE* sf = fopen((dir + "/shape.txt").c_str(), "r")) {
+            if (fscanf(sf, "%d %d", &T, &nt) != 2)
+                T = 0;
+            fclose(sf);
+        }
+        if (FILE* tf = fopen((dir + "/t.txt").c_str(), "r")) {
+            if (fscanf(tf, "%f", &t_val) != 1)
+                t_val = 0.5f;
+            fclose(tf);
+        }
+        std::vector<float> x = rd("x.bin", (size_t)T * mel_dim);
+        std::vector<float> cond = rd("cond.bin", (size_t)T * mel_dim);
+        std::vector<int32_t> tokens(nt);
+        if (FILE* kf = fopen((dir + "/tokens.bin").c_str(), "rb")) {
+            size_t got = fread(tokens.data(), sizeof(int32_t), nt, kf);
+            fclose(kf);
+            tokens.resize(got);
+        }
+        if (T > 0 && (int)x.size() == T * mel_dim && (int)cond.size() == T * mel_dim) {
+            std::vector<float> temb = compute_time_embed(ctx, t_val);
+            // COND arm (drop_audio_cond=false, drop_text=false)
+            std::vector<float> text_embed = compute_text_embed(ctx, tokens.data(), (int)tokens.size(), T);
+            std::vector<float> hidden =
+                f5_compute_hidden(ctx, x.data(), T, mel_dim, cond.data(), text_embed.data(), text_dim, false, false, 0);
+            wr("cpp_temb.bin", temb);
+            wr("cpp_text_embed.bin", text_embed);
+            wr("cpp_hidden.bin", hidden);
+            // UNCOND arm (CFG null: drop_audio_cond=true, drop_text=true) — the
+            // arm every earlier probe skipped; CFG amplifies its error 2×.
+            std::vector<float> text_embed_u =
+                compute_text_embed(ctx, tokens.data(), (int)tokens.size(), T, /*drop_text=*/true);
+            std::vector<float> hidden_u = f5_compute_hidden(ctx, x.data(), T, mel_dim, cond.data(), text_embed_u.data(),
+                                                            text_dim, /*drop_audio_cond=*/true, /*drop_text=*/true, 0);
+            std::vector<float> vel_u = f5_dit_run(ctx, hidden_u.data(), T, temb.data());
+            wr("cpp_text_embed_uncond.bin", text_embed_u);
+            wr("cpp_hidden_uncond.bin", hidden_u);
+            wr("cpp_velocity_uncond.bin", vel_u);
+            fprintf(stderr, "f5_tts: INPUT_PROBE T=%d nt=%zu → cond+uncond arms dumped\n", T, tokens.size());
+        } else {
+            fprintf(stderr, "f5_tts: INPUT_PROBE bad inputs (T=%d x=%zu cond=%zu)\n", T, x.size(), cond.size());
+        }
+        *pcm_out = (float*)malloc(sizeof(float));
+        (*pcm_out)[0] = 0.0f;
+        *sample_rate_out = hp.sample_rate;
+        return 1;
+    }
+
+    // #387-adj ODE trajectory probe: CRISPASR_F5_ODE_PROBE=<dir> injects a matched
+    // x0 (x0.bin, T×mel), cond (cond.bin, T×mel) and tokens (tokens.bin, nt i32),
+    // runs the FULL euler_solve, and dumps x at every step (ode_step_N.bin, via
+    // dump_dir) so the free-running trajectory can be diffed step-by-step against
+    // the reference — the ONLY probe that exposes compounding divergence (matched
+    // per-stage snapshots are structurally blind to it). shape.txt: "<T> <nt>".
+    if (const char* pdir = crispasr_env::get("CRISPASR_F5_ODE_PROBE")) {
+        std::string dir(pdir);
+        auto rd = [&](const std::string& nm, size_t nf) {
+            std::vector<float> v(nf);
+            FILE* f = fopen((dir + "/" + nm).c_str(), "rb");
+            size_t got = f ? fread(v.data(), sizeof(float), nf, f) : 0;
+            if (f)
+                fclose(f);
+            v.resize(got);
+            return v;
+        };
+        int T = 0, nt = 0;
+        if (FILE* sf = fopen((dir + "/shape.txt").c_str(), "r")) {
+            if (fscanf(sf, "%d %d", &T, &nt) != 2)
+                T = 0;
+            fclose(sf);
+        }
+        std::vector<float> x0 = rd("x0.bin", (size_t)T * mel_dim);
+        std::vector<float> cond = rd("cond.bin", (size_t)T * mel_dim);
+        std::vector<int32_t> tokens(nt);
+        if (FILE* kf = fopen((dir + "/tokens.bin").c_str(), "rb")) {
+            size_t got = fread(tokens.data(), sizeof(int32_t), nt, kf);
+            fclose(kf);
+            tokens.resize(got);
+        }
+        if (T > 0 && (int)x0.size() == T * mel_dim && (int)cond.size() == T * mel_dim) {
+            ctx->ref_init_noise = x0; // euler_solve uses this as y0
+            ctx->dump_dir = dir;      // euler_solve dumps ode_step_N here
+            std::vector<float> text_emb = compute_text_embed(ctx, tokens.data(), (int)tokens.size(), T);
+            std::vector<float> text_emb_u =
+                compute_text_embed(ctx, tokens.data(), (int)tokens.size(), T, /*drop_text=*/true);
+            std::vector<float> gen = euler_solve(ctx, cond, text_emb, text_emb_u, T, mel_dim, text_dim);
+            fprintf(stderr, "f5_tts: ODE_PROBE T=%d nt=%zu → trajectory dumped (%zu final)\n", T, tokens.size(),
+                    gen.size());
+        } else {
+            fprintf(stderr, "f5_tts: ODE_PROBE bad inputs (T=%d x0=%zu cond=%zu)\n", T, x0.size(), cond.size());
+        }
+        *pcm_out = (float*)malloc(sizeof(float));
+        (*pcm_out)[0] = 0.0f;
+        *sample_rate_out = hp.sample_rate;
+        return 1;
     }
 
     // ── Text preparation ──
@@ -2789,6 +3040,13 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
     // guard (a bad/too-long ref transcript must not collapse the rate to zero),
     // but only a very loose UPPER guard that catches a garbage near-empty
     // transcript (which would explode the duration) — not genuinely slow speech.
+    // KNOWN DELTA vs Raon's utils_infer.py (#387-adj, not yet ported): the
+    // upstream Raon inference sets local_speed = 0.3 when the gen text is < 10
+    // UTF-8 bytes, i.e. ~3.3x MORE frames for very short prompts (one-word
+    // synthesis). It also clamps sec_per_byte to a 12 chars/s floor via VAD. We
+    // do neither, so a one-word --tts will be rushed/truncated on BOTH 0.3B and
+    // 1B. Harmless for normal-length text (the clamp/local_speed don't fire).
+    // TODO: port the <10-byte local_speed=0.3 branch + the 12 c/s VAD clamp.
     float rate = (float)ref_T / (float)std::max(1, ref_text_len);
     // The clamp is an ADD-ON over the upstream formula (which has no clamp); gate
     // it so it can be switched off. CRISPASR_F5_DURATION_CLAMP=0 restores the

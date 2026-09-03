@@ -31,7 +31,7 @@ MODELS.mkdir(parents=True, exist_ok=True)
 RESULTS = WORK / "raon_roundtrip.json"
 
 CRISPASR_URL = "https://github.com/CrispStrobe/CrispASR.git"
-CRISPASR_REF = os.environ.get("CRISPASR_REF", "main")
+CRISPASR_REF = os.environ.get("CRISPASR_REF", "feat/raon-opentts-1b")
 CLONE = TMP / "CrispASR"
 
 GEN_TEXT = "The quick brown fox jumps over the lazy dog near the riverbank."
@@ -102,7 +102,7 @@ step("built", cli=str(CLI))
 # ── models: raon GGUF + whisper-tiny + a real English reference clip ───────
 # Size-parameterized: RAON_SIZE=0.3B (default) uses --backend raon; 1B uses
 # --backend raon-1b. Same sbhifigan16k vocoder + mel front-end either way.
-SIZE = os.environ.get("RAON_SIZE", "0.3B")
+SIZE = os.environ.get("RAON_SIZE", "1B")  # baked 1B variant
 BACKEND = {"0.3B": "raon", "1B": "raon-1b"}[SIZE]
 GGUF_FILE = f"raon-opentts-{SIZE.lower()}-f16.gguf"
 gguf = hf_hub_download(f"cstr/raon-opentts-{SIZE.lower()}-GGUF", GGUF_FILE,
@@ -113,6 +113,13 @@ whisper = MODELS / "ggml-tiny.en.bin"
 ref_wav = CLONE / "samples" / "jfk.wav"
 ref_text = "And so my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
 step("models", gguf=os.path.basename(gguf), whisper=whisper.exists(), ref=ref_wav.exists())
+
+# Exercise the SHIPPED DEFAULT: f5 now defaults to manual SDPA (correct on P100/
+# sm_60 where the flash prec hint is ignored). Force nothing here — a PASS proves
+# the default is correct out of the box, which is what makes the merge safe.
+os.environ.pop("CRISPASR_F5_NO_FLASH", None)
+os.environ.pop("CRISPASR_F5_FLASH", None)
+step("attn_mode", forced=None, note="shipped default (manual)")
 
 # ── synth (GPU DiT + GPU HiFi-GAN, #387) ─────────────────────────────────────────
 out_wav = WORK / "raon_synth.wav"
