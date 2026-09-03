@@ -2578,6 +2578,13 @@ extern "C" struct kokoro_context_params kokoro_context_default_params(void) {
     return p;
 }
 
+extern "C" struct kokoro_context* kokoro_context_create_for_testing(struct kokoro_context_params params) {
+    auto* c = new kokoro_context();
+    c->params = params;
+    c->n_threads = params.n_threads > 0 ? params.n_threads : 4;
+    return c;
+}
+
 extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, struct kokoro_context_params params) {
     if (!path_model) {
         fprintf(stderr, "kokoro: null model path\n");
@@ -3611,6 +3618,12 @@ extern "C" void kokoro_set_length_scale(struct kokoro_context* ctx, float scale)
     if (scale > 4.0f)
         scale = 4.0f;
     ctx->params.length_scale = scale;
+}
+
+extern "C" float kokoro_get_length_scale(const struct kokoro_context* ctx) {
+    if (!ctx)
+        return 1.0f;
+    return ctx->params.length_scale;
 }
 
 extern "C" void kokoro_free(struct kokoro_context* ctx) {

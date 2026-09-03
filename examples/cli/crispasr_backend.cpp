@@ -468,6 +468,7 @@ static constexpr feature_col kFeatures[] = {
     {"beats", CAP_BEATS},
     {"tab", CAP_TAB},
     {"piano", CAP_PIANO},
+    {"tts-speed", CAP_TTS_SPEED},
 };
 
 void crispasr_print_backend_matrix() {
@@ -550,6 +551,7 @@ static constexpr cap_slug kCapSlugs[] = {
     {"beats", CAP_BEATS},
     {"tab", CAP_TAB},
     {"piano", CAP_PIANO},
+    {"tts-speed", CAP_TTS_SPEED},
 };
 
 void crispasr_print_backend_matrix_json() {
