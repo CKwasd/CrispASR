@@ -1399,7 +1399,12 @@ extern "C" struct mt3_context* mt3_init_from_file(const char* path, struct mt3_p
             // On a box with no GPU this hands back a *second* CPU backend.
             // Taking it would put two CPU backends in the scheduler and print
             // a misleading "GPU backend enabled (CPU)" line, so drop it.
-            if (gpu && ggml_backend_is_cpu(gpu)) {
+            // core_cpu_backend::is_cpu, NOT ggml_backend_is_cpu: under
+            // GGML_BACKEND_DL (#355) the CPU backend is a dlopen-ed module and
+            // that symbol is not linkable, so a direct call builds everywhere
+            // except the linux-backend-dl job — which is exactly where it
+            // failed (undefined reference, run 33712251884).
+            if (gpu && core_cpu_backend::is_cpu(gpu)) {
                 ggml_backend_free(gpu);
                 gpu = nullptr;
             }
