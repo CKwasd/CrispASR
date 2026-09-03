@@ -151,41 +151,51 @@ path — the gate moved to the OLD path, never removed.
 With no env set, sidon / beat-this / cosyvoice3 all now report zero broadcasting
 quantized matmuls. Unit suite 1780/1780.
 
-**The int-dot arm: BOTH routes closed, recorded as open rather than closed.**
-The fix in 6b396bb9 has still never EXECUTED on a device taking ggml's MMQ path.
-It stands on the code-path argument, CPU equivalence, and the reporter's own
-confirmation — which is real evidence, but not the same thing.
+**Mechanism PROVEN on the affected hardware; only the exact code path is
+unexercised.** Earlier notes here overstated the gap and are corrected.
 
-*Route 1, local lavapipe (forced int-dot).* Compiler solved: LunarG's SDK glslc
-(shaderc v2026.3) compiles `dotPacked4x8AccSatEXT`, where Ubuntu's emits the
-exact "extension not supported" string ggml's CMake probe matches — so
-`-DVulkan_GLSLC_EXECUTABLE=/mnt/volume1/tmp-overflow/1.4.357.1/x86_64/bin/glslc`
-turns the MMQ pipelines ON (configure confirms "GL_EXT_integer_dot_product
-supported by glslc"). BLOCKED ON MEMORY, structurally: ggml's generated
-`mul_mm.comp.cpp` is a 122 MB single TU needing ~2-3 GB, while the box holds
-4.3 GB resident across 17 concurrent Claude sessions. That does not drain with
-time, so polling a free-MB threshold cannot succeed — poll
-`pgrep -c -f 'cc1plus|clang++|nvcc'` reaching 0 instead. Two attempts OOM-killed
-(gcc at 777 MB, clang at 1.75 GB); clang peaks 1.16 GB vs gcc, so use clang at
--j1. Note ggml's own "int dot: %d" device line prints a LOCAL variable holding
-raw extension presence, NOT the gated `device->integer_dot_product` — it reads
-identically with and without the force flag and cannot confirm the flag took.
+The reporter ran four arms on their own GTX 1660 SUPER (`int dot: 1`):
 
-*Route 2, Kaggle.* DEAD, and structurally rather than by lottery
-(`tools/kaggle/sidon-vulkan-probe`, 79236e62). The image ships no NVIDIA Vulkan
-ICD — only intel/lvp/radeon/virtio — and its only Vulkan device is llvmpipe, so
-a Kaggle run would test nothing a local lavapipe run doesn't. Installing
-libnvidia-gl-580 places `nvidia_icd.json` but then vulkaninfo enumerates ZERO
-devices, llvmpipe included: the distro ICD does not match Kaggle's injected
-container driver and breaks the loader. A T4 draw would not help. (It was also
-the 7th consecutive P100.)
+| arm | mean_volume | establishes |
+|---|---|---|
+| new GGUF, default | -19.9 dB | re-quantized files fix it with no new binary |
+| old GGUF, default | -91.0 dB | reproduces the original bug |
+| old GGUF, `RPE=expand` | **-20.0 dB** | quantized matmul in GENERAL is fine on that GPU |
+| old GGUF, `RPE=bucket` | -91.0 dB | it is specifically the BROADCAST RPE matmul |
 
-⚠ ARM B REMAINS THE GATE whenever this is retried: `CRISPASR_SIDON_QUANT_RPE=1`
-MUST produce silence. If it does not, the forced int-dot did not take and ARM A
-proves nothing — see the confirmed precedent of `ggml_flash_attn_ext_set_prec`
-being a silent no-op on sm_60, a hint the API accepts and the kernel ignores.
-Arms use the OLD GGUFs at /mnt/storage/gguf-models/sidon/ (RPE table still
-Q8_0/Q4_0); the republished HF ones are F16 and are NOT valid arms.
+The `expand` arm is the important one, and it does more than isolate the bug:
+`expand` dequantizes the table with `ggml_get_rows(l.distance_w, rel_idx)`
+(sidon.cpp:477) and then does an F32xF32 matmul — the SAME mechanism the fix
+applies at sidon.cpp:520 via `ggml_get_rows(dist_w, bucket_ids)`. So "gather the
+quantized table to F32 before the multiply" is confirmed to fix this ON THE
+HARDWARE THAT EXHIBITED IT. The two differ only in the index shape (T*T vs 73
+buckets) and hence output shape, not in whether a quantized weight reaches MMQ.
+
+Residual risk is therefore narrow and nameable: the fix's specific 73-element
+gather has not itself run on an int-dot device. Vulkan `get_rows` for
+q4_0/q8_0/q4_K at these shapes was verified via test-backend-ops on lavapipe,
+and the detector shows the fix removes every broadcasting quantized matmul
+(sidon 8->0, beat-this 29->0, cosyvoice3 133->0).
+
+**THE FIX IS UNRELEASED.** 6b396bb9 is not in v0.8.31, which is what the
+reporter runs — so users who downloaded the old quantized GGUFs and never
+re-download are still exposed, and the runtime fix is the only thing that would
+protect them. Shipping a release is the concrete remaining action on this issue.
+
+Verification routes for the exact path, all three now closed with evidence:
+- *local Vulkan* — one build away, glslc solved (LunarG SDK shaderc v2026.3 at
+  /mnt/volume1/tmp-overflow/1.4.357.1/x86_64/bin/glslc; configure prints
+  "GL_EXT_integer_dot_product supported by glslc"). Blocked on memory: ggml's
+  generated mul_mm.comp.cpp is a 122 MB single TU needing ~2-3 GB, while the box
+  holds ~4.3 GB across 17 Claude sessions AND SwapFree sits at ~1%, so
+  MemAvailable is not the binding constraint and a build can OOM-kill another
+  session (one peer lost its context this way). Use clang (peak 1.16 GB vs gcc),
+  -j1, and 4a's `set_source_files_properties(... "-O0")` on the shader TUs.
+- *Kaggle Vulkan* — dead structurally: no NVIDIA ICD, only llvmpipe; installing
+  libnvidia-gl-580 places nvidia_icd.json and then enumerates ZERO devices.
+- *Kaggle CUDA* — not answerable today: ~20 consecutive P100 draws across both
+  accounts (sm_60 is below `GGML_CUDA_CC_DP4A == 610`, so MMQ is off). The
+  fail-fast guard made each bad draw ~1 min rather than a wasted run.
 
 
 
