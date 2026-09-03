@@ -285,6 +285,14 @@ struct nemotron_context {
     ggml_cgraph* cached_enc_gf = nullptr;
     std::vector<uint8_t> cached_enc_meta;
     int cached_enc_T_mel = 0;
+
+    // Persistent backend-resident F32 prompt weights. Keeping the dequantized
+    // weights matches the legacy CPU prompt math while avoiding conversion and
+    // upload on every transcription.
+    ggml_context* prompt_f32_ctx = nullptr;
+    ggml_backend_buffer_t prompt_f32_buf = nullptr;
+    ggml_tensor* prompt_l0_w_f32 = nullptr;
+    ggml_tensor* prompt_l2_w_f32 = nullptr;
 };
 
 struct nemotron_stream_layer_graph {
@@ -300,6 +308,46 @@ struct nemotron_stream_layer_graph {
     }
 };
 using nemotron_stream_graph_cache = std::map<std::tuple<int, int, int>, std::unique_ptr<nemotron_stream_layer_graph>>;
+
+// Persistent cache storage for one-shot GPU streaming. Attention cache stores
+// post-FFN1 channel state, matching the existing host k_cache semantics.
+// Two banks avoid overlapping copies when the L-frame window rolls forward.
+struct nemotron_stream_device_cache {
+    ggml_context* ctx0 = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_tensor* attn = nullptr;      // (d, L, n_layers, 2 banks)
+    ggml_tensor* conv = nullptr;      // (d, K-1, n_layers, 2 banks)
+    ggml_tensor* conv_zero = nullptr; // (d, K-1), permanently zero
+
+    nemotron_stream_device_cache() = default;
+    nemotron_stream_device_cache(const nemotron_stream_device_cache&) = delete;
+    nemotron_stream_device_cache& operator=(const nemotron_stream_device_cache&) = delete;
+    ~nemotron_stream_device_cache() {
+        if (buf)
+            ggml_backend_buffer_free(buf);
+        if (ctx0)
+            ggml_free(ctx0);
+    }
+};
+
+struct nemotron_stream_device_chunk_graph {
+    std::vector<uint8_t> meta;
+    ggml_context* ctx0 = nullptr;
+    ggml_cgraph* gf = nullptr;
+    ggml_tensor* block_in = nullptr;
+    ggml_tensor* block_out = nullptr;
+    ggml_tensor* pos_enc = nullptr;
+
+    nemotron_stream_device_chunk_graph() = default;
+    nemotron_stream_device_chunk_graph(const nemotron_stream_device_chunk_graph&) = delete;
+    nemotron_stream_device_chunk_graph& operator=(const nemotron_stream_device_chunk_graph&) = delete;
+    ~nemotron_stream_device_chunk_graph() {
+        if (ctx0)
+            ggml_free(ctx0);
+    }
+};
+using nemotron_stream_device_graph_cache =
+    std::map<std::tuple<int, int, int, int>, std::unique_ptr<nemotron_stream_device_chunk_graph>>;
 
 // ===========================================================================
 // Helpers
@@ -738,9 +786,48 @@ static std::vector<float> nemotron_compute_mel_impl(nemotron_context* ctx, const
 // Flatten: 17 * 256 = 4352 input to the final linear.
 // ===========================================================================
 
+// ---------------------------------------------------------------------------
+// PR #424 optimisation gates (opt-in).
+//
+// The GPU fast paths from #424 measured a REAL, DETERMINISTIC output difference
+// against the merge base on the chunked/streamed GPU arm — single-token
+// doublings, e.g. "не" -> "не не". RNNT emits per frame with no dedup, so one
+// borderline logit flip re-emits a token; the shape is a numerics difference,
+// not a cache replaying audio. The CPU arm, the GPU one-shot arms and both
+// cross-utterance leak shapes were byte-identical.
+//
+// The failing arm bundles FOUR independent changes, so the cause is not
+// attributable from it: the device-resident stream cache, direct convolutions
+// (a different accumulation ORDER than im2col+GEMM, an F32-level numerics
+// source on its own), the batched GPU joint.enc projection, and the GPU prompt
+// MLP. Rather than delete a plausible ~large speedup or ship an unexplained
+// output change, each is gated and DEFAULT-OFF, so main is byte-identical to
+// the merge base unless someone opts in — and so the cause can be bisected in
+// the order measured most-to-least borderline-sensitive:
+//
+//   1. CRISPASR_NEMOTRON_GPU_JOINT        batched joint.enc  (most sensitive)
+//   2. CRISPASR_NEMOTRON_GPU_DIRECT_CONV  direct convolutions
+//   3. CRISPASR_NEMOTRON_GPU_STREAM_CACHE device-resident streaming cache
+//   4. CRISPASR_NEMOTRON_GPU_PROMPT       GPU prompt MLP
+//   CRISPASR_NEMOTRON_GPU_FASTPATH=1      enables all four at once
+//
+// READ PER CALL, NEVER CACHED IN A STATIC. A `static const bool` initialised
+// from getenv is evaluated once per process, so flipping the variable on a live
+// context changes nothing and an A/B silently compares a path against itself —
+// a bug this repo has shipped before (tests/test_sidon_live.cpp compared one
+// RPE mode against itself for its entire existence). The getenv is on graph
+// construction paths, not in a per-frame loop.
+static bool nemotron_opt_enabled(const char* var) {
+    if (const char* all = getenv("CRISPASR_NEMOTRON_GPU_FASTPATH"))
+        if (all[0] && all[0] != '0')
+            return true;
+    const char* e = getenv(var);
+    return e && e[0] && e[0] != '0';
+}
+
 static ggml_tensor* nemotron_build_pre_encode(ggml_context* ctx0, ggml_tensor* mel,
                                               const core_conformer::PreEncodeWeights& w, int subsampling_channels,
-                                              int* out_T_enc) {
+                                              int* out_T_enc, bool use_direct_conv) {
     auto bias_4d = [&](ggml_tensor* b) {
         return ggml_cast(ctx0, ggml_reshape_4d(ctx0, b, 1, 1, b->ne[0], 1), GGML_TYPE_F32);
     };
@@ -753,26 +840,36 @@ static ggml_tensor* nemotron_build_pre_encode(ggml_context* ctx0, ggml_tensor* m
         return ggml_pad_ext(ctx0, x, /*lp0*/ 2, /*rp0*/ 1, /*lp1*/ 2, /*rp1*/ 1, 0, 0, 0, 0);
     };
 
+    // Use direct convolution kernels when enabled, otherwise fall back to the standard ggml convolution ops.
+    auto conv2d = [&](ggml_tensor* kernel, ggml_tensor* input, int s0, int s1) -> ggml_tensor* {
+        return use_direct_conv ? ggml_conv_2d_direct(ctx0, kernel, input, s0, s1, 0, 0, 1, 1)
+                               : ggml_conv_2d(ctx0, kernel, input, s0, s1, 0, 0, 1, 1);
+    };
+    auto conv2d_dw = [&](ggml_tensor* kernel, ggml_tensor* input, int s0, int s1) -> ggml_tensor* {
+        return use_direct_conv ? ggml_conv_2d_dw_direct(ctx0, kernel, input, s0, s1, 0, 0, 1, 1)
+                               : ggml_conv_2d_dw(ctx0, kernel, input, s0, s1, 0, 0, 1, 1);
+    };
+
     // Stage 0: Conv2d(1, C, k=3, s=2) with causal padding
-    ggml_tensor* cur = ggml_conv_2d(ctx0, w.conv0_w, causal_pad(mel), 2, 2, 0, 0, 1, 1);
+    ggml_tensor* cur = conv2d(w.conv0_w, causal_pad(mel), 2, 2);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv0_b));
     cur = ggml_relu(ctx0, cur);
 
     // Stage 2: DW Conv2d(C, k=3, s=2) with causal padding
-    cur = ggml_conv_2d_dw(ctx0, w.conv2_w, causal_pad(cur), 2, 2, 0, 0, 1, 1);
+    cur = conv2d_dw(w.conv2_w, causal_pad(cur), 2, 2);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv2_b));
 
     // Stage 3: PW Conv2d(C, C, k=1, s=1) — no padding
-    cur = ggml_conv_2d(ctx0, w.conv3_w, cur, 1, 1, 0, 0, 1, 1);
+    cur = conv2d(w.conv3_w, cur, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv3_b));
     cur = ggml_relu(ctx0, cur);
 
     // Stage 5: DW Conv2d(C, k=3, s=2) with causal padding
-    cur = ggml_conv_2d_dw(ctx0, w.conv5_w, causal_pad(cur), 2, 2, 0, 0, 1, 1);
+    cur = conv2d_dw(w.conv5_w, causal_pad(cur), 2, 2);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv5_b));
 
     // Stage 6: PW Conv2d(C, C, k=1, s=1)
-    cur = ggml_conv_2d(ctx0, w.conv6_w, cur, 1, 1, 0, 0, 1, 1);
+    cur = conv2d(w.conv6_w, cur, 1, 1);
     cur = ggml_add(ctx0, cur, bias_4d(w.conv6_b));
     cur = ggml_relu(ctx0, cur);
 
@@ -820,6 +917,11 @@ static std::vector<ggml_fp16_t> build_window_mask(int T, int left, int right) {
     return mask;
 }
 
+struct nemotron_stream_block_outputs {
+    ggml_tensor* cache_ch = nullptr;
+    ggml_tensor* conv_cache = nullptr;
+};
+
 // ---- Streaming block: split into stages with separate cache inputs ----
 // new_in:    (d, T_new) — new frames for this chunk
 // cache_ch:  (d, T_cache) — cached post-FFN1 frames from previous chunks (or nullptr)
@@ -831,7 +933,8 @@ static std::vector<ggml_fp16_t> build_window_mask(int T, int left, int right) {
 static ggml_tensor* nemotron_build_block_streaming(ggml_context* ctx0, ggml_tensor* new_in, ggml_tensor* cache_ch,
                                                    ggml_tensor* conv_cache_in, ggml_tensor* pos_enc, int T_new,
                                                    int T_cache, const nemotron_enc_layer& e,
-                                                   const core_conformer::BlockParams& p) {
+                                                   const core_conformer::BlockParams& p,
+                                                   nemotron_stream_block_outputs* outputs = nullptr) {
     const int d = p.d;
     const int n_heads = p.n_heads;
     const int head_dim = p.head_dim;
@@ -858,6 +961,9 @@ static ggml_tensor* nemotron_build_block_streaming(ggml_context* ctx0, ggml_tens
     ggml_tensor* post_ffn1_new = ggml_dup(ctx0, cur);
     ggml_set_name(post_ffn1_new, "cache_ch_out");
     ggml_set_output(post_ffn1_new);
+    if (outputs) {
+        outputs->cache_ch = post_ffn1_new;
+    }
 
     // ---- Self-attention: Q from new, K/V from [cache, new] ----
     ggml_tensor* inpAttn = cur;
@@ -895,8 +1001,10 @@ static ggml_tensor* nemotron_build_block_streaming(ggml_context* ctx0, ggml_tens
     Q_v = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Q_v, head_dim, n_heads, T_new), 0, 2, 1, 3);
     K_ = ggml_permute(ctx0, ggml_reshape_3d(ctx0, K_, head_dim, n_heads, T_full), 0, 2, 1, 3);
     R = ggml_permute(ctx0, ggml_reshape_3d(ctx0, R, head_dim, n_heads, 2 * T_full - 1), 0, 2, 1, 3);
-    ggml_tensor* V_ =
-        ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, V, head_dim, n_heads, T_full), 0, 2, 1, 3));
+
+    // Keep Q/K/V as permuted views; flash_attn_ext consumes this layout directly,
+    // so materializing them with ggml_cont would only add redundant copies.
+    ggml_tensor* V_ = ggml_permute(ctx0, ggml_reshape_3d(ctx0, V, head_dim, n_heads, T_full), 0, 2, 1, 3);
 
     // BD = rel_shift(Q_v @ R^T): asymmetric version for Q(T_new) × K(T_full).
     // BD_raw shape: (2*T_full-1, T_new, n_heads).
@@ -912,8 +1020,7 @@ static ggml_tensor* nemotron_build_block_streaming(ggml_context* ctx0, ggml_tens
     ggml_tensor* BD_scaled = ggml_scale(ctx0, BD_c, scale);
     ggml_tensor* BD_mask = ggml_cast(ctx0, BD_scaled, GGML_TYPE_F16);
 
-    ggml_tensor* attn_out =
-        ggml_flash_attn_ext(ctx0, ggml_cont(ctx0, Q_u), ggml_cont(ctx0, K_), V_, BD_mask, scale, 0.0f, 0.0f);
+    ggml_tensor* attn_out = ggml_flash_attn_ext(ctx0, Q_u, K_, V_, BD_mask, scale, 0.0f, 0.0f);
     attn_out = ggml_reshape_2d(ctx0, attn_out, d, T_new);
 
     attn_out = mm_bias(e.attn_out_w, attn_out, e.attn_out_b);
@@ -943,6 +1050,9 @@ static ggml_tensor* nemotron_build_block_streaming(ggml_context* ctx0, ggml_tens
         conv_cache_new = ggml_cont(ctx0, conv_cache_new);
         ggml_set_name(conv_cache_new, "conv_cache_out");
         ggml_set_output(conv_cache_new);
+        if (outputs) {
+            outputs->conv_cache = conv_cache_new;
+        }
     }
 
     // DW conv: prepend conv cache (or zero-pad) for left context
@@ -1058,10 +1168,11 @@ static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, g
         attn_mask = ggml_cast(ctx0, BD_scaled, GGML_TYPE_F16);
     }
 
-    ggml_tensor* V_ = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, V, head_dim, n_heads, T), 0, 2, 1, 3));
+    // Keep Q/K/V as permuted views; flash_attn_ext consumes this layout directly,
+    // so materializing them with ggml_cont would only add redundant copies.
+    ggml_tensor* V_ = ggml_permute(ctx0, ggml_reshape_3d(ctx0, V, head_dim, n_heads, T), 0, 2, 1, 3);
 
-    ggml_tensor* attn_out =
-        ggml_flash_attn_ext(ctx0, ggml_cont(ctx0, Q_u), ggml_cont(ctx0, K_), V_, attn_mask, scale, 0.0f, 0.0f);
+    ggml_tensor* attn_out = ggml_flash_attn_ext(ctx0, Q_u, K_, V_, attn_mask, scale, 0.0f, 0.0f);
     attn_out = ggml_reshape_2d(ctx0, attn_out, d, T);
 
     attn_out = mm_bias(e.attn_out_w, attn_out, e.attn_out_b);
@@ -1088,7 +1199,6 @@ static ggml_tensor* nemotron_build_block(ggml_context* ctx0, ggml_tensor* cur, g
     // Output has T + (K-1) time frames due to excess right padding. Trim to T.
     // Conv output shape: (T+K-1, 1, d, 1). Take view of first T frames.
     {
-        int64_t T_conv = cnv->ne[0]; // T + K - 1
         cnv = ggml_view_4d(ctx0, cnv, T, cnv->ne[1], cnv->ne[2], cnv->ne[3], cnv->nb[1], cnv->nb[2], cnv->nb[3], 0);
         cnv = ggml_cont(ctx0, cnv);
     }
@@ -1144,7 +1254,9 @@ static ggml_cgraph* nemotron_build_graph_encoder(nemotron_context* ctx, int T_me
 
     // ----- Causal pre-encode (asymmetric padding, 17 freq bins) -----
     int T = 0;
-    ggml_tensor* cur = nemotron_build_pre_encode(ctx0, mel, m.pre_encode, (int)hp.subsampling_channels, &T);
+    ggml_tensor* cur = nemotron_build_pre_encode(ctx0, mel, m.pre_encode, (int)hp.subsampling_channels, &T,
+                                                 ctx->backend != ctx->backend_cpu &&
+                                                     nemotron_opt_enabled("CRISPASR_NEMOTRON_GPU_DIRECT_CONV"));
 
     // nemotron has xscaling=false, so no scaling step
 
@@ -1382,7 +1494,7 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
         // Also expand cache outputs — they're not reachable from block_out's
         // dependency tree. Find them by scanning the ggml context's tensor list.
         for (ggml_tensor* t = ggml_get_first_tensor(lg->ctx0); t; t = ggml_get_next_tensor(lg->ctx0, t)) {
-            if (t->name && (std::string(t->name) == "cache_ch_out" || std::string(t->name) == "conv_cache_out")) {
+            if (std::strcmp(t->name, "cache_ch_out") == 0 || std::strcmp(t->name, "conv_cache_out") == 0) {
                 ggml_build_forward_expand(lg->gf, t);
             }
         }
@@ -1394,6 +1506,207 @@ static bool nemotron_run_encoder_chunked(nemotron_context* ctx, const float* pre
 
     if (!nemotron_ensure_sched(ctx))
         return false;
+
+    // One-shot GPU fast path: keep per-layer streaming state on-device across
+    // chunks. Persistent nemotron_stream sessions own host caches and use the
+    // general path below.
+    if (ctx->backend != ctx->backend_cpu && nemotron_opt_enabled("CRISPASR_NEMOTRON_GPU_STREAM_CACHE") &&
+        stream_cache == nullptr && reset_cache && L >= chunk_size) {
+        // Allocate two persistent cache banks directly on the selected backend.
+        // This mirrors the persistent KV-cache pattern used by the decoder
+        // backends: graph ggml_cpy nodes write state into tensors whose backend
+        // buffer survives scheduler resets and subsequent graph submissions.
+        nemotron_stream_device_cache dev_cache;
+        const size_t cache_meta = ggml_tensor_overhead() * 8 + 4096;
+        ggml_init_params cip = {cache_meta, nullptr, true};
+        dev_cache.ctx0 = ggml_init(cip);
+        if (!dev_cache.ctx0) {
+            fprintf(stderr, "nemotron: failed to create GPU streaming-cache context\n");
+            return false;
+        }
+        dev_cache.attn = ggml_new_tensor_4d(dev_cache.ctx0, GGML_TYPE_F32, d, L, n_layers, 2);
+        dev_cache.conv = ggml_new_tensor_4d(dev_cache.ctx0, GGML_TYPE_F32, d, K - 1, n_layers, 2);
+        dev_cache.conv_zero = ggml_new_tensor_2d(dev_cache.ctx0, GGML_TYPE_F32, d, K - 1);
+        ggml_set_name(dev_cache.attn, "nemotron_stream_attn_cache");
+        ggml_set_name(dev_cache.conv, "nemotron_stream_conv_cache");
+        ggml_set_name(dev_cache.conv_zero, "nemotron_stream_conv_zero");
+        dev_cache.buf = ggml_backend_alloc_ctx_tensors(dev_cache.ctx0, ctx->backend);
+        if (!dev_cache.buf) {
+            fprintf(stderr, "nemotron: failed to allocate GPU streaming-cache buffer\n");
+            return false;
+        }
+        ggml_backend_buffer_clear(dev_cache.buf, 0);
+
+        // Graphs contain views into dev_cache, so their lifetime must not outlive
+        // this per-call device cache.
+        nemotron_stream_device_graph_cache device_graphs;
+
+        auto get_or_build_device_chunk = [&](int T_new, int T_cache, bool has_conv_cache,
+                                             int src_bank) -> nemotron_stream_device_chunk_graph& {
+            // Bank offsets are baked into ggml_view nodes, so src_bank is part of the
+            // graph-cache key even when all tensor shapes are otherwise identical.
+            auto key = std::make_tuple(T_new, T_cache, has_conv_cache ? 1 : 0, src_bank);
+            auto it = device_graphs.find(key);
+            if (it != device_graphs.end())
+                return *it->second;
+
+            const int dst_bank = 1 - src_bank;
+            const size_t graph_size = 8192;
+            const size_t msz = ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false);
+            auto cg = std::make_unique<nemotron_stream_device_chunk_graph>();
+            cg->meta.resize(msz);
+            ggml_init_params ip2 = {msz, cg->meta.data(), true};
+            cg->ctx0 = ggml_init(ip2);
+            cg->gf = ggml_new_graph_custom(cg->ctx0, graph_size, false);
+
+            cg->block_in = ggml_new_tensor_2d(cg->ctx0, GGML_TYPE_F32, d, T_new);
+            ggml_set_name(cg->block_in, "block_in");
+            ggml_set_input(cg->block_in);
+
+            const int T_full = T_cache + T_new;
+            cg->pos_enc = ggml_new_tensor_2d(cg->ctx0, GGML_TYPE_F32, d, 2 * T_full - 1);
+            ggml_set_name(cg->pos_enc, "pos_enc");
+            ggml_set_input(cg->pos_enc);
+
+            ggml_tensor* cur = cg->block_in;
+            for (int il = 0; il < n_layers; il++) {
+                const size_t attn_src_base =
+                    (size_t)src_bank * dev_cache.attn->nb[3] + (size_t)il * dev_cache.attn->nb[2];
+                const size_t attn_dst_base =
+                    (size_t)dst_bank * dev_cache.attn->nb[3] + (size_t)il * dev_cache.attn->nb[2];
+                const size_t conv_src_base =
+                    (size_t)src_bank * dev_cache.conv->nb[3] + (size_t)il * dev_cache.conv->nb[2];
+                const size_t conv_dst_base =
+                    (size_t)dst_bank * dev_cache.conv->nb[3] + (size_t)il * dev_cache.conv->nb[2];
+
+                ggml_tensor* cache_ch = nullptr;
+                if (T_cache > 0) {
+                    cache_ch = ggml_view_2d(cg->ctx0, dev_cache.attn, d, T_cache, dev_cache.attn->nb[1], attn_src_base);
+                }
+
+                ggml_tensor* conv_cache_in = nullptr;
+                if (has_conv_cache) {
+                    conv_cache_in =
+                        ggml_view_2d(cg->ctx0, dev_cache.conv, d, K - 1, dev_cache.conv->nb[1], conv_src_base);
+                }
+
+                nemotron_stream_block_outputs outputs{};
+                cur = nemotron_build_block_streaming(cg->ctx0, cur, cache_ch, conv_cache_in, cg->pos_enc, T_new,
+                                                     T_cache, m.enc[il], bp, &outputs);
+                GGML_ASSERT(outputs.cache_ch != nullptr);
+                GGML_ASSERT(outputs.conv_cache != nullptr);
+
+                // Host semantics are append(new) then trim-left to L. Build the
+                // same chronological window into the other persistent bank.
+                const int next_count = std::min(L, T_cache + T_new);
+                const int keep_old = next_count - T_new;
+                GGML_ASSERT(keep_old >= 0);
+                if (keep_old > 0) {
+                    const int old_start = T_cache - keep_old;
+                    GGML_ASSERT(old_start >= 0);
+                    ggml_tensor* src_keep = ggml_view_2d(cg->ctx0, dev_cache.attn, d, keep_old, dev_cache.attn->nb[1],
+                                                         attn_src_base + (size_t)old_start * dev_cache.attn->nb[1]);
+                    ggml_tensor* dst_keep =
+                        ggml_view_2d(cg->ctx0, dev_cache.attn, d, keep_old, dev_cache.attn->nb[1], attn_dst_base);
+                    ggml_build_forward_expand(cg->gf, ggml_cpy(cg->ctx0, src_keep, dst_keep));
+                }
+                ggml_tensor* dst_new = ggml_view_2d(cg->ctx0, dev_cache.attn, d, T_new, dev_cache.attn->nb[1],
+                                                    attn_dst_base + (size_t)keep_old * dev_cache.attn->nb[1]);
+                ggml_build_forward_expand(cg->gf, ggml_cpy(cg->ctx0, outputs.cache_ch, dst_new));
+
+                // Preserve the current host-cache behavior exactly. When a
+                // chunk is shorter than K-1, the host path zero-pads the front
+                // and stores only this chunk's post-GLU frames at the tail.
+                const int conv_frames = (int)outputs.conv_cache->ne[1];
+                if (conv_frames == K - 1) {
+                    ggml_tensor* dst_conv =
+                        ggml_view_2d(cg->ctx0, dev_cache.conv, d, K - 1, dev_cache.conv->nb[1], conv_dst_base);
+                    ggml_build_forward_expand(cg->gf, ggml_cpy(cg->ctx0, outputs.conv_cache, dst_conv));
+                } else {
+                    GGML_ASSERT(conv_frames > 0 && conv_frames < K - 1);
+                    ggml_tensor* dst_conv_full =
+                        ggml_view_2d(cg->ctx0, dev_cache.conv, d, K - 1, dev_cache.conv->nb[1], conv_dst_base);
+                    ggml_tensor* zeroed = ggml_cpy(cg->ctx0, dev_cache.conv_zero, dst_conv_full);
+                    ggml_build_forward_expand(cg->gf, zeroed);
+                    const size_t tail_off = (size_t)(K - 1 - conv_frames) * zeroed->nb[1];
+                    ggml_tensor* dst_conv_tail =
+                        ggml_view_2d(cg->ctx0, zeroed, d, conv_frames, zeroed->nb[1], tail_off);
+                    ggml_build_forward_expand(cg->gf, ggml_cpy(cg->ctx0, outputs.conv_cache, dst_conv_tail));
+                }
+            }
+
+            cg->block_out = cur;
+            ggml_set_name(cg->block_out, "block_out");
+            ggml_set_output(cg->block_out);
+            ggml_build_forward_expand(cg->gf, cg->block_out);
+
+            auto* result = cg.get();
+            device_graphs.emplace(key, std::move(cg));
+            return *result;
+        };
+
+        int n_cached = 0;
+        bool has_conv = false;
+        int src_bank = 0;
+
+        for (int ci = 0; ci < n_chunks; ci++) {
+            const int t_start = ci * chunk_size;
+            const int t_end = std::min(t_start + chunk_size, T_enc);
+            const int n_new = t_end - t_start;
+            const int n_ctx = std::min(n_cached, L);
+
+            auto& cg = get_or_build_device_chunk(n_new, n_ctx, has_conv, src_bank);
+            ggml_backend_sched_reset(ctx->sched);
+            if (!ggml_backend_sched_alloc_graph(ctx->sched, cg.gf)) {
+                fprintf(stderr, "nemotron: sched alloc GPU-cache chunk %d failed\n", ci);
+                return false;
+            }
+
+            // Only the genuinely new chunk input and relative-position table
+            // cross the host/backend boundary. Per-layer state is already in
+            // dev_cache and is read/written by graph views + ggml_cpy.
+            ggml_backend_tensor_set(cg.block_in, pre_enc + (size_t)t_start * d, 0, (size_t)n_new * d * sizeof(float));
+            auto pe = core_conformer::make_pos_enc(d, n_ctx + n_new);
+            ggml_backend_tensor_set(cg.pos_enc, pe.data(), 0, pe.size() * sizeof(float));
+
+            if (ggml_backend_sched_graph_compute(ctx->sched, cg.gf) != GGML_STATUS_SUCCESS) {
+                fprintf(stderr, "nemotron: GPU-cache streaming chunk %d compute failed\n", ci);
+                return false;
+            }
+
+            // Deliberately keep this one readback: it is the chunk's actual
+            // encoder output, not cache maintenance. A future optimization can make the
+            // downstream prompt/decode path consume it on-device.
+            std::vector<float> chunk_out((size_t)n_new * d);
+            ggml_backend_tensor_get(cg.block_out, chunk_out.data(), 0, chunk_out.size() * sizeof(float));
+            memcpy(enc_out.data() + (size_t)t_start * d, chunk_out.data(), (size_t)n_new * d * sizeof(float));
+
+            n_cached = std::min(L, n_ctx + n_new);
+            has_conv = true;
+            src_bank = 1 - src_bank;
+
+            if (ci % 5 == 0 || ci == n_chunks - 1) {
+                fprintf(stderr, "  chunk %d/%d (frames %d-%d, gpu_cache_graphs=%zu, cache=%d)\n", ci + 1, n_chunks,
+                        t_start, t_end - 1, device_graphs.size(), n_cached);
+            }
+        }
+
+        if (getenv("CRISPASR_NEMOTRON_DEBUG")) {
+            float emin = 1e30f, emax = -1e30f, esum = 0.0f;
+            for (size_t i = 0; i < enc_out.size(); i++) {
+                float v = enc_out[i];
+                if (v < emin)
+                    emin = v;
+                if (v > emax)
+                    emax = v;
+                esum += v;
+            }
+            fprintf(stderr, "nemotron: GPU-cache chunked enc_out T=%d d=%d min=%.4f max=%.4f mean=%.6f\n", T_enc, d,
+                    emin, emax, esum / (float)enc_out.size());
+        }
+        fprintf(stderr, "nemotron: GPU-cache chunked encoder done\n");
+        return true;
+    }
 
     // Process each chunk
     for (int ci = 0; ci < n_chunks; ci++) {
@@ -1605,6 +1918,55 @@ static void predictor_step(const nemotron_predictor_weights& W, int token_id, ne
 // Joint head (CPU F32) — ReLU activation (NeMo default)
 // ===========================================================================
 
+// Run joint.enc over the whole [d_model, T] encoder matrix in one backend graph.
+// Input/output remain F32; quantized GGUF weights use the backend's native matmul.
+static bool nemotron_joint_proj_all_gpu(nemotron_context* ctx, const float* enc, int T_enc, int d_model,
+                                        std::vector<float>& out) {
+    if (!ctx || !enc || T_enc <= 0 || d_model <= 0)
+        return false;
+    if (!nemotron_ensure_sched(ctx))
+        return false;
+
+    const auto& j = ctx->model.joint;
+    const int joint_hidden = (int)ctx->model.hparams.joint_hidden;
+    const size_t graph_size = 64;
+    const size_t meta_size = ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false) + 4096;
+    std::vector<uint8_t> meta(meta_size);
+    ggml_init_params ip = {meta_size, meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    if (!ctx0)
+        return false;
+
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, graph_size, false);
+    ggml_tensor* in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_model, T_enc);
+    ggml_set_name(in, "joint_enc_in");
+    ggml_set_input(in);
+
+    ggml_tensor* proj = ggml_mul_mat(ctx0, j.enc_w, in);
+    proj = ggml_add(ctx0, proj, j.enc_b);
+    ggml_set_name(proj, "joint_enc_out");
+    ggml_set_output(proj);
+    ggml_build_forward_expand(gf, proj);
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "nemotron: sched alloc joint.enc GPU graph failed\n");
+        ggml_free(ctx0);
+        return false;
+    }
+    ggml_backend_tensor_set(in, enc, 0, (size_t)T_enc * d_model * sizeof(float));
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "nemotron: joint.enc GPU graph compute failed\n");
+        ggml_free(ctx0);
+        return false;
+    }
+
+    out.resize((size_t)T_enc * joint_hidden);
+    ggml_backend_tensor_get(proj, out.data(), 0, out.size() * sizeof(float));
+    ggml_free(ctx0);
+    return true;
+}
+
 static void joint_proj_enc(const nemotron_joint_weights& J, const float* enc_t, std::vector<float>& out) {
     out.assign(J.joint_hidden, 0.0f);
 #if defined(HAVE_ACCELERATE)
@@ -1799,10 +2161,32 @@ static std::vector<nemotron_emitted_token> nemotron_rnnt_decode(nemotron_context
     else
         predictor_step(W, blank_id, state, pred_out);
 
+    // Precompute all encoder-side joint projections on the GPU to avoid
+    // per-timestep CPU projection overhead during RNNT decoding.
+    std::vector<float> all_proj_e_gpu;
+    double joint_enc_proj_cpu_ms = 0.0;
+    if (ctx->backend != ctx->backend_cpu && nemotron_opt_enabled("CRISPASR_NEMOTRON_GPU_JOINT")) {
+        nemotron_bench_stage _b("joint_enc_proj");
+        if (!nemotron_joint_proj_all_gpu(ctx, enc, T_enc, d_model, all_proj_e_gpu)) {
+            fprintf(stderr, "nemotron: GPU joint.enc projection failed, falling back to CPU\n");
+            all_proj_e_gpu.clear();
+        }
+    }
+
     for (int t = 0; t < T_enc; t++) {
         const float* enc_t = enc + (size_t)t * d_model;
         std::vector<float> proj_e;
-        joint_proj_enc(J, enc_t, proj_e);
+        if (!all_proj_e_gpu.empty()) {
+            const float* src = all_proj_e_gpu.data() + (size_t)t * J.joint_hidden;
+            proj_e.assign(src, src + J.joint_hidden);
+        } else if (time_dec) {
+            const auto jp0 = std::chrono::steady_clock::now();
+            joint_proj_enc(J, enc_t, proj_e);
+            const auto jp1 = std::chrono::steady_clock::now();
+            joint_enc_proj_cpu_ms += std::chrono::duration<double, std::milli>(jp1 - jp0).count();
+        } else {
+            joint_proj_enc(J, enc_t, proj_e);
+        }
 
         int sym_count = 0;
         while (sym_count < max_symbols_per_frame) {
@@ -1850,6 +2234,9 @@ static std::vector<nemotron_emitted_token> nemotron_rnnt_decode(nemotron_context
             sym_count++;
         }
     }
+    if (time_dec && all_proj_e_gpu.empty())
+        fprintf(stderr, "  nemotron_bench: %-22s %.2f ms\n", "joint_enc_proj", joint_enc_proj_cpu_ms);
+
     if (time_dec) {
         auto _dt1 = std::chrono::steady_clock::now();
         fprintf(stderr, "nemotron: rnnt_decode %.1f ms (%s, T_enc=%d, %zu tokens)\n",
@@ -2489,6 +2876,10 @@ extern "C" void nemotron_free(struct nemotron_context* ctx) {
 
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    if (ctx->prompt_f32_buf)
+        ggml_backend_buffer_free(ctx->prompt_f32_buf);
+    if (ctx->prompt_f32_ctx)
+        ggml_free(ctx->prompt_f32_ctx);
     ctx->model.pw_q8.free();
     if (ctx->model.buf)
         core_gguf::release_weight_buffer(ctx->model.buf);
@@ -2526,8 +2917,9 @@ static bool nemotron_run_preencode(nemotron_context* ctx, const float* mel, int 
     ggml_set_name(mel_t, "mel");
     ggml_set_input(mel_t);
     int T_pre = 0;
-    ggml_tensor* pre =
-        nemotron_build_pre_encode(ctx0, mel_t, ctx->model.pre_encode, (int)hp.subsampling_channels, &T_pre);
+    ggml_tensor* pre = nemotron_build_pre_encode(
+        ctx0, mel_t, ctx->model.pre_encode, (int)hp.subsampling_channels, &T_pre,
+        ctx->backend != ctx->backend_cpu && nemotron_opt_enabled("CRISPASR_NEMOTRON_GPU_DIRECT_CONV"));
     ggml_set_name(pre, "pre_enc");
     ggml_set_output(pre);
     ggml_build_forward_expand(gf, pre);
@@ -2556,9 +2948,125 @@ static bool nemotron_run_preencode(nemotron_context* ctx, const float* mel, int 
     return true;
 }
 
+// Create cached per context backend-resident F32 prompt weights
+static bool nemotron_ensure_prompt_f32_weights(nemotron_context* ctx) {
+    if (ctx->prompt_l0_w_f32 && ctx->prompt_l2_w_f32)
+        return true;
+
+    const auto& pk = ctx->model.prompt_kernel;
+    if (!pk.l0_w || !pk.l2_w)
+        return false;
+
+    const auto l0 = tensor_to_f32(pk.l0_w);
+    const auto l2 = tensor_to_f32(pk.l2_w);
+    if (l0.empty() || l2.empty())
+        return false;
+
+    const size_t meta_size = ggml_tensor_overhead() * 4 + 4096;
+    ggml_init_params ip = {meta_size, nullptr, true};
+    ctx->prompt_f32_ctx = ggml_init(ip);
+    if (!ctx->prompt_f32_ctx)
+        return false;
+
+    ctx->prompt_l0_w_f32 = ggml_new_tensor_2d(ctx->prompt_f32_ctx, GGML_TYPE_F32, pk.l0_w->ne[0], pk.l0_w->ne[1]);
+    ctx->prompt_l2_w_f32 = ggml_new_tensor_2d(ctx->prompt_f32_ctx, GGML_TYPE_F32, pk.l2_w->ne[0], pk.l2_w->ne[1]);
+    ggml_set_name(ctx->prompt_l0_w_f32, "nemotron_prompt_l0_w_f32");
+    ggml_set_name(ctx->prompt_l2_w_f32, "nemotron_prompt_l2_w_f32");
+
+    ctx->prompt_f32_buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx->prompt_f32_ctx,
+                                                                   ggml_backend_get_default_buffer_type(ctx->backend));
+    if (!ctx->prompt_f32_buf) {
+        ggml_free(ctx->prompt_f32_ctx);
+        ctx->prompt_f32_ctx = nullptr;
+        ctx->prompt_l0_w_f32 = nullptr;
+        ctx->prompt_l2_w_f32 = nullptr;
+        return false;
+    }
+
+    ggml_backend_tensor_set(ctx->prompt_l0_w_f32, l0.data(), 0, l0.size() * sizeof(float));
+    ggml_backend_tensor_set(ctx->prompt_l2_w_f32, l2.data(), 0, l2.size() * sizeof(float));
+    return true;
+}
+
+static bool nemotron_apply_prompt_gpu(nemotron_context* ctx, std::vector<float>& enc_out, int T_enc, int d_model) {
+    const auto& pk = ctx->model.prompt_kernel;
+    const int n_prompts = (int)ctx->model.hparams.num_prompts;
+    const int pk_in = d_model + n_prompts;
+    if (!nemotron_ensure_sched(ctx))
+        return false;
+
+    // ggml tensor memory is [ne0, ne1], so each frame is one contiguous
+    // pk_in-wide column in this flat host buffer.
+    std::vector<float> prompt_in((size_t)T_enc * pk_in, 0.0f);
+    for (int t = 0; t < T_enc; t++) {
+        float* dst = prompt_in.data() + (size_t)t * pk_in;
+        memcpy(dst, enc_out.data() + (size_t)t * d_model, (size_t)d_model * sizeof(float));
+        if (ctx->prompt_id >= 0 && ctx->prompt_id < n_prompts)
+            dst[d_model + ctx->prompt_id] = 1.0f;
+    }
+
+    const size_t graph_size = 96;
+    const size_t meta_size = ggml_tensor_overhead() * graph_size + ggml_graph_overhead_custom(graph_size, false) + 4096;
+    std::vector<uint8_t> meta(meta_size);
+    ggml_init_params ip = {meta_size, meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    if (!ctx0)
+        return false;
+
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, graph_size, false);
+    ggml_tensor* in = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, pk_in, T_enc);
+    ggml_set_name(in, "prompt_in");
+    ggml_set_input(in);
+
+    if (!nemotron_ensure_prompt_f32_weights(ctx)) {
+        fprintf(stderr, "nemotron: failed to initialize persistent F32 prompt weights\n");
+        ggml_free(ctx0);
+        return false;
+    }
+
+    ggml_tensor* mid_mm = ggml_mul_mat(ctx0, ctx->prompt_l0_w_f32, in);
+    ggml_mul_mat_set_prec(mid_mm, GGML_PREC_F32);
+    ggml_tensor* mid = ggml_add(ctx0, mid_mm, pk.l0_b);
+    mid = ggml_relu(ctx0, mid);
+
+    ggml_tensor* out_mm = ggml_mul_mat(ctx0, ctx->prompt_l2_w_f32, mid);
+    ggml_mul_mat_set_prec(out_mm, GGML_PREC_F32);
+    ggml_tensor* out = ggml_add(ctx0, out_mm, pk.l2_b);
+    ggml_set_name(out, "prompt_out");
+    ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "nemotron: sched alloc prompt GPU graph failed\n");
+        ggml_free(ctx0);
+        return false;
+    }
+    ggml_backend_tensor_set(in, prompt_in.data(), 0, prompt_in.size() * sizeof(float));
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "nemotron: prompt GPU graph compute failed\n");
+        ggml_free(ctx0);
+        return false;
+    }
+
+    std::vector<float> prompted((size_t)T_enc * d_model);
+    ggml_backend_tensor_get(out, prompted.data(), 0, prompted.size() * sizeof(float));
+    enc_out = std::move(prompted);
+    ggml_free(ctx0);
+    return true;
+}
+
 static void nemotron_apply_prompt(nemotron_context* ctx, std::vector<float>& enc_out, int T_enc, int d_model) {
     if (!ctx->model.prompt_kernel.l0_w)
         return;
+
+    if (ctx->backend != ctx->backend_cpu && nemotron_opt_enabled("CRISPASR_NEMOTRON_GPU_PROMPT")) {
+        if (nemotron_apply_prompt_gpu(ctx, enc_out, T_enc, d_model)) {
+            return;
+        }
+        fprintf(stderr, "nemotron: GPU prompt kernel failed, falling back to CPU\n");
+    }
+
     const auto& pk = ctx->model.prompt_kernel;
     const int n_prompts = (int)ctx->model.hparams.num_prompts;
     const int pk_in = d_model + n_prompts;
@@ -2729,8 +3237,9 @@ static nemotron_result* nemotron_transcribe_impl(nemotron_context* ctx, const fl
                 ggml_set_input(mel_t);
 
                 int T_pre = 0;
-                ggml_tensor* pre = nemotron_build_pre_encode(ctx0, mel_t, ctx->model.pre_encode,
-                                                             (int)hp2.subsampling_channels, &T_pre);
+                ggml_tensor* pre = nemotron_build_pre_encode(
+                    ctx0, mel_t, ctx->model.pre_encode, (int)hp2.subsampling_channels, &T_pre,
+                    ctx->backend != ctx->backend_cpu && nemotron_opt_enabled("CRISPASR_NEMOTRON_GPU_DIRECT_CONV"));
                 ggml_set_name(pre, "pre_enc");
                 ggml_set_output(pre);
                 ggml_build_forward_expand(gf, pre);
@@ -2789,56 +3298,14 @@ static nemotron_result* nemotron_transcribe_impl(nemotron_context* ctx, const fl
     if (T_enc <= 0)
         return nullptr;
 
-    // Apply prompt kernel (language conditioning) — CPU F32
-    // concat(enc_out[d_model], lang_onehot[n_prompts]) → Linear(in→mid) → ReLU → Linear(mid→d_model)
-    if (ctx->model.prompt_kernel.l0_w) {
-        const auto& pk = ctx->model.prompt_kernel;
-        const int n_prompts = (int)ctx->model.hparams.num_prompts;
-        const int pk_in = d_model + n_prompts;
-        const int pk_mid = (int)ctx->model.hparams.prompt_kernel_mid;
-        const int prompt_id = ctx->prompt_id;
-
-        // Load prompt kernel weights to CPU F32 (lazy)
-        auto l0_w = tensor_to_f32(pk.l0_w); // (pk_mid, pk_in)
-        auto l0_b = tensor_to_f32(pk.l0_b); // (pk_mid,)
-        auto l2_w = tensor_to_f32(pk.l2_w); // (d_model, pk_mid)
-        auto l2_b = tensor_to_f32(pk.l2_b); // (d_model,)
-
-        // Build language one-hot
-        std::vector<float> lang(n_prompts, 0.0f);
-        if (prompt_id >= 0 && prompt_id < n_prompts)
-            lang[prompt_id] = 1.0f;
-
-        // Apply per-frame: for each t, concat(enc[t], lang) → linear1 → relu → linear2
-        std::vector<float> prompted((size_t)T_enc * d_model);
-        for (int t = 0; t < T_enc; t++) {
-            // Concat: [enc[t][0..d_model], lang[0..n_prompts]]
-            std::vector<float> cat(pk_in);
-            memcpy(cat.data(), enc_out.data() + (size_t)t * d_model, d_model * sizeof(float));
-            memcpy(cat.data() + d_model, lang.data(), n_prompts * sizeof(float));
-
-            // Linear1 + ReLU
-            std::vector<float> mid(pk_mid);
-            for (int i = 0; i < pk_mid; i++) {
-                float s = l0_b[i];
-                const float* row = l0_w.data() + (size_t)i * pk_in;
-                for (int k = 0; k < pk_in; k++)
-                    s += row[k] * cat[k];
-                mid[i] = s > 0.0f ? s : 0.0f; // ReLU
-            }
-
-            // Linear2
-            float* out = prompted.data() + (size_t)t * d_model;
-            for (int i = 0; i < d_model; i++) {
-                float s = l2_b[i];
-                const float* row = l2_w.data() + (size_t)i * pk_mid;
-                for (int k = 0; k < pk_mid; k++)
-                    s += row[k] * mid[k];
-                out[i] = s;
-            }
+    // Apply prompt kernel (language conditioning). The GPU path runs the
+    // same two-layer MLP as one batched ggml graph on the selected backend.
+    {
+        nemotron_bench_stage _b("prompt");
+        if (ctx->model.prompt_kernel.l0_w) {
+            nemotron_apply_prompt(ctx, enc_out, T_enc, d_model);
+            fprintf(stderr, "nemotron: prompt kernel applied (prompt_id=%d)\n", ctx->prompt_id);
         }
-        enc_out = std::move(prompted);
-        fprintf(stderr, "nemotron: prompt kernel applied (prompt_id=%d)\n", prompt_id);
     }
 
     if (getenv("CRISPASR_NEMOTRON_DEBUG")) {
