@@ -99,9 +99,10 @@ from pathlib import Path
 import numpy as np
 
 WORK = Path("/kaggle/working")
-REPO = WORK / "CrispASR"
-BUILD = WORK / "build"
-OUT = WORK / "out"
+SCRATCH = Path("/kaggle/temp") if Path("/kaggle/temp").is_dir() else Path("/tmp")
+REPO = SCRATCH / "CrispASR"     # NOT under /kaggle/working: not kernel output
+BUILD = SCRATCH / "build"       # same
+OUT = WORK / "out"              # the only thing we want back: stems + ref + json
 
 CRISPASR_REF = os.environ.get("CRISPASR_REF", "main")
 CRISPASR_REPO = os.environ.get("CRISPASR_REPO", "https://github.com/CrispStrobe/CrispASR.git")
@@ -139,6 +140,24 @@ kh.resolve_hf_token()
 run(["nvidia-smi", "-L"], check=False)
 
 # ── 2. build ───────────────────────────────────────────────────────
+# ── 1b. dependencies FIRST — fail in seconds, not after the build ──
+# v1 died at `from gguf import ...` inside the converter, ~16 min in, having
+# already paid for the CUDA build and the 913 MB checkpoint. The import is
+# cheap to verify and the build is not, so verify first.
+print("\n[1b/9] Python deps (before the expensive build)", flush=True)
+# gguf is NOT optional and is NOT on the Kaggle image: the converter does
+# `from gguf import GGUFWriter, GGMLQuantizationType` inside main(), so it dies
+# at conversion AFTER the full CUDA build and the 913 MB checkpoint download —
+# ~16 minutes of quota for a ModuleNotFoundError. This is exactly how v1 died.
+run("pip install -q 'bs-roformer==0.3.10' gguf soundfile librosa 2>&1 | tail -5", check=False)
+import importlib  # noqa: E402
+
+for _m in ("gguf", "soundfile", "librosa"):
+    if importlib.util.find_spec(_m) is None:
+        raise SystemExit(f"FATAL: '{_m}' missing after pip install — would fail later at a "
+                         f"far more expensive point; aborting before the build.")
+print("  deps present: gguf, soundfile, librosa", flush=True)
+
 print("\n[2/9] Build CUDA", flush=True)
 kh.install_build_toolchain()
 arch = kh.detect_cuda_arch()
@@ -153,11 +172,10 @@ assert CLI.exists(), "crispasr-cli missing"
 
 # ── 3. deps + checkpoint ───────────────────────────────────────────
 print("\n[3/9] Reference deps + Kim checkpoint", flush=True)
-run("pip install -q 'bs-roformer==0.3.10' soundfile librosa 2>&1 | tail -5", check=False)
 from huggingface_hub import snapshot_download  # noqa: E402
 
 CKPT_DIR = Path(snapshot_download("KimberleyJSN/melbandroformer",
-                                  cache_dir=str(WORK / "hf"),
+                                  cache_dir=str(SCRATCH / "hf"),
                                   token=os.environ.get("HF_TOKEN")))
 print(f"  checkpoint dir: {CKPT_DIR}", flush=True)
 for p in sorted(CKPT_DIR.rglob("*")):
@@ -372,8 +390,11 @@ if "A_noseg" not in cpp:
     print("  SKIPPED: arm A void, no local reference", flush=True)
 else:
     A = cpp["A_noseg"]
+    # Sample counts per region are printed so the reader can see how much data
+    # each half of the comparison rests on — a boundary estimate drawn from one
+    # crossfade is far noisier than one drawn from three.
     print(f"\n{'arm':<12}{'boundary SDR':>14}{'interior SDR':>14}{'delta dB':>10}"
-          f"{'bnd frac':>10}{'#bnd':>6}", flush=True)
+          f"{'#bnd':>6}{'bnd smp':>10}{'int smp':>10}", flush=True)
     local = {}
     for name in ("B_default", "C_seg3"):
         if name not in cpp or not geom.get(name):
@@ -390,7 +411,7 @@ else:
         i_sdr, i_res = sdr_and_resid(cpp[name], A, ~mask)
         local[name] = (b_sdr, i_sdr, n_bnd, b_res, i_res)
         print(f"{name:<12}{b_sdr:14.2f}{i_sdr:14.2f}{b_sdr - i_sdr:10.2f}"
-              f"{mask.mean():10.3f}{n_bnd:6d}", flush=True)
+              f"{n_bnd:6d}{int(mask.sum()):10d}{int((~mask).sum()):10d}", flush=True)
 
     print("\n--- VERDICT ---", flush=True)
     # Power is a property of the STIMULUS and is reported separately from the
@@ -441,5 +462,26 @@ else:
         print(f"Segmentation cost vs the port itself: SDR(A)={whole['A_noseg']:.2f} dB, "
               f"SDR(B)={whole['B_default']:.2f} dB, cost={whole['A_noseg'] - whole['B_default']:+.2f} dB.", flush=True)
 
-print("\nOutputs (kernel output, reusable offline): ref_vocals.wav + out/<arm>/*.wav", flush=True)
+# Small machine-readable summary alongside the wavs, so a second implementation
+# can cross-check these numbers rather than re-deriving them from the log.
+import json  # noqa: E402
+
+summary = {
+    "script_version": SCRIPT_VERSION,
+    "clip": {"source": Path(music_path).name, "offset_s": CLIP_OFF_S,
+             "dur_s": round(dur, 3), "sr": SR, "samples": int(stereo.shape[0])},
+    "geometry": geom,
+    "whole_clip_sdr_vs_torch_ref": {k: round(v, 4) for k, v in whole.items()},
+    "within_arm_vs_A": {
+        k: {"boundary_sdr": round(v[0], 4), "interior_sdr": round(v[1], 4),
+            "n_internal_boundaries": v[2], "boundary_resid": v[3], "interior_resid": v[4]}
+        for k, v in local.items()
+    } if "A_noseg" in cpp else {},
+    "thresholds": {"artefact_db": ARTEFACT_DB, "floor_db": FLOOR_DB},
+    "sdr_definition": "10*log10(|ref|^2 / |ref-est|^2) vs the named reference; NOT BSS-Eval",
+}
+(OUT / "results.json").write_text(json.dumps(summary, indent=2))
+print(f"\nWrote {OUT/'results.json'}", flush=True)
+print("Outputs (kernel-output mount only; clone/build/hf kept off it):", flush=True)
+print("  out/ref_vocals.wav, out/<arm>/*.wav, out/results.json", flush=True)
 print("DONE", flush=True)
