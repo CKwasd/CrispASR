@@ -2,6 +2,7 @@
 // and null-guard coverage. No GGUF required.
 
 #include <cstring>
+#include <limits>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -69,6 +70,10 @@ TEST_CASE("kokoro_length_scale: boundary clamping on context", "[unit][kokoro]")
 
     // Negative clamping (-2.0 -> 0.25)
     kokoro_set_length_scale(ctx, -2.0f);
+    REQUIRE(kokoro_get_length_scale(ctx) == Catch::Approx(0.25f));
+
+    // NaN clamping -> 0.25
+    kokoro_set_length_scale(ctx, std::numeric_limits<float>::quiet_NaN());
     REQUIRE(kokoro_get_length_scale(ctx) == Catch::Approx(0.25f));
 
     // Overflow clamping (> 4.0 -> 4.0)

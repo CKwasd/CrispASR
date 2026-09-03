@@ -3613,7 +3613,7 @@ extern "C" void kokoro_set_n_threads(struct kokoro_context* ctx, int n_threads) 
 extern "C" void kokoro_set_length_scale(struct kokoro_context* ctx, float scale) {
     if (!ctx)
         return;
-    if (scale < 0.25f)
+    if (std::isnan(scale) || scale < 0.25f)
         scale = 0.25f;
     if (scale > 4.0f)
         scale = 4.0f;
