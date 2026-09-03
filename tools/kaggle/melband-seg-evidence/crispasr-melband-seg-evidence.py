@@ -69,7 +69,7 @@ OUT = WORK / "out"
 
 CRISPASR_REF = os.environ.get("CRISPASR_REF", "main")
 CRISPASR_REPO = os.environ.get("CRISPASR_REPO", "https://github.com/CrispStrobe/CrispASR.git")
-SCRIPT_VERSION = "seg-evidence-v1.1-ggufdep"
+SCRIPT_VERSION = "seg-evidence-v1.2-realimport"
 
 
 def run(cmd, check=True, env=None, timeout=None, cwd=None):
@@ -120,7 +120,12 @@ print("\n[3/8] Reference deps + Kim checkpoint", flush=True)
 # `gguf` is NOT in the Kaggle image and the converter imports it (v1 run
 # 2026-09-03 died here after the full build + 913 MB checkpoint download).
 run("pip install -q 'bs-roformer==0.3.10' soundfile librosa gguf 2>&1 | tail -5", check=False)
-run([sys.executable, "-c", "import gguf; print('gguf', gguf.__version__)"], check=True)
+# Verify the EXACT symbols the converter imports (line 106), not a proxy.
+# v1.1 asserted gguf.__version__, which the package does not define — so the
+# guard added to catch a silent pip failure became the failure itself, after
+# the full build and the 913 MB download. Test the thing that must work.
+run([sys.executable, "-c",
+     "from gguf import GGUFWriter, GGMLQuantizationType; print('gguf import OK', GGUFWriter)"], check=True)
 from huggingface_hub import snapshot_download  # noqa: E402
 
 CKPT_DIR = Path(snapshot_download("KimberleyJSN/melbandroformer",
