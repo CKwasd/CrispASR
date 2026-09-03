@@ -482,6 +482,11 @@ for name, _ in ARMS_FOR_WHOLE:
 # the smallest injected defect. FLOOR_DB catches the bit-identical degenerate
 # case described at the verdict below.
 ARTEFACT_DB = float(os.environ.get("MBR_ARTEFACT_DB", "-1.0"))
+# A crossfade averages two independent estimates -> noise variance halves ->
+# 10*log10(2) = 3.01 dB expected gain over a single-covered interior. Measured
+# +3.75 dB on the 2026-09-03 run, corroborated by a second implementation.
+EXPECTED_XFADE_DB = float(os.environ.get("MBR_EXPECTED_XFADE_DB", "3.01"))
+XFADE_TOL_DB = float(os.environ.get("MBR_XFADE_TOL_DB", "1.5"))
 FLOOR_DB = float(os.environ.get("MBR_FLOOR_DB", "120"))
 
 print("\n[9/9] Within-arm boundary localisation (reference = arm A, no-seg)", flush=True)
@@ -569,10 +574,26 @@ else:
             print("measurably worse than segment interiors. This is a real finding — the", flush=True)
             print("overlap-add arithmetic is known sound, so suspect receptive-field/context", flush=True)
             print("effects at chunk edges, not the adder.", flush=True)
+        elif d > EXPECTED_XFADE_DB - XFADE_TOL_DB:
+            # A crossfade averages two independent segment estimates, halving
+            # noise variance for a PREDICTED 10*log10(2) = 3.01 dB gain. So
+            # ~+3 dB is not merely "no artefact" — it is positive evidence the
+            # overlap-add is doing its job. Both this run and an independent
+            # implementation measured +3.75 dB here.
+            print(f"OVERLAP-ADD CONFIRMED WORKING: crossfades gain {d:+.2f} dB over interiors,", flush=True)
+            print(f"consistent with the {EXPECTED_XFADE_DB:.2f} dB predicted from averaging two", flush=True)
+            print("independent estimates. Positive evidence, not an absence of complaint.", flush=True)
         else:
-            print("NO BOUNDARY ARTEFACT DETECTED: the overlap windows reconstruct as well as", flush=True)
-            print("the segment interiors. This is a positive, localised measurement rather", flush=True)
-            print("than an inference from a null delta.", flush=True)
+            # The band that is neither an artefact nor the expected gain. A
+            # crossfade that does NOT gain ~3 dB is itself a defect signal —
+            # the two overlapping estimates are not being averaged as intended
+            # — even though it is not WORSE than the interior. Neither this
+            # script nor the independent one tested for that until the real
+            # numbers showed what "healthy" looks like.
+            print(f"UNEXPECTED: crossfades gain {d:+.2f} dB, but a working overlap-add should gain", flush=True)
+            print(f"~{EXPECTED_XFADE_DB:.2f} dB by averaging two independent estimates. Not an artefact by the", flush=True)
+            print("threshold above, but the averaging is not behaving as designed — check the", flush=True)
+            print("triangular weight and the sum_weight normalisation before trusting this arm.", flush=True)
 
     if whole.get("A_noseg") is not None and whole.get("B_default") is not None:
         print(f"Segmentation cost vs the port itself: SDR(A)={whole['A_noseg']:.2f} dB, "

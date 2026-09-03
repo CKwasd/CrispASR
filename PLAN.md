@@ -1,5 +1,28 @@
 # CrispASR — Pending work
 
+## DONE 2026-09-03 — #422 segmentation evidence, measured
+
+Kernel `chr1s4/crispasr-melband-seg-evidence-v2`, source
+`tools/kaggle/melband-seg-evidence-v2/`. Closes the one #422 review finding
+that merging did not settle: segmentation shipped with no reference-anchored
+evidence, because the PR's 30 s arm is common-mode over segmentation (gates
+resolve once at init; segmentation wraps `separate_full` per segment) and
+golden10s never segments (`n_samples <= seg_len`).
+
+Full numbers and the four findings are in `docs/mel-band-roformer/PLAN.md`
+(§422 section). Headline: NO boundary artefact — crossfades reconstruct
++3.75 dB BETTER than interiors, matching the 3.01 dB predicted from averaging
+two independent estimates, corroborated by a second independently-written
+implementation to 0.01 dB. Segmentation does cost 22.9 dB vs unsegmented, but
+that cost is a broad CONTEXT effect, not an edge effect — and it does NOT
+establish a defect, because arm A and the torch reference both extrapolate
+2.5x past the 8 s trained chunk and agree precisely because they do the same
+unusual thing.
+
+NEXT (not started): compare arm B against a reference that ALSO chunks at 8 s
+with the same overlap. That is the arm that would settle whether the 22.9 dB is
+inherent to chunked inference or specific to our implementation.
+
 ## DONE 2026-09-02 — argument validation ran after backend dispatch
 
 Worktree `.claude/worktrees/fix-validate-before-dispatch`, branch
