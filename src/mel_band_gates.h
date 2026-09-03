@@ -59,4 +59,46 @@ inline Resolved resolve(const char* env_gpu, const char* env_ggml, const char* e
     return r;
 }
 
+// Segment length in SAMPLES for the Demucs-style split (review #422).
+//
+// Four sources, in precedence order:
+//   1. CRISPASR_MELBAND_SEG_S  (seconds, only when it parses > 0)
+//   2. params.segment_seconds  (seconds, only when > 0)
+//   3. the checkpoint's TRAINED chunk from GGUF metadata (SAMPLES, exact)
+//   4. 8 s fallback, the Kim vocals chunk, for GGUFs predating that KV
+//
+// The trained chunk is applied in samples rather than round-tripped through
+// seconds: 352800 / 44100 = 8 exactly for Kim, but a checkpoint trained at,
+// say, 344400 samples (7.81 s) would floor to 7 and silently drop 0.81 s of
+// trained context from every segment. Explicit overrides stay in seconds
+// because they are a human-facing knob; the trained chunk is a property of the
+// checkpoint and deserves to survive intact.
+//
+// Returns 0 when it cannot be determined (caller then takes the whole-buffer
+// path), never a negative or overflowing length.
+inline int resolve_segment_len(int param_seg_s, const char* env_seg_s, int chunk_size, int sample_rate) {
+    if (sample_rate <= 0)
+        return 0;
+
+    int seg_s = param_seg_s;
+    if (env_seg_s && *env_seg_s) {
+        const int v = atoi(env_seg_s);
+        if (v > 0) // a non-positive or unparseable value is ignored, not obeyed
+            seg_s = v;
+    }
+    if (seg_s > 0) {
+        // Guard the multiply: a huge --segment would otherwise wrap negative
+        // and read as "no segmentation" instead of "absurd request".
+        if (seg_s > (2147483647 / sample_rate))
+            return 0;
+        return seg_s * sample_rate;
+    }
+    if (chunk_size > 0)
+        return chunk_size; // already samples — used exactly
+    const int fallback_s = 8;
+    if (fallback_s > (2147483647 / sample_rate))
+        return 0;
+    return fallback_s * sample_rate;
+}
+
 } // namespace mel_band_gates

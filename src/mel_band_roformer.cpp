@@ -695,7 +695,7 @@ static ggml_tensor* g_rms_dim(ggml_context* g, ggml_tensor* x, ggml_tensor* gamm
 // (CPU roformer_block: x[i] += attn_out[i], NOT onto xn).
 static ggml_tensor* g_mbr_attn(ggml_context* g, ggml_tensor* x, ggml_tensor* xn, ggml_tensor* qkv_w,
                                ggml_tensor* gate_w, ggml_tensor* gate_b, ggml_tensor* out_w, ggml_tensor* pos_t, int S,
-                               int B, int dim, int heads, int dim_head) {
+                               int B, int heads, int dim_head) {
     const int inner = heads * dim_head;
     ggml_tensor* qkv = ggml_mul_mat(g, qkv_w, xn); // (3*inner, S, B)
 
@@ -748,7 +748,7 @@ static ggml_tensor* g_mbr_attn(ggml_context* g, ggml_tensor* x, ggml_tensor* xn,
 // FFN: x -> x + (Linear(dim->hid) -> GELU(erf) -> Linear(hid->dim)), pre-RMS.
 static ggml_tensor* g_mbr_ffn(ggml_context* g, ggml_tensor* x, ggml_tensor* ff_g, ggml_tensor* ff1_w,
                               ggml_tensor* ff1_b, ggml_tensor* ff4_w, ggml_tensor* ff4_b, ggml_tensor* eps_t,
-                              ggml_tensor* sqrt_dim_t, int S, int B, int dim, int hid) {
+                              ggml_tensor* sqrt_dim_t, int dim, int hid) {
     ggml_tensor* fn = g_rms_dim(g, x, ff_g, eps_t, sqrt_dim_t); // (dim,S,B)
     ggml_tensor* h1 = ggml_mul_mat(g, ff1_w, fn);
     if (ff1_b)
@@ -788,8 +788,8 @@ static ggml_tensor* mbr_block_layer_graph(mel_band_roformer_context* ctx, ggml_c
     const int hid = (int)ff1_b->ne[0];
 
     ggml_tensor* xn = g_rms_dim(g, x_b, nrm_g, eps_t, sqrt_dim_t);
-    ggml_tensor* y = g_mbr_attn(g, x_b, xn, qkv_w, gate_w, gate_b, out_w, pos_t, S, B, dim, heads, dim_head);
-    y = g_mbr_ffn(g, y, ff_g, ff1_w, ff1_b, ff4_w, ff4_b, eps_t, sqrt_dim_t, S, B, dim, hid);
+    ggml_tensor* y = g_mbr_attn(g, x_b, xn, qkv_w, gate_w, gate_b, out_w, pos_t, S, B, heads, dim_head);
+    y = g_mbr_ffn(g, y, ff_g, ff1_w, ff1_b, ff4_w, ff4_b, eps_t, sqrt_dim_t, dim, hid);
     y = g_rms_dim(g, y, fg, eps_t, sqrt_dim_t); // final layer norm
     return y;
 }
@@ -1405,7 +1405,6 @@ static bool mbr_fused_graph(mel_band_roformer_context* ctx, const std::vector<fl
             ggml_free(gctx);
             return false;
         }
-        const int hid = (int)b0->ne[0];
         const int din2 = (int)b4->ne[0]; // 2 * band width
         const int din = din2 / 2;
         if (din != ctx->band_width[b]) {
@@ -1682,20 +1681,15 @@ mel_band_roformer_result* mel_band_roformer_separate(mel_band_roformer_context* 
     // 10 s default ran the time-transformer's RoPE positions 25% past anything
     // seen in training on every segment of long audio.
     // Env overrides for CLI A/B: CRISPASR_MELBAND_SEG_S, CRISPASR_MELBAND_NO_SEGMENT.
-    int seg_s = ctx->params.segment_seconds;
-    if (const char* seg_env = std::getenv("CRISPASR_MELBAND_SEG_S")) {
-        int s = atoi(seg_env);
-        if (s > 0)
-            seg_s = s;
-    }
     bool no_seg = ctx->params.no_segment;
     if (const char* ns_env = std::getenv("CRISPASR_MELBAND_NO_SEGMENT"))
         no_seg = ns_env[0] && atoi(ns_env) != 0;
-    // Default segment: the checkpoint's trained chunk. hp.chunk_size is in
-    // samples; 8 s is the Kim vocals chunk (352800 @ 44100) for GGUFs that
-    // predate the metadata (review #422: 10 s extrapolated RoPE).
-    const int default_seg_s = ctx->hp.chunk_size > 0 ? ctx->hp.chunk_size / ctx->hp.sample_rate : 8;
-    const int seg_len = (seg_s > 0 ? seg_s : default_seg_s) * ctx->hp.sample_rate;
+    // Segment length resolution (env > params > trained chunk > 8 s fallback)
+    // lives in mel_band_gates.h as a pure function so the precedence and the
+    // samples-vs-seconds distinction are unit-locked rather than inline here —
+    // see tests/test-mel-band-gates.cpp.
+    const int seg_len = mel_band_gates::resolve_segment_len(
+        ctx->params.segment_seconds, std::getenv("CRISPASR_MELBAND_SEG_S"), ctx->hp.chunk_size, ctx->hp.sample_rate);
     if (no_seg || n_samples <= seg_len || seg_len <= 0)
         return mel_band_roformer_separate_full(ctx, pcm, n_samples, in_channels);
 
@@ -1949,7 +1943,15 @@ int mel_band_roformer_parity(const char* model_gguf, const char* audio_wav, int 
     return all_ok ? 0 : 1;
 }
 
+// NOTE on `audio_wav`: deliberately unused. The input comes from the reference
+// GGUF's own `input_audio` stage, so both sides see BYTE-IDENTICAL samples and
+// a decode/resample difference cannot be mistaken for a model difference. The
+// parameter is kept for signature symmetry with the other diff entry points
+// (and crispasr-diff passes one), but the file on disk is NOT read here —
+// passing a different wav changes nothing, which is worth stating rather than
+// leaving a caller to discover it from a result that silently ignored them.
 int mel_band_roformer_diff(const char* model_gguf, const char* ref_gguf, const char* audio_wav, int verbosity) {
+    (void)audio_wav;
     mel_band_roformer_context* ctx = mel_band_roformer_init_from_file(model_gguf, mel_band_roformer_default_params());
     if (!ctx) {
         fprintf(stderr, "mbr_diff: failed to load model %s\n", model_gguf);
