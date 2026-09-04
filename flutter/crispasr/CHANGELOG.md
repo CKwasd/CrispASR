@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.32
+
+* **Five new backends**: Raon-OpenTTS speech synthesis, Quds Persian
+  recognition, and MT3 / Basic Pitch / mel-band-roformer on the music and
+  separation surfaces, with Standard MIDI output (#250, #387, #422).
+* **Source separation runs on the GPU by default** where one is present —
+  HTDemucs and the new fused mel-band-roformer graph (#413, #414, #422).
+* **Nemotron `-l auto` no longer conditions on English regardless of the
+  detected language**, and reads its 121-entry language table from the model,
+  reaching 51 languages that were previously unnameable (#425).
+* Subtitle output returns the original script instead of transliterated text,
+  and Canary reports wrong-language conditioning instead of failing silently
+  (#419).
+* Live/streaming WebM decodes past the first 100 ms timeslice (#417), and a
+  malformed sample rate can no longer amplify a small file into a
+  multi-gigabyte allocation.
+* Kokoro honours `--tts-speed` (#423); FunASR, piano transcription, the
+  Bananamind vocoder and Sidon all get bit-identical speedups (#305, #416).
+
 ## 0.8.31
 
 * **Pocket-TTS** now supports German, Spanish, Italian, Portuguese, and French
