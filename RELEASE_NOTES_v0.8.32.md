@@ -43,10 +43,14 @@ including F5-TTS:
   the KQ product in F16, and on kernels that ignore `GGML_PREC_F32` — P100 /
   sm_60 confirmed — the precision hint is silently dropped. Measured against a
   torch-f16 mirror oracle, C++ drifted ~16x more than pure weight-f16 rounding
-  on the 0.3B and ~85x on the 1B, compounding to NaN. `CRISPASR_F5_NO_FLASH`
-  selects a manual F32 SDPA path that is hint-independent, and it collapses the
-  drift onto the oracle exactly. Adding the precision hint by itself changed
-  nothing, byte-for-byte, which is how the kernel was identified as the cause.
+  on the 0.3B and ~85x on the 1B, compounding to NaN. **Flash attention is now
+  opt-in on the f5 DiT**: the default is a manual F32 SDPA path that no
+  precision hint can silently drop, and it collapses the drift onto the oracle
+  exactly. `CRISPASR_F5_FLASH=1` restores the fused kernel where the hint is
+  honoured (`CRISPASR_F5_NO_FLASH=1` still forces manual, for back-compat).
+  Adding the precision hint by itself changed nothing, byte-for-byte, which is
+  how the kernel was identified as the cause — and why the default flipped
+  rather than a hardware allowlist being added.
 - **One-word `--tts` was rushed or truncated** on every f5-family backend.
   Upstream drops to `local_speed = 0.3` for generated text under 10 bytes, and
   that is now ported. It *replaces* rather than multiplies the user's
