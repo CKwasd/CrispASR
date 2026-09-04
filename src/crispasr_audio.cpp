@@ -125,6 +125,93 @@ namespace {
 // (Whisper-compatible) — overridden by crispasr_audio_load_at_rate().
 static thread_local int kTargetSampleRate = 16000;
 constexpr int kTargetChannels = 1;
+
+// Ceiling on how much PCM one decode may produce.
+//
+// Found by CI's seeded fuzzer on 2026-09-04 (run 33840954769): a 344 KB WAV
+// declaring `sampleRate = 1` is a structurally valid RIFF file, and miniaudio
+// dutifully resamples it to the 16 kHz target — a 16000x expansion — turning
+// 176 000 stored samples into 2.816e9 output frames, 11.3 GB, from an input
+// small enough to arrive as an ordinary HTTP upload. The three chunked-decode
+// loops below grow their buffer geometrically and had no ceiling at all, so
+// they simply kept doubling until the allocator or the OOM killer intervened.
+// Every surface that accepts a user-supplied file reaches this path.
+//
+// THE BOUND IS AGAINST INPUT SIZE, because the defect is AMPLIFICATION, not
+// length: a genuinely long recording carries proportionally more input bytes,
+// so a ratio bound never penalises it, while an absolute duration limit would
+// have to choose between rejecting real 8-hour recordings and permitting this.
+//
+// kMaxFramesPerInputByte = 256 against the worst ratios real encoders produce
+// at 16 kHz mono: AMR-NB at 4.75 kbit/s is ~27 output frames per input byte,
+// Opus at 6 kbit/s ~21, MPEG-2.5 mp3 at 8 kbit/s ~16, 8-bit 8 kHz PCM ~2. So
+// ~9.5x headroom over anything an encoder emits in practice. The one case that
+// reaches the bound is libopus driven to its 500 bit/s API floor (exactly 256),
+// which no encoder produces for speech; such a caller raises the ceiling with
+// CRISPASR_MAX_DECODED_FRAMES rather than being silently truncated.
+//
+// A second, absolute backstop covers large inputs, where 256x is still a lot:
+// 24 h at the target rate, which at 16 kHz mono f32 is 5.5 GB — past anything
+// that loads into RAM today, so it constrains only the pathological case.
+//
+// CRISPASR_MAX_DECODED_FRAMES REPLACES the effective ceiling (0 = no limit)
+// rather than raising just one of the two bounds. The first draft here had it
+// lift only the absolute backstop while the ratio bound still applied — so the
+// rejection message named a knob that could not lift the bound that had
+// actually fired, which is worse than no knob.
+constexpr size_t kMaxFramesPerInputByte = 256;
+
+size_t crispasr_max_decoded_frames(const char* path) {
+    // Every caller computes `ceiling + one chunk` when clamping its allocation,
+    // so a ceiling near SIZE_MAX would wrap that sum to a tiny number and spin
+    // the grow branch forever. Halving the representable range costs nothing
+    // real (SIZE_MAX/2 frames is 4 exabytes of f32) and removes the wrap.
+    const size_t kCeilingMax = (size_t)-1 / 2;
+    auto clamp = [&](size_t v) { return v > kCeilingMax ? kCeilingMax : v; };
+
+    if (const char* env = std::getenv("CRISPASR_MAX_DECODED_FRAMES")) {
+        char* end = nullptr;
+        const unsigned long long v = std::strtoull(env, &end, 10);
+        if (end != env && *end == '\0')
+            return v == 0 ? 0 : clamp((v > (unsigned long long)(size_t)-1) ? (size_t)-1 : (size_t)v); // 0 = unlimited
+        // An unparseable value falls through to the defaults rather than
+        // silently meaning "unlimited".
+    }
+
+    // uint64 math then clamp: at a 96 kHz target rate 24 h does not fit in a
+    // 32-bit size_t, and a wrapped backstop would read as "almost no limit".
+    const uint64_t abs64 = (uint64_t)(kTargetSampleRate > 0 ? kTargetSampleRate : 16000) * 60u * 60u * 24u;
+    const size_t abs_cap = (abs64 > (uint64_t)(size_t)-1) ? (size_t)-1 : (size_t)abs64;
+
+    size_t rel_cap = 0;
+    if (FILE* f = std::fopen(path, "rb")) {
+        if (std::fseek(f, 0, SEEK_END) == 0) {
+            const long n = std::ftell(f);
+            if (n > 0) {
+                // Saturate rather than wrap on 32-bit, where size_t is 4 bytes
+                // and a 500 MB input times 256 does not fit.
+                rel_cap =
+                    ((size_t)n > (size_t)-1 / kMaxFramesPerInputByte) ? (size_t)-1 : (size_t)n * kMaxFramesPerInputByte;
+            }
+        }
+        std::fclose(f);
+    }
+
+    if (rel_cap == 0)
+        return clamp(abs_cap); // unstattable: only the backstop applies
+    return clamp(rel_cap < abs_cap ? rel_cap : abs_cap);
+}
+
+// Shared by the three loops: report once, with the override, so a caller who
+// hits the ceiling legitimately can tell it apart from a corrupt file.
+void crispasr_report_decode_ceiling(const char* path, size_t max_frames) {
+    std::fprintf(stderr,
+                 "[crispasr-audio] '%s' decodes to more than %zu frames at %d Hz and was rejected.\n"
+                 "                 This usually means a malformed header (e.g. a WAV declaring a 1 Hz\n"
+                 "                 sample rate) asking for an enormous resample. If the file is real,\n"
+                 "                 raise CRISPASR_MAX_DECODED_FRAMES.\n",
+                 path ? path : "(null)", max_frames, kTargetSampleRate);
+}
 } // namespace
 
 // Apple-platform fallback for formats the permissive miniaudio path can't
@@ -185,11 +272,23 @@ int crispasr_at_decode(const char* path, int want_channels, float** out_interlea
     }
 
     const UInt32 chunkFrames = (UInt32)kTargetSampleRate; // 1 s
+    const size_t max_frames = crispasr_max_decoded_frames(path);
     float* buf = nullptr;
     size_t cap = 0, used = 0; // frames
     for (;;) {
+        if (max_frames && used >= max_frames) {
+            crispasr_report_decode_ceiling(path, max_frames);
+            std::free(buf);
+            ExtAudioFileDispose(af);
+            return -3;
+        }
         if (cap - used < chunkFrames) {
-            const size_t newcap = cap ? cap * 2 : (size_t)chunkFrames * 8;
+            size_t newcap = cap ? cap * 2 : (size_t)chunkFrames * 8;
+            // Never allocate past the ceiling. One chunk of slack keeps
+            // `cap - used >= chunkFrames` true for every `used < max_frames`,
+            // so the clamp cannot spin re-allocating the same size forever.
+            if (max_frames && newcap > max_frames + chunkFrames)
+                newcap = max_frames + chunkFrames;
             float* nb = (float*)std::realloc(buf, newcap * (size_t)ch * sizeof(float));
             if (!nb) {
                 std::free(buf);
@@ -2942,13 +3041,24 @@ CA_EXPORT int crispasr_audio_load(const char* path, float** out_pcm, int* out_sa
     // and sidesteps that. The total allocation grows geometrically so we
     // don't re-alloc every chunk.
     const ma_uint64 kChunkFrames = (ma_uint64)kTargetSampleRate; // 1 s
+    const size_t max_frames = crispasr_max_decoded_frames(path);
     float* buf = nullptr;
     size_t capacity = 0;
     size_t used = 0;
 
     for (;;) {
+        if (max_frames && used >= max_frames) {
+            crispasr_report_decode_ceiling(path, max_frames);
+            std::free(buf);
+            ma_decoder_uninit(&decoder);
+            return -3;
+        }
         if (capacity - used < kChunkFrames) {
-            const size_t new_cap = capacity ? capacity * 2 : kChunkFrames * 8;
+            size_t new_cap = capacity ? capacity * 2 : (size_t)kChunkFrames * 8;
+            // See the Apple loop: clamping to the ceiling plus one chunk keeps
+            // the grow branch unreachable once the ceiling is allocated.
+            if (max_frames && new_cap > max_frames + (size_t)kChunkFrames)
+                new_cap = max_frames + (size_t)kChunkFrames;
             float* nb = (float*)std::realloc(buf, new_cap * sizeof(float));
             if (!nb) {
                 if (buf)
@@ -3159,13 +3269,24 @@ CA_EXPORT int crispasr_audio_load_stereo(const char* path, float** out_left, flo
         return -2;
 
     const ma_uint64 kChunkFrames = (ma_uint64)kTargetSampleRate; // 1 s
+    const size_t max_frames = crispasr_max_decoded_frames(path);
     float* buf = nullptr;
     size_t capacity = 0; // in frames
     size_t used = 0;     // in frames
 
     for (;;) {
+        if (max_frames && used >= max_frames) {
+            crispasr_report_decode_ceiling(path, max_frames);
+            std::free(buf);
+            ma_decoder_uninit(&decoder);
+            return -3;
+        }
         if (capacity - used < kChunkFrames) {
-            const size_t new_cap = capacity ? capacity * 2 : kChunkFrames * 8;
+            size_t new_cap = capacity ? capacity * 2 : (size_t)kChunkFrames * 8;
+            // See the Apple loop: clamping to the ceiling plus one chunk keeps
+            // the grow branch unreachable once the ceiling is allocated.
+            if (max_frames && new_cap > max_frames + (size_t)kChunkFrames)
+                new_cap = max_frames + (size_t)kChunkFrames;
             float* nb = (float*)std::realloc(buf, new_cap * (size_t)decode_channels * sizeof(float));
             if (!nb) {
                 if (buf)

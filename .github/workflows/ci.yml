@@ -315,7 +315,24 @@ jobs:
           # Inputs that once crashed a parser. A seeded 45 s run rediscovers a
           # crash only by luck — replaying these makes each fixed bug a
           # deterministic gate instead of a coin flip.
-          cp tests/fuzz/regressions/*.ogg fuzz-corpus/ 2>/dev/null || true
+          #
+          # COUNTED, not globbed-and-hoped. The previous form was
+          # `cp .../*.ogg ... || true`, and tests/.gitignore excludes *.ogg, so
+          # the one documented seed was never committed and the glob matched
+          # nothing on every run since. A gate that replays an empty set reports
+          # exactly what a passing gate reports, so it has to be able to say so.
+          n_seeds=0
+          for f in tests/fuzz/regressions/*; do
+            case "$f" in *README.md|*.gitignore) continue ;; esac
+            [ -f "$f" ] || continue
+            cp "$f" fuzz-corpus/
+            n_seeds=$((n_seeds + 1))
+          done
+          echo "replaying $n_seeds regression seed(s)"
+          if [ "$n_seeds" -eq 0 ]; then
+            echo "::error::tests/fuzz/regressions/ contributed no seeds — check tests/.gitignore"
+            exit 1
+          fi
           ./build-fuzz/bin/crispasr-fuzz-audio -max_total_time=45 -max_len=1048576 \
              -rss_limit_mb=4096 -artifact_prefix=fuzz-artifacts/ fuzz-corpus
 
