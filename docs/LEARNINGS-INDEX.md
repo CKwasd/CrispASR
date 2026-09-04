@@ -17,7 +17,7 @@ per-backend porting detail (Per-model port notes + the family cross-reference).
 Reach for the topic groups when you are stuck on a *technique*, and the
 cross-reference when you already know which model you are touching.
 
-## Index by topic (297 lessons)
+## Index by topic (298 lessons)
 
 **Security & untrusted input** (2)
 
@@ -354,12 +354,13 @@ cross-reference when you already know which model you are touching.
 - L18186 — Four bugs that together caused empty/garbage transcripts; all patched in src/vibevoice.cpp +…
 - L18411 — "Verified byte-identical at 225 s" verified a clip, not a length — and a decoder that drops spans needs a repair pass, not a better cap
 
-**Uncategorised** (4)
+**Uncategorised** (5)
 
 - L195 — An arm that fails under every condition cannot discriminate a fix
 - L216 — Hardcoded token ids need a guard that DECODES them
 - L267 — Model-emitted sentinels are not transcript text
 - L18638 — An ISA gate that "safely refuses" the only CPU module ships a process that cannot run — and every safety layer downstream assumed the layer above had fired
+- L18751 — An amplifying decoder needs a bound against INPUT SIZE, not duration — and the regression corpus that would have caught it had never been committed
 
 ## Cross-reference by model / family
 

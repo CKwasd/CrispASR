@@ -40,9 +40,19 @@ vulkan = []
 #     std's floor      ~3.9 MB  (precompiled rlibs; [profile.dev] cannot touch)
 #     profile-governed ~151 MB
 #
-#     dev default (debug=2)   187.9 MB
-#     line-tables-only         ~60 MB   -68%
-#     debug = 0                ~36.7 MB -80%
+#     dev default (debug=2)   187.9 MB  MEASURED (readelf -S, one artifact)
+#     line-tables-only         ~60 MB   -68%  PROJECTED from the section sizes
+#     debug = 0                ~36.7 MB -80%  PROJECTED
+#
+# THE PROJECTIONS OVERSHOOT, and by a knowable amount. bw-fixes-1 measured the
+# real thing on kerotakis afterwards: deps 13.7 GB -> 6.1 GB and the binary
+# -61%, against the -68% projected here. The gap is not noise — std's
+# precompiled floor is a FIXED cost the profile cannot touch, so the percentage
+# saving degrades as binaries get smaller. That single fact also explains the
+# hello-world measurement that said 0.1% and was off by ~700x: on a toy binary
+# the untouchable floor IS the whole binary. Expect -55% to -65% in practice,
+# and readelf an artifact from the class you actually care about before
+# quoting a number for a different one.
 #
 # line-tables-only, alone: the extra ~1.5 GB/repo that debug=0 would save is not
 # worth losing per-frame `at ./src/...` lines in backtraces. Do NOT add

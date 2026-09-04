@@ -177,10 +177,16 @@ q4_0/q8_0/q4_K at these shapes was verified via test-backend-ops on lavapipe,
 and the detector shows the fix removes every broadcasting quantized matmul
 (sidon 8->0, beat-this 29->0, cosyvoice3 133->0).
 
-**THE FIX IS UNRELEASED.** 6b396bb9 is not in v0.8.31, which is what the
-reporter runs — so users who downloaded the old quantized GGUFs and never
-re-download are still exposed, and the runtime fix is the only thing that would
-protect them. Shipping a release is the concrete remaining action on this issue.
+**THE FIX SHIPPED IN v0.8.32** (2026-09-04, tag at `26a3d2a6`). It was
+unreleased for two days: 6b396bb9 was not in v0.8.31, which is what the reporter
+runs, so users who downloaded the old quantized GGUFs and never re-download were
+exposed and the runtime fix was the only thing that would protect them. Shipping
+was the concrete remaining action and it is done — v0.8.32 carries 6b396bb9, the
+`core_quant_bcast::audit` detector, and the beat-this / cosyvoice3 folds.
+
+The reporter still has to be told, and the residual risk below is unchanged: the
+fix's specific 73-element gather has still not run on an int-dot device, so this
+issue stays OPEN on evidence, not on shipping.
 
 Verification routes for the exact path, all three now closed with evidence:
 - *local Vulkan* — one build away, glslc solved (LunarG SDK shaderc v2026.3 at

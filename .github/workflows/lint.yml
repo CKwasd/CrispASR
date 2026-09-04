@@ -54,6 +54,16 @@ on:
       # Release-tooling consistency (release-consistency job). A version bump
       # touches NONE of the C++ paths above, so without these the check would
       # never run on the commits it exists to guard.
+      #
+      # RELEASE_NOTES_*.md is here for exactly the same reason and was missing.
+      # The convention is "write the notes, then tag", so the TAGGED commit is
+      # routinely docs-only and matched none of these paths — meaning neither
+      # release-consistency nor the workflow-shell lint ran on the exact tree
+      # that ships. v0.8.32 hit this at 26a3d2a6 and had to be linted by a
+      # manual workflow_dispatch instead (run 33844654678). The trap is already
+      # documented at the top of this filter for #369: knowing the pattern did
+      # not stop the next instance of it, so the filter has to encode it.
+      - 'RELEASE_NOTES_*.md'
       - 'VERSION'
       - 'scripts/sync-version.py'
       - 'scripts/bump-version.sh'
@@ -140,6 +150,16 @@ on:
       # Release-tooling consistency (release-consistency job). A version bump
       # touches NONE of the C++ paths above, so without these the check would
       # never run on the commits it exists to guard.
+      #
+      # RELEASE_NOTES_*.md is here for exactly the same reason and was missing.
+      # The convention is "write the notes, then tag", so the TAGGED commit is
+      # routinely docs-only and matched none of these paths — meaning neither
+      # release-consistency nor the workflow-shell lint ran on the exact tree
+      # that ships. v0.8.32 hit this at 26a3d2a6 and had to be linted by a
+      # manual workflow_dispatch instead (run 33844654678). The trap is already
+      # documented at the top of this filter for #369: knowing the pattern did
+      # not stop the next instance of it, so the filter has to encode it.
+      - 'RELEASE_NOTES_*.md'
       - 'VERSION'
       - 'scripts/sync-version.py'
       - 'scripts/bump-version.sh'
