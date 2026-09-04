@@ -9,16 +9,19 @@ graph that runs a 359 s track at RTF 0.076.
 
 The second theme is that accelerated paths now *default* to being fast.
 HTDemucs picks the fused GPU graph on any host that has a real GPU, FunASR
-caches its decode and encoder graphs, piano transcription and the Bananamind
-vocoder use every core, and Sidon chooses its relative-position formulation
-from the actual sequence length. Every one of those is bit-identical to the
-path it replaces, or says plainly where it is not.
+caches its decode and encoder graphs, piano transcription threads its
+convolutions and recurrent layers, the Bananamind vocoder finally runs as a
+graph on a GPU-capable scheduler, and Sidon chooses its relative-position
+formulation from the actual sequence length. Every one of those is
+bit-identical to the path it replaces, or says plainly where it is not.
 
 The third is language handling. Nemotron's `-l auto` was silently conditioning
 on the English prompt no matter what language ID detected; subtitle output was
-returning transliterated text as the transcript; three backends accepted
-languages they cannot recognise and answered anyway. Those are fixed, and a
-malformed audio file can no longer make the decoder allocate 11 GB.
+returning transliterated text as the transcript; MOSS transcribe was silently
+translating Chinese and German into English at a success return code; and the
+C session ABI and the server both dispatched languages a monolingual backend
+cannot satisfy. Those are fixed, and a malformed audio file can no longer make
+the decoder allocate 11 GB.
 
 ---
 
@@ -237,7 +240,9 @@ limits, and BitNet TQ weights route to CPU under Vulkan, rather than failing.
 
 ## Performance
 
-All of the following are bit-identical to the path they replace unless stated.
+All of the following are bit-identical to the path they replace except where
+called out — and the two exceptions are called out, rather than being folded
+into an average.
 
 - **FunASR graph caches.** The decode step graph is cached in buckets of 16 KV
   positions with a four-graph FIFO, padded slots masked to −inf so flash
@@ -252,12 +257,18 @@ All of the following are bit-identical to the path they replace unless stated.
 - **The Bananamind vocoder** (#305) was the one HiFi-GAN-family vocoder still
   on the legacy transpose path and pinned to CPU. It now has pre-permuted
   transposed-convolution weights, the fast-convolution bake, and all three
-  graphs on a GPU-capable scheduler. PCM cosine 1.000000000.
+  graphs on a GPU-capable scheduler. PCM cosine 1.000000000 with at most one
+  int16 least-significant-bit of difference — not bit-identical, but the
+  TTS→ASR transcripts are byte-identical on English and German at F32 and Q8_0.
+  `CRISPASR_BANANAMIND_VOC_LEGACY=1` restores the old path exactly.
 - **Sidon picks its relative-position formulation from the sequence length**
   (#416). The `expand` formulation is 2.7x faster in the predictor at T = 557
   but materialises a table costing an extra 196·T² bytes — 58 MiB there, but
   1.64 GiB at the 3000-frame cap. It is now selected automatically within a
-  memory budget, on GPU backends, and re-resolved per graph build.
+  memory budget, on GPU backends, and re-resolved per graph build. This is the
+  one item here that is **not** bit-identical: the two formulations agree only
+  to cosine 0.99999999, so a sequence length crossing the budget changes the
+  output in its last digits. `CRISPASR_SIDON_RPE` forces either formulation.
 - **Nemotron GPU fast paths** (#424, contributed by jltjarvinen) — a one-shot
   GPU streaming encoder keeping attention and convolution caches on-device,
   cached chunk graphs, direct convolutions, a batched joint projection and a
@@ -279,11 +290,12 @@ routed through Vulkan's MMQ path on integer-dot GPUs, where it produces silence
 on the reporting user's hardware. Two independent static searches each found
 sites the other missed, so this ships a **runtime** detector instead —
 `CRISPASR_AUDIT_QUANT_BCAST=1` walks the node list at compute time and prints
-the real shapes. Validated in both directions: eight sites with the fix off,
-zero with it on. Sidon's own case is fixed, and the beat-this and CosyVoice3
+the real shapes. Validated in both directions, per backend: Sidon 8 sites with
+the fix off and 0 with it on, beat-this 29 → 0, CosyVoice3 133 → 0. Sidon's own
+case is fixed by dequantizing the table, and the beat-this and CosyVoice3
 sites are folded by collapsing the batch dimension into the token dimension —
-an exact restatement for a per-token-independent projection, and unlike the
-Sidon fix it does not dequantize. The CosyVoice3 fold is bit-identical.
+an exact restatement for a per-token-independent projection, and one that does
+not dequantize. The CosyVoice3 fold is bit-identical.
 
 Sidon also now reports a degenerate decode instead of returning empty output
 at a success code.
