@@ -3,7 +3,9 @@
 #include "audio_resample.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <vector>
@@ -70,6 +72,9 @@ static int gcd(int a, int b) {
 
 } // namespace
 
+// Largest upsample this will perform. See the note in resample_polyphase.
+static constexpr int kMaxResampleRatio = 64;
+
 std::vector<float> resample_polyphase(const float* in, int n_in, int src_rate, int dst_rate, int num_zeros,
                                       float kaiser_beta) {
     if (!in || n_in <= 0 || src_rate <= 0 || dst_rate <= 0)
@@ -80,15 +85,47 @@ std::vector<float> resample_polyphase(const float* in, int n_in, int src_rate, i
         return out;
     }
 
+    // BOUND THE EXPANSION BEFORE COMPUTING ANYTHING.
+    //
+    // `sr` reaches most callers straight out of a decoded file header, so
+    // dst_rate/src_rate is attacker-controlled. A WAV declaring sampleRate = 1
+    // asks this function for a 16000x upsample: 176 000 input samples become
+    // 2.816e9 output floats, 11.3 GB. (Same input, different code path, as the
+    // crispasr_audio_load ceiling — that one bounds the DECODE, this bounds the
+    // RESAMPLE, and the CLI reaches only this one.)
+    //
+    // THE PREVIOUS GUARD DID NOT GUARD. n_out was computed into an `int`, so
+    // that case overflowed to -1478967296 and the `n_out <= 0` test below
+    // caught it BY LUCK — the product happened to land negative. At 300 000
+    // input samples the same expression overflows to +505032704 and at 400 000
+    // to +2105032704: positive, past the test, allocating gigabytes and then
+    // resampling with a length that has nothing to do with the data. A guard
+    // whose input has already overflowed is not a guard.
+    //
+    // 64x against what real conversions need: 8k->48k is 6x, 16k->48k is 3x,
+    // 8k->96k is 12x. Five times the headroom of the most extreme legitimate
+    // ratio, and three orders of magnitude below the abusive one.
+    const int64_t n_out64 = ((int64_t)n_in * dst_rate + src_rate - 1) / src_rate;
+    if (n_out64 <= 0 || n_out64 > (int64_t)n_in * kMaxResampleRatio || n_out64 > (int64_t)INT_MAX) {
+        // LOUD, because the caller cannot tell an empty return from silence.
+        // read_audio_data assigned this straight into its PCM buffer, so the
+        // CLI reported "0 samples ... no speech detected" and exited 0 — a
+        // rejection rendered as a successful transcription of nothing.
+        std::fprintf(stderr,
+                     "[crispasr-resample] refusing %d samples at %d Hz -> %d Hz: %lld output samples exceeds the "
+                     "%dx expansion limit. A sample rate this far from the target usually means a malformed "
+                     "header.\n",
+                     n_in, src_rate, dst_rate, (long long)n_out64, kMaxResampleRatio);
+        return {};
+    }
+
     const int g = gcd(src_rate, dst_rate);
     const int L = dst_rate / g;
     const int M = src_rate / g;
 
     // Total output length — round up so we never silently drop trailing
     // input samples.
-    const int n_out = (int)(((int64_t)n_in * dst_rate + src_rate - 1) / src_rate);
-    if (n_out <= 0)
-        return {};
+    const int n_out = (int)n_out64;
 
     auto h = build_filter(L, M, num_zeros, kaiser_beta);
     const int half_len = ((int)h.size() - 1) / 2;

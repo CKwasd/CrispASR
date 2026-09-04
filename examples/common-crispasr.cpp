@@ -238,6 +238,19 @@ bool read_audio_data(const std::string& fname, std::vector<float>& pcmf32, std::
                 plane[(size_t)i] = pcmf32[(size_t)(i * ch + c)];
             out_planes[(size_t)c] =
                 core_audio::resample_polyphase(plane.data(), (int)frame_count, src_rate, effective_rate);
+            // An empty result from a NON-EMPTY input is a refusal, not silence.
+            // resample_polyphase rejects an absurd expansion (a WAV declaring
+            // sampleRate = 1 asks for 16000x), and assigning that straight into
+            // pcmf32 made the CLI print "0 samples ... no speech detected" and
+            // exit 0 — a rejection rendered as a successful transcription of
+            // nothing, which is the one outcome a user cannot act on.
+            if (out_planes[(size_t)c].empty()) {
+                fprintf(stderr,
+                        "error: failed to resample '%s' from %d Hz to %d Hz (see the resampler diagnostic above)\n",
+                        fname.c_str(), src_rate, effective_rate);
+                ma_decoder_uninit(&decoder);
+                return false;
+            }
         }
         const size_t n_out = out_planes[0].size();
         pcmf32.assign(n_out * (size_t)ch, 0.0f);

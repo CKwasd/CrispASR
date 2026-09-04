@@ -105,3 +105,63 @@ TEST_CASE("polyphase resampling is ripple-free on a constant input", "[unit][aud
         REQUIRE(interior_max_dev(output, level) < kMaxDev);
     }
 }
+
+// Regression: `sr` arrives from a decoded file header, so dst_rate/src_rate is
+// attacker-controlled. A WAV declaring sampleRate = 1 asks for a 16000x
+// upsample — 176 000 input samples become 2.816e9 output floats, 11.3 GB.
+//
+// THE OLD GUARD DID NOT GUARD. n_out was computed into an `int`, so that case
+// overflowed to -1478967296 and the `n_out <= 0` test caught it BY LUCK. The
+// cases below at 300 000 and 400 000 input samples overflow to +505032704 and
+// +2105032704 — positive, past the test, allocating gigabytes and resampling
+// with a length unrelated to the data. Those two are the point of this test:
+// the committed fuzz WAV alone would pass against the broken code.
+//
+// The accepted arm is not decoration. Without it, "rejected" is equally
+// explained by a resampler that rejects everything.
+TEST_CASE("polyphase resampling bounds the expansion ratio", "[unit][audio-resample]") {
+    auto tone = [](int n, int rate) {
+        std::vector<float> v((size_t)n);
+        for (int i = 0; i < n; i++)
+            // Literal, not M_PI: MSVC does not define it without _USE_MATH_DEFINES,
+            // and build.yml's ALL_BUILD compiles this whole tree on Windows.
+            v[(size_t)i] = std::sin(2.0 * 3.14159265358979323846 * 100.0 * i / (double)rate);
+        return v;
+    };
+
+    SECTION("real conversions are unaffected") {
+        struct {
+            int n, src, dst;
+        } ok[] = {
+            {176000, 44100, 16000}, // typical file -> model rate
+            {32000, 16000, 24000},  // vibevoice / kyutai
+            {16000, 8000, 48000},   // 6x, the widest real upsample
+            {16000, 8000, 96000},   // 12x
+            {1000, 1000, 64000},    // exactly at the limit
+        };
+        for (auto& c : ok) {
+            const auto in = tone(c.n, c.src);
+            const auto out = core_audio::resample_polyphase(in.data(), c.n, c.src, c.dst);
+            INFO("" << c.src << " -> " << c.dst);
+            REQUIRE_FALSE(out.empty());
+            CHECK((int64_t)out.size() == ((int64_t)c.n * c.dst + c.src - 1) / c.src);
+        }
+    }
+
+    SECTION("absurd expansion is refused, including the cases that overflowed positive") {
+        struct {
+            int n, src, dst;
+        } bad[] = {
+            {1000, 1000, 65000}, // one past the limit
+            {176000, 1, 16000},  // the committed fuzz WAV; overflowed NEGATIVE
+            {300000, 1, 16000},  // overflowed to +505032704
+            {400000, 1, 16000},  // overflowed to +2105032704
+        };
+        for (auto& c : bad) {
+            const auto in = tone(c.n, c.src > 0 ? c.src : 1);
+            const auto out = core_audio::resample_polyphase(in.data(), c.n, c.src, c.dst);
+            INFO("n=" << c.n << " " << c.src << " -> " << c.dst);
+            CHECK(out.empty());
+        }
+    }
+}

@@ -215,13 +215,24 @@ fragments never trip it.
 
 Found by the seeded fuzzer in CI. A structurally valid 344 KB WAV declaring
 `sampleRate = 1` resamples 16000x to the 16 kHz target — 2.816e9 frames,
-11.3 GB — and the chunked decode loops grew geometrically with no ceiling. It
-reaches every surface that accepts a user-supplied file, server upload
-included. Decoded frames are now bounded against **input size**, because the
-defect is amplification rather than length: 256 output frames per input byte,
-roughly 9.5x more than the most extreme ratio any real encoder produces, plus a
+11.3 GB — and the chunked decode loops in `crispasr_audio_load` grew
+geometrically with no ceiling. That is the C ABI path: the bindings, the
+server, and every caller that hands a file to a CrispASR session. Decoded
+frames are now bounded against **input size**, because the defect is
+amplification rather than length: 256 output frames per input byte, roughly
+9.5x more than the most extreme ratio any real encoder produces, plus a
 24-hour absolute backstop. `CRISPASR_MAX_DECODED_FRAMES` replaces the ceiling
 for anyone who genuinely needs more.
+
+**Scope, stated precisely.** The `crispasr` CLI does *not* use that function —
+it has its own decoder in `read_audio_data`, which decodes at the file's native
+rate and resamples afterwards, so the same input reaches a different piece of
+code. On this release the CLI does not blow up on it, but only by accident: its
+output-length arithmetic overflowed a 32-bit `int` into a negative number and
+tripped an unrelated `<= 0` check. Inputs a little larger overflow *positive*
+and get through. That second path is fixed after this tag and ships in the next
+release; if you drive untrusted audio through the CLI specifically, that is the
+one to wait for.
 
 ### Live and streaming WebM decoded only the first 0.1 s (#417)
 
