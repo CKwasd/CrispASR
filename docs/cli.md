@@ -329,6 +329,7 @@ Distinct exit codes let a caller tell *which* stage failed:
 | Exit | Meaning |
 |---|---|
 | `2` | Config error — a `--require-*` whose stage was never requested |
+| `4` | An input file could not be decoded (bad container, or a header asking for an absurd resample) |
 | `30` | Required VAD model failed to load |
 | `31` | Required word timestamps missing (aligner failed to load, or no native/aligned words on a non-empty segment) |
 | `32` | Required punctuation model failed to load |

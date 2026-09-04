@@ -2825,6 +2825,13 @@ int main(int argc, char** argv) {
         }
     }
 
+    // docs/cli.md publishes "rc 0 <=> every required stage succeeded", but an
+    // input that could not be read only printed to stderr and `continue`d, so a
+    // run in which EVERY file failed still exited 0. A caller then gets an empty
+    // transcript and a success code, which is the one outcome it cannot act on.
+    // Counted here and turned into a non-zero exit below.
+    int n_read_failures = 0;
+
     for (int f = 0; f < (int)params.fname_inp.size(); ++f) {
         const auto& fname_inp = params.fname_inp[f];
         struct fout_factory {
@@ -2879,6 +2886,7 @@ int main(int argc, char** argv) {
 
         if (!::read_audio_data(fname_inp, pcmf32, pcmf32s, params.diarize)) {
             fprintf(stderr, "error: failed to read audio file '%s'\n", fname_inp.c_str());
+            n_read_failures++;
             continue;
         }
 
@@ -3192,13 +3200,19 @@ int main(int argc, char** argv) {
     }
     whisper_free(ctx);
 
+    // 4 = at least one input could not be decoded. Distinct from 10 (decoded
+    // fine, inference failed) and from the 30/31/32 strict-pipeline codes.
+    const int rc = n_read_failures > 0 ? 4 : 0;
+
 #if defined(_WIN32)
     // Bypass global C++ destructors (ggml Vulkan device teardown can
     // stall indefinitely on Windows when the GPU is idle post-inference).
+    // NOTE: this said _Exit(0) unconditionally, so on Windows the CLI reported
+    // success no matter what happened — the exit code could not fail at all.
     std::fflush(stdout);
     std::fflush(stderr);
-    _Exit(0);
+    _Exit(rc);
 #else
-    return 0;
+    return rc;
 #endif
 }
