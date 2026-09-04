@@ -2490,6 +2490,15 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           NOTES="RELEASE_NOTES_${TAG}.md"
-          if [ -f "$NOTES" ]; then
-            gh release edit "$TAG" --notes-file "$NOTES"
+          # Hard-fail rather than skip. `if [ -f ]` meant a tag cut without its
+          # notes file published GitHub's auto-generated commit list as the
+          # release body and reported success — the one step whose whole job is
+          # the human-facing text, silently doing nothing. Old tags are
+          # unaffected: a re-run checks out that tag's own tree, which carries
+          # its own notes file even after main stops keeping the older ones.
+          if [ ! -f "$NOTES" ]; then
+            echo "::error::$NOTES is missing at $TAG. Write it, or attach the body by hand:"
+            echo "::error::  gh release edit $TAG --notes-file <file>"
+            exit 1
           fi
+          gh release edit "$TAG" --notes-file "$NOTES"

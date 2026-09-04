@@ -1941,8 +1941,11 @@ effort estimate. Completed items have been moved to `HISTORY.md`.
 > independent sequences and numbers may collide. When in doubt, PLAN
 > items are always written as `§N` and GitHub issues as `#N`.
 
-**Latest release: v0.8.20** (tag `v0.8.20`, + pub.dev `crispasr 0.8.20`). Release
-notes live on each tag; per-version `RELEASE_NOTES_v0.8.*.md` at repo root.
+**Latest release: v0.8.32** (tag `v0.8.32`, + pub.dev `crispasr 0.8.32`). Release
+notes live on each tag. Only the CURRENT version's `RELEASE_NOTES_v*.md` is kept
+at the repo root — older ones are removed when the next is written, since each
+tag carries its own copy and the GitHub release carries the published body.
+`release.yml` hard-fails if the file for the tag being cut is absent.
 The v0.8.18 → v0.8.20 train shipped in one session (2026-07-21): each patch was
 a genuine fix that only surfaced on a real tag run — see "Recent completions"
 and `LEARNINGS.md` "a green release job is not a shipped artifact".
