@@ -391,9 +391,15 @@ for the per-task flags and output formats.
   (`<input>_<stem>.wav`) via **mel-band-roformer** (vocal/instrumental, MIT) or
   **htdemucs** (4-stem). `--stems vocals,drums` selects a subset;
   `--sep-output-dir` sets the output location.
-- **Piano transcription** (`--backend piano-transcription`) — piano audio → MIDI
-- **Polyphonic note events** (`--backend basic-pitch`) — Spotify Basic Pitch, any instrument → note events (~110 KB model)
+- **Piano transcription** (`--backend piano-transcription`) — piano audio →
   note events (88 keys @ 100 fps, ByteDance/Kong CRNN; F16 GGUF ≈ 77 MB).
+- **Polyphonic note events** (`--backend basic-pitch`) — Spotify Basic Pitch,
+  any instrument → note events (~110 KB model).
+- **Multi-instrument transcription** (`--backend mt3`, alias
+  `music-transcription`) — MT3's T5 encoder/decoder emits note events with
+  per-instrument programs (F16 GGUF ≈ 96 MB).
+- All three take `--piano-format text|json|midi`; `midi` writes a Standard
+  MIDI File.
 - **Guitar tablature** (`--tab`) — per-frame fret-per-string grid via **TabCNN**
   (Wiggins & Kim, ISMIR 2019; CC BY 4.0 weights). The backend emits per-string
   emission scores, not a decided tablature — run your own constrained Viterbi via

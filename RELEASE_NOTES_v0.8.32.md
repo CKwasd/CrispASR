@@ -1,10 +1,11 @@
 # CrispASR v0.8.32
 
-Five new backends. Raon-OpenTTS and Quds bring Korean-trained F5 speech
-synthesis and Persian recognition; MT3 and Basic Pitch turn the `--piano`
-surface into general music transcription with Standard MIDI output; and
-mel-band-roformer joins HTDemucs as a GPU source separator, contributed by
-tilllt with a fused single graph that runs a 359 s track at RTF 0.076.
+Four new backends, and a fifth taken to the GPU. Raon-OpenTTS and Quds bring
+F5-family speech synthesis and Persian recognition; MT3 and Basic Pitch turn
+the `--piano` surface into general music transcription with Standard MIDI
+output; and mel-band-roformer, which shipped as a CPU path in v0.8.31, joins
+HTDemucs as a GPU source separator — contributed by tilllt with a fused single
+graph that runs a 359 s track at RTF 0.076.
 
 The second theme is that accelerated paths now *default* to being fast.
 HTDemucs picks the fused GPU graph on any host that has a real GPU, FunASR
@@ -25,11 +26,14 @@ malformed audio file can no longer make the decoder allocate 11 GB.
 
 ### Raon-OpenTTS (#387)
 
-`--backend raon` synthesises speech through the F5-family DiT and a HiFi-GAN
-vocoder, from a single self-contained GGUF (`cstr/raon-opentts-0.3b-GGUF`)
-carrying the DiT, the vocoder, the mel filterbank and window, and the vocab.
-The TTS→ASR roundtrip gate passes at 0.90 word overlap; the vocoder was
-validated in isolation at cosine 0.9979 against the reference.
+`--backend raon` synthesises English zero-shot voice-cloned speech through the
+F5-family DiT and a 16 kHz HiFi-GAN vocoder, from a single self-contained GGUF
+(`cstr/raon-opentts-0.3b-GGUF`, ~959 MB) carrying the DiT, the vocoder, the mel
+filterbank and window, and the vocab. The TTS→ASR roundtrip gate passes at 0.90
+word overlap; the vocoder was validated in isolation at cosine 0.9979 against
+the reference. `--backend raon-1b` adds KRAFTON's larger 1B DiT (~2.8 GB), also
+roundtrip-validated. Both are **CC-BY-NC-4.0, non-commercial only**, and
+auto-download prints the restriction before fetching.
 
 The vocoder runs as a ggml graph on the backend scheduler — the same
 `core_hifigan` path FastPitch, SpeechT5 and Bananamind use — rather than the

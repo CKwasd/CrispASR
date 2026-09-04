@@ -2,9 +2,10 @@
 
 ## 0.8.32
 
-* **Five new backends**: Raon-OpenTTS speech synthesis, Quds Persian
-  recognition, and MT3 / Basic Pitch / mel-band-roformer on the music and
-  separation surfaces, with Standard MIDI output (#250, #387, #422).
+* **Four new backends**: Raon-OpenTTS speech synthesis, Quds Persian
+  recognition, and MT3 / Basic Pitch on the music surface, with Standard MIDI
+  output (#250, #387). mel-band-roformer, already present on CPU, gains a
+  fused GPU graph (#422).
 * **Source separation runs on the GPU by default** where one is present —
   HTDemucs and the new fused mel-band-roformer graph (#413, #414, #422).
 * **Nemotron `-l auto` no longer conditions on English regardless of the
