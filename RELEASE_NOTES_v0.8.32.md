@@ -21,7 +21,8 @@ returning transliterated text as the transcript; MOSS transcribe was silently
 translating Chinese and German into English at a success return code; and the
 C session ABI and the server both dispatched languages a monolingual backend
 cannot satisfy. Those are fixed, and a malformed audio file can no longer make
-the decoder allocate 11 GB.
+CrispASR allocate 11 GB — on either of the two independent audio paths it
+turned out to have.
 
 ---
 
@@ -224,15 +225,29 @@ amplification rather than length: 256 output frames per input byte, roughly
 24-hour absolute backstop. `CRISPASR_MAX_DECODED_FRAMES` replaces the ceiling
 for anyone who genuinely needs more.
 
-**Scope, stated precisely.** The `crispasr` CLI does *not* use that function —
-it has its own decoder in `read_audio_data`, which decodes at the file's native
-rate and resamples afterwards, so the same input reaches a different piece of
-code. On this release the CLI does not blow up on it, but only by accident: its
-output-length arithmetic overflowed a 32-bit `int` into a negative number and
-tripped an unrelated `<= 0` check. Inputs a little larger overflow *positive*
-and get through. That second path is fixed after this tag and ships in the next
-release; if you drive untrusted audio through the CLI specifically, that is the
-one to wait for.
+**The CLI is a second, separate path, and it is fixed here too.** The
+`crispasr` CLI does not call `crispasr_audio_load`: it has its own decoder in
+`read_audio_data`, which decodes at the file's native rate and resamples
+afterwards, so the same input lands in `core_audio::resample_polyphase`
+instead. That function survived the malicious file only by accident — it
+computed its output length into a 32-bit `int`, and 176000 × 16000 overflowed
+to −1,478,967,296, which tripped an unrelated `n_out <= 0` check. Inputs a
+little larger overflow *positive* (300 000 samples → +505,032,704; 400 000 →
++2,105,032,704), sail past that check, allocate gigabytes and then resample
+with a length unrelated to the data. A guard whose input has already overflowed
+is not a guard.
+
+The length is now computed in 64-bit and the expansion bounded at 64×, against
+a widest real conversion of 12× (8 kHz → 96 kHz). This is not CLI-only: about
+ten call sites pass a sample rate taken straight from a file header, including
+reference-WAV voice cloning in CosyVoice3, Confucius4, MOSS and OmniVoice. The
+refusal is also audible now — it previously returned an empty buffer, which the
+CLI reported as `0 samples ... no speech detected` at a success exit code, the
+one outcome a user cannot act on.
+
+Both paths were found the same way and neither by reading code: the first by
+CI's seeded fuzzer, the second by downloading this release's own Linux tarball
+and running it against the first bug's regression input.
 
 ### Live and streaming WebM decoded only the first 0.1 s (#417)
 
