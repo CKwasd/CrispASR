@@ -3040,13 +3040,27 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
     // guard (a bad/too-long ref transcript must not collapse the rate to zero),
     // but only a very loose UPPER guard that catches a garbage near-empty
     // transcript (which would explode the duration) — not genuinely slow speech.
-    // KNOWN DELTA vs Raon's utils_infer.py (#387-adj, not yet ported): the
-    // upstream Raon inference sets local_speed = 0.3 when the gen text is < 10
-    // UTF-8 bytes, i.e. ~3.3x MORE frames for very short prompts (one-word
-    // synthesis). It also clamps sec_per_byte to a 12 chars/s floor via VAD. We
-    // do neither, so a one-word --tts will be rushed/truncated on BOTH 0.3B and
-    // 1B. Harmless for normal-length text (the clamp/local_speed don't fire).
-    // TODO: port the <10-byte local_speed=0.3 branch + the 12 c/s VAD clamp.
+    // SHORT-PROMPT HANDLING (#387-adj), ported from Raon's utils_infer.py — but
+    // only HALF of it, deliberately. Upstream does two things we did not:
+    //
+    //   (a) local_speed = 0.3 when the gen text is < 10 UTF-8 bytes, i.e. ~3.3x
+    //       MORE frames for one-word synthesis. PORTED below: without it a
+    //       one-word --tts was rushed or truncated on every f5-family backend.
+    //   (b) clamps sec_per_byte to a 12 chars/s floor via VAD. NOT PORTED, and
+    //       porting it would REINTRODUCE #294. The numbers, at mel_fps 93.75:
+    //           upstream 12 c/s cap   7.81 frames/byte = 1.08x fixed_rate
+    //           the cap that broke    18.03            = 2.50x  (truncated the
+    //             #294 reporter's slow reference — "leaves out parts of
+    //             sentences")
+    //           our current guard     57.69            = 8.00x
+    //       Upstream's clamp is 2.3x TIGHTER than one already measured to
+    //       truncate speech here. It is not the same quantity: upstream derives
+    //       sec_per_byte from VAD-measured speech with silence excluded, so the
+    //       clamp guards a silence-inflated ref; our `rate` comes from ref_T,
+    //       which INCLUDES silence and padding. Same number, different meaning.
+    //       Applying it literally would cap genuinely slow references.
+    //
+    // CRISPASR_F5_SHORT_PROMPT_SPEED=0 disables (a) for A/B.
     float rate = (float)ref_T / (float)std::max(1, ref_text_len);
     // The clamp is an ADD-ON over the upstream formula (which has no clamp); gate
     // it so it can be switched off. CRISPASR_F5_DURATION_CLAMP=0 restores the
@@ -3055,7 +3069,18 @@ int f5_tts_synthesize(struct f5_tts_context* ctx, const char* text, float** pcm_
     bool duration_clamp = !(clamp_env && std::strcmp(clamp_env, "0") == 0);
     if (duration_clamp)
         rate = std::min(std::max(rate, fixed_rate * 0.75f), fixed_rate * 8.0f);
-    int duration = ref_T + (int)(rate * (float)gen_text_len / ctx->speed);
+    // (a): upstream REPLACES the speed for very short gen text rather than
+    // multiplying, so a user --tts-speed does not compound with it.
+    const char* sp_env = crispasr_env::get("CRISPASR_F5_SHORT_PROMPT_SPEED");
+    const bool short_prompt_speed = !(sp_env && std::strcmp(sp_env, "0") == 0);
+    float eff_speed = ctx->speed;
+    if (short_prompt_speed && gen_text_len < 10 && gen_text_len > 0) {
+        eff_speed = 0.3f;
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "f5_tts: short gen text (%d bytes < 10) -> local_speed 0.3 (Raon utils_infer)\n",
+                    gen_text_len);
+    }
+    int duration = ref_T + (int)(rate * (float)gen_text_len / eff_speed);
 
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "f5_tts: ref_T=%d duration=%d tokens=%zu text='%s'\n", ref_T, duration, tokens.size(),
