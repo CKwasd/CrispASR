@@ -30,3 +30,27 @@ default = []
 cuda = []
 metal = []
 vulkan = []
+
+# Debug artifacts dominate `target/debug` and are almost all DWARF, most of
+# which the profile controls. Measured 2026-09-03 with `readelf -S` on a real
+# 187.9 MB dev-profile test binary on this machine (no rebuild needed — an
+# existing artifact answers it):
+#
+#     ALL .debug_*   155.1 MB   = 82.5% of the binary
+#     std's floor      ~3.9 MB  (precompiled rlibs; [profile.dev] cannot touch)
+#     profile-governed ~151 MB
+#
+#     dev default (debug=2)   187.9 MB
+#     line-tables-only         ~60 MB   -68%
+#     debug = 0                ~36.7 MB -80%
+#
+# line-tables-only, alone: the extra ~1.5 GB/repo that debug=0 would save is not
+# worth losing per-frame `at ./src/...` lines in backtraces. Do NOT add
+# `strip = "debuginfo"` alongside it — strip removes DWARF sections, and
+# .debug_line IS one, so the pair silently cancels and lands within 200 bytes of
+# debug=0 (verified: zero .debug_line sections, no per-frame lines).
+#
+# `panicked at file:line` survives either setting — it is panic location
+# metadata, not DWARF — so debug=0 is not blind, it just loses the frames below.
+[profile.dev]
+debug = "line-tables-only"

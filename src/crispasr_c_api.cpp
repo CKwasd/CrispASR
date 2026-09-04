@@ -2919,7 +2919,18 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
     // htdemucs-only. Multi-surface trap; see docs/contributing.md section 7.
     if (s->backend == "mel-band-roformer" || s->backend == "mel_band_roformer" || s->backend == "melbandroformer" ||
         s->backend == "mbr") {
-        s->mbr_ctx = mel_band_roformer_init_from_file(model_path, mel_band_roformer_default_params());
+        mel_band_roformer_params mp = mel_band_roformer_default_params();
+        mp.n_threads = s->n_threads;
+        // Without this the gates resolve to the legacy CPU path for EVERY
+        // binding and server consumer: mel_band_roformer_default_params() sets
+        // use_gpu=false, so AUTO never sees a permitted GPU and the fused graph
+        // (RTF ~0.076) is unreachable outside the CLI (CPU RTF ~57). This arm
+        // was the lone outlier — htdemucs directly below and rvc/omnivoice
+        // adjacent all forward the open-time TLS flag, and htdemucs even
+        // carries the comment explaining why (crispasr_session has no use_gpu
+        // member). Same "encoder gap" shape as the #414 CLI catch.
+        mp.use_gpu = g_open_use_gpu_tls;
+        s->mbr_ctx = mel_band_roformer_init_from_file(model_path, mp);
         if (!s->mbr_ctx) {
             delete s;
             return nullptr;
