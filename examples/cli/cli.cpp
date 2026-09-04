@@ -2830,6 +2830,14 @@ int main(int argc, char** argv) {
     // run in which EVERY file failed still exited 0. A caller then gets an empty
     // transcript and a success code, which is the one outcome it cannot act on.
     // Counted here and turned into a non-zero exit below.
+    //
+    // SCOPE: this LEGACY whisper path only. The unified dispatcher
+    // (crispasr_run.cpp) already returned 20 — see its three read_audio_data
+    // call sites, one of which uses the same accumulate-then-continue shape.
+    // The gap was reachable through the historical default invocation,
+    // `crispasr -m ggml-tiny.bin -f in.wav` with no --backend, which is exactly
+    // the shape that predates the dispatcher. tests/test-input-exit-code.sh
+    // pins it and deliberately omits --backend for that reason.
     int n_read_failures = 0;
 
     for (int f = 0; f < (int)params.fname_inp.size(); ++f) {

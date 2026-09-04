@@ -4933,6 +4933,21 @@ set_tests_properties(test-help-stdout PROPERTIES
     LABELS "unit;cli"
     TIMEOUT 60)
 
+# ─── test-input-exit-code — an undecodable input must reach the EXIT CODE.
+# cli.cpp's LEGACY whisper path (no --backend, a .bin model) printed to stderr
+# and `continue`d, so a run where every file failed still exited 0, against
+# docs/cli.md's published "rc 0 <=> every required stage succeeded". The unified
+# dispatcher already returned 20; only this path was affected. Labelled
+# unit;gh — NOT live — and pointed at the committed models/for-tests-ggml-tiny.bin
+# so it genuinely executes in CI (`ctest -L "gh|unit" -E live`) rather than
+# skipping, which is how the cli-labelled tests stayed dead (70112d10).
+add_test(NAME test-input-exit-code
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-input-exit-code.sh $<TARGET_FILE:crispasr-cli>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-input-exit-code PROPERTIES
+    LABELS "unit;gh;cli"
+    TIMEOUT 300)
+
 # ─── test-dry-run-resolve — offline regression: --dry-run-resolve must preview
 # the same model a real `-m <alias>` would load (sub-variant keys, §166).
 # Needs only the built binary (no models / network); SKIPs if absent.
