@@ -25,6 +25,13 @@ on:
         required: false
         default: ''
         type: string
+      cuda12_probe_arch:
+        description: >-
+          Dry-run diagnostic only: override the Windows CUDA 12 architecture
+          list to shorten a package probe. Empty keeps the release matrix.
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -2082,7 +2089,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_CUDA=ON ^
             -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
-            -DCMAKE_CUDA_ARCHITECTURES="60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual" ^
+            -DCMAKE_CUDA_ARCHITECTURES="${{ inputs.cuda12_probe_arch || '60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual' }}" ^
             -DCRISPASR_OPUS_FETCH=ON
           cmake --build build --target crispasr-cli crispasr-quantize -j %NUMBER_OF_PROCESSORS%
 
@@ -2144,11 +2151,16 @@ jobs:
           # promotes native stderr to ErrorRecord and can abort the capture
           # before the diagnostic text is assigned (#400 proof run 33477050379).
           $env:CUDA_VISIBLE_DEVICES = "-1"
-          $version = (& "$full\crispasr.exe" --version 2>&1) -join "`n"
+          $stdout = Join-Path $env:RUNNER_TEMP 'crispasr-cuda12-version.stdout.txt'
+          $stderr = Join-Path $env:RUNNER_TEMP 'crispasr-cuda12-version.stderr.txt'
+          $probe = Start-Process -FilePath "$full\crispasr.exe" -ArgumentList '--version' `
+            -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          $version = (Get-Content -Raw $stdout) + (Get-Content -Raw $stderr)
           Write-Host $version
-          if ($LASTEXITCODE -ne 0 -or $version -notmatch 'cuda toolkit\s*:\s*12\.' -or
+          Write-Host "CUDA 12 version probe exit code: $($probe.ExitCode)"
+          if ($probe.ExitCode -ne 0 -or $version -notmatch 'cuda toolkit\s*:\s*12\.' -or
               $version -notmatch 'cuda runtime ABI\s*:\s*12\b') {
-            throw 'Packaged CUDA 12 executable does not identify its CUDA 12 toolkit/runtime ABI'
+            throw "Packaged CUDA 12 executable does not identify its CUDA 12 toolkit/runtime ABI (exit $($probe.ExitCode))"
           }
 
       - uses: actions/upload-artifact@v4
