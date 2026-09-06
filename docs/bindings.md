@@ -173,7 +173,8 @@ exposes them as struct/class members on its segment type.
 
 ```python
 from crispasr import (
-    Session, diarize_segments, detect_language_pcm,
+    Session, diarize_segments, diarize_segments_with_turns,
+    detect_language_pcm,
     align_words, cache_ensure_file, registry_default_bundle,
     # Diarize pipeline primitives (#107):
     SpeakerEmbedder, PyannoteCache, agglomerative_cluster,
@@ -188,6 +189,10 @@ segs = sess.transcribe_vad(pcm, "silero-v6.2.0.bin")  # stitched VAD pass
 # Run each shared post-step standalone
 lang = detect_language_pcm(pcm, model_path="ggml-tiny.bin")
 diarize_segments(my_segs, pcm, method=DiarizeMethod.VAD_TURNS)
+ok, turns = diarize_segments_with_turns(
+    my_segs, pcm, method=DiarizeMethod.FOXNOSE,
+    foxnose_embedder_path="wespeaker-resnet34-lm.gguf",
+)
 words = align_words("canary-ctc-aligner.gguf", "hello world", pcm)
 
 # Inspect the canonical bundle used by `-m auto` (no quant suffix).

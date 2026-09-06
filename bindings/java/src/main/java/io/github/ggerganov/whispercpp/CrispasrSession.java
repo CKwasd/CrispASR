@@ -315,6 +315,9 @@ public final class CrispasrSession implements AutoCloseable {
         // Diarization
         int crispasr_diarize_segments_abi(float[] leftPcm, float[] rightPcm, int nSamples,
                                           int isStereo, Pointer segs, int nSegs, Pointer opts);
+        int crispasr_diarize_segments_turns_abi(float[] leftPcm, float[] rightPcm, int nSamples,
+                                                int isStereo, Pointer segs, int nSegs, Pointer opts,
+                                                Pointer outTurns, int turnsCap, IntByReference outNTurns);
 
         // Text-LID
         int crispasr_text_detect_language(String text, String modelPath, int nThreads,

@@ -7,8 +7,10 @@
 
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:typed_data';
 
-import 'package:crispasr/crispasr.dart' show DiarizeMethod, LidMethod;
+import 'package:crispasr/crispasr.dart'
+    show DiarizeMethod, DiarizeSegment, DiarizeTurn, LidMethod, diarizeSegments;
 import 'package:ffi/ffi.dart';
 import 'package:test/test.dart';
 
@@ -300,6 +302,7 @@ void main() {
       'crispasr_params_set_max_tokens',
       'crispasr_text_detect_language',
       'crispasr_enhance_audio_rnnoise',
+      'crispasr_diarize_segments_turns_abi',
     ]) {
       expect(() => lib.lookup(s), returnsNormally,
           reason: 'missing C-ABI symbol: $s');
@@ -338,5 +341,24 @@ void main() {
     expect(DiarizeMethod.values.length, 5,
         reason: 'extending DiarizeMethod without bumping the C-side enum '
             'will silently drop the new variant');
+  });
+
+  test('turn-returning diarize ABI labels segments and reports no energy turns',
+      () {
+    final segs = [DiarizeSegment(t0: 0, t1: 1)];
+    final turns = <DiarizeTurn>[];
+    final ok = diarizeSegments(
+      segs: segs,
+      left: Float32List.fromList(List.filled(16000, 0.5)),
+      right: Float32List(16000),
+      isStereo: true,
+      method: DiarizeMethod.energy,
+      outTurns: turns,
+      lib: lib,
+    );
+    expect(ok, isTrue);
+    expect(segs.single.speaker, 0);
+    expect(turns, isEmpty,
+        reason: 'only FoxNose derives audio-level speaker turns');
   });
 }

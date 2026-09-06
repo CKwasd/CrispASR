@@ -44,6 +44,8 @@ on:
   pull_request:
     paths:
       - 'tests/regression/**'
+      - 'tests/test_python_diarize_turns.py'
+      - 'python/crispasr/**'
       - '.github/workflows/regression.yml'
 
 permissions:
@@ -98,6 +100,10 @@ jobs:
         run: |
           python -m pytest tests/test_python_chat.py -v || \
           python -m unittest tests/test_python_chat.py -v
+      - name: Run Python diarization ABI tests
+        run: |
+          python -m pytest tests/test_python_diarize_turns.py -v || \
+          python tests/test_python_diarize_turns.py -v
       # Perf-regression compare logic (docs/perf-sweep/PLAN.md TODO-4). Model-free —
       # guards the hard/soft-gate logic used by the nightly perf snapshot step below.
       - name: Run perf-baseline compare unit tests

@@ -2,13 +2,13 @@
 the Python ctypes binding.
 
 Does NOT instantiate models or run inference — purely checks that the
-binding declares (and can look up) all 153 symbols in this smoke-test set.
+binding declares (and can look up) every symbol in this smoke-test set.
 Requires CRISPASR_LIB_PATH pointing at a built libcrispasr.{so,dylib}.
 
 KNOWN GAP: this list is a curated subset, NOT the full export surface.
-src/crispasr_c_api.cpp currently declares 200 distinct CA_EXPORT symbols, so
-~47 are unlisted and this test would not notice if a binding stopped exposing
-one of them. Treat a green run as "the listed symbols are reachable", not as
+This test does not enumerate the full export surface and would not notice if
+an unlisted binding symbol disappeared. Treat a green run as "the listed
+symbols are reachable", not as
 "the ABI is fully covered". When adding symbols here, prefer closing the gap
 over matching the existing count. Regenerate the true export list with:
 
@@ -39,6 +39,7 @@ ALL_SYMBOLS = [
     "crispasr_detect_language",
     "crispasr_detect_language_pcm",
     "crispasr_diarize_segments_abi",
+    "crispasr_diarize_segments_turns_abi",
     "crispasr_enhance_audio_rnnoise",
     "crispasr_kokoro_lang_has_native_voice_abi",
     "crispasr_kokoro_lang_is_german_abi",

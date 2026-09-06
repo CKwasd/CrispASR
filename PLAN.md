@@ -618,14 +618,13 @@ verified locally on `samples/multispeaker.wav` + wespeaker-resnet34-lm, where
 the fixture does exercise a segment covering two speakers. Same pair of
 levels on the Rust side in `crispasr/tests/integration.rs`.
 
-**Not done, and deliberately: the other bindings.** Go, Python, Java, Ruby,
-Dart and JS still expose only `crispasr_diarize_segments_abi`. Nothing there
-is broken — the new symbol is additive — but a caller on those surfaces still
-cannot split a segment. Extending them is a mechanical follow-up (each has a
-hand-written mirror; the new turn struct is its own 24-byte POD, NOT an
-append to the opts struct). `tests/test_binding_parity.py`'s curated symbol
-list is unchanged for the same reason: adding the symbol there would fail
-until the Python binding declares it.
+Follow-up completed 2026-09-06: Go, Python, and Dart now size and retry the
+turn buffer and expose typed turn results; Java declares both calls on its
+low-level JNA surface. The Python audit also found and repaired a separate
+ABI bug: its options mirror had remained at 24 bytes after FoxNose extended
+the native append-only struct to 48 bytes. JavaScript and Ruby have no public
+standalone diarization API today (their unused C declarations were previously
+mistaken for binding support), so there is no turn-returning surface to extend.
 
 ## CLAIMED 2026-08-19 — Issue #375 Canary streaming regression
 

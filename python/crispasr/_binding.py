@@ -507,6 +507,7 @@ class DiarizeMethod:
     XCORR = 1       # stereo only
     VAD_TURNS = 2   # mono-friendly, timing-based
     PYANNOTE = 3    # mono-friendly, GGUF pyannote seg model
+    FOXNOSE = 4     # mono-friendly, WeSpeaker + spectral clustering
 
 
 @dataclass
@@ -520,6 +521,52 @@ class DiarizeSegment:
     t0: float
     t1: float
     speaker: int = -1
+
+
+@dataclass
+class DiarizeTurn:
+    """One audio-derived speaker turn returned by FoxNose.
+
+    Times are seconds on the same absolute timeline as
+    :class:`DiarizeSegment`. Other diarization methods return no turns.
+    """
+    t0: float
+    t1: float
+    speaker: int
+
+
+class _DiarizeSegAbi(ctypes.Structure):
+    _fields_ = [
+        ("t0_cs", ctypes.c_int64),
+        ("t1_cs", ctypes.c_int64),
+        ("speaker", ctypes.c_int32),
+        ("_pad", ctypes.c_int32),
+    ]
+
+
+class _DiarizeOptsAbi(ctypes.Structure):
+    # APPEND-ONLY mirror of crispasr_diarize_opts_abi. Keep the explicit
+    # padding field: native code reads all 48 bytes on 64-bit platforms.
+    _fields_ = [
+        ("method", ctypes.c_int32),
+        ("n_threads", ctypes.c_int32),
+        ("slice_t0_cs", ctypes.c_int64),
+        ("pyannote_model_path", ctypes.c_char_p),
+        ("foxnose_embedder_path", ctypes.c_char_p),
+        ("min_speakers", ctypes.c_int32),
+        ("max_speakers", ctypes.c_int32),
+        ("num_speakers", ctypes.c_int32),
+        ("_pad2", ctypes.c_int32),
+    ]
+
+
+class _DiarizeTurnAbi(ctypes.Structure):
+    _fields_ = [
+        ("t0_cs", ctypes.c_int64),
+        ("t1_cs", ctypes.c_int64),
+        ("speaker", ctypes.c_int32),
+        ("_pad", ctypes.c_int32),
+    ]
 
 
 # =========================================================================
@@ -1109,17 +1156,78 @@ def diarize_segments(
     pyannote_model_path: Optional[str] = None,
     n_threads: int = 4,
     slice_t0: float = 0.0,
+    foxnose_embedder_path: Optional[str] = None,
+    min_speakers: int = 0,
+    max_speakers: int = 0,
+    num_speakers: int = 0,
     lib_path: Optional[str] = None,
 ) -> bool:
     """Assign a speaker index to each of ``segs``, mutating in place.
 
-    Four methods — see :class:`DiarizeMethod`. ``left`` is mono PCM for
+    Five methods — see :class:`DiarizeMethod`. ``left`` is mono PCM for
     mono-only methods, otherwise the left channel of a stereo pair.
     All PCM is 16 kHz float32. Returns ``True`` on success; only
-    ``PYANNOTE`` can fail (model load failure).
+    Model-backed methods can fail when their model cannot be loaded.
     """
+    ok, _ = _diarize_segments_impl(
+        segs, left, right=right, is_stereo=is_stereo, method=method,
+        pyannote_model_path=pyannote_model_path, n_threads=n_threads,
+        slice_t0=slice_t0, foxnose_embedder_path=foxnose_embedder_path,
+        min_speakers=min_speakers, max_speakers=max_speakers,
+        num_speakers=num_speakers, lib_path=lib_path, want_turns=False,
+    )
+    return ok
+
+
+def diarize_segments_with_turns(
+    segs: List[DiarizeSegment],
+    left: np.ndarray,
+    *,
+    right: Optional[np.ndarray] = None,
+    is_stereo: bool = False,
+    method: int = DiarizeMethod.VAD_TURNS,
+    pyannote_model_path: Optional[str] = None,
+    n_threads: int = 4,
+    slice_t0: float = 0.0,
+    foxnose_embedder_path: Optional[str] = None,
+    min_speakers: int = 0,
+    max_speakers: int = 0,
+    num_speakers: int = 0,
+    lib_path: Optional[str] = None,
+) -> Tuple[bool, List[DiarizeTurn]]:
+    """Label ``segs`` and return audio-derived FoxNose speaker turns.
+
+    The returned timestamps are seconds on the same absolute timeline as the
+    input segments. Non-FoxNose methods return an empty turn list.
+    """
+    return _diarize_segments_impl(
+        segs, left, right=right, is_stereo=is_stereo, method=method,
+        pyannote_model_path=pyannote_model_path, n_threads=n_threads,
+        slice_t0=slice_t0, foxnose_embedder_path=foxnose_embedder_path,
+        min_speakers=min_speakers, max_speakers=max_speakers,
+        num_speakers=num_speakers, lib_path=lib_path, want_turns=True,
+    )
+
+
+def _diarize_segments_impl(
+    segs: List[DiarizeSegment],
+    left: np.ndarray,
+    *,
+    right: Optional[np.ndarray],
+    is_stereo: bool,
+    method: int,
+    pyannote_model_path: Optional[str],
+    n_threads: int,
+    slice_t0: float,
+    foxnose_embedder_path: Optional[str],
+    min_speakers: int,
+    max_speakers: int,
+    num_speakers: int,
+    lib_path: Optional[str],
+    want_turns: bool,
+) -> Tuple[bool, List[DiarizeTurn]]:
     if not segs or left is None or len(left) == 0:
-        return True
+        return True, []
 
     lib = ctypes.CDLL(lib_path or _find_lib())
     if not hasattr(lib, "crispasr_diarize_segments_abi"):
@@ -1142,46 +1250,73 @@ def diarize_segments(
     else:
         right_ptr = left_ptr
 
-    # ABI structs must match crispasr_c_api.cpp.
-    class _SegAbi(ctypes.Structure):
-        _fields_ = [
-            ("t0_cs", ctypes.c_int64),
-            ("t1_cs", ctypes.c_int64),
-            ("speaker", ctypes.c_int32),
-            ("_pad", ctypes.c_int32),
-        ]
-
-    class _OptsAbi(ctypes.Structure):
-        _fields_ = [
-            ("method", ctypes.c_int32),
-            ("n_threads", ctypes.c_int32),
-            ("slice_t0_cs", ctypes.c_int64),
-            ("pyannote_model_path", ctypes.c_char_p),
-        ]
-
-    seg_array = (_SegAbi * len(segs))()
+    seg_array = (_DiarizeSegAbi * len(segs))()
     for i, s in enumerate(segs):
         seg_array[i].t0_cs = int(round(s.t0 * 100))
         seg_array[i].t1_cs = int(round(s.t1 * 100))
         seg_array[i].speaker = s.speaker
         seg_array[i]._pad = 0
 
-    opts = _OptsAbi(
+    opts = _DiarizeOptsAbi(
         method=int(method),
         n_threads=int(n_threads),
         slice_t0_cs=int(round(slice_t0 * 100)),
         pyannote_model_path=(pyannote_model_path.encode("utf-8")
                              if pyannote_model_path else None),
+        foxnose_embedder_path=(foxnose_embedder_path.encode("utf-8")
+                               if foxnose_embedder_path else None),
+        min_speakers=int(min_speakers),
+        max_speakers=int(max_speakers),
+        num_speakers=int(num_speakers),
+        _pad2=0,
     )
 
-    rc = lib.crispasr_diarize_segments_abi(
-        left_ptr, right_ptr, int(len(left_np)), 1 if is_stereo else 0,
-        ctypes.byref(seg_array), len(segs), ctypes.byref(opts),
-    )
+    turns: List[DiarizeTurn] = []
+    if want_turns:
+        if not hasattr(lib, "crispasr_diarize_segments_turns_abi"):
+            raise RuntimeError(
+                "crispasr_diarize_segments_turns_abi not in loaded library — "
+                "rebuild CrispASR 0.8.30+ to receive FoxNose turns."
+            )
+        fn = lib.crispasr_diarize_segments_turns_abi
+        fn.argtypes = [
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p, ctypes.c_int32,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_int32),
+        ]
+        fn.restype = ctypes.c_int
+        turn_cap = max(1, (len(left_np) + 7999) // 8000 + len(segs) + 16)
+        for attempt in range(2):
+            turn_array = (_DiarizeTurnAbi * turn_cap)()
+            n_turns = ctypes.c_int32()
+            rc = fn(
+                left_ptr, right_ptr, int(len(left_np)), 1 if is_stereo else 0,
+                ctypes.byref(seg_array), len(segs), ctypes.byref(opts),
+                ctypes.byref(turn_array), turn_cap, ctypes.byref(n_turns),
+            )
+            if rc == 2 and attempt == 0 and n_turns.value > turn_cap:
+                turn_cap = n_turns.value
+                continue
+            if rc == 0:
+                turns = [
+                    DiarizeTurn(
+                        t0=turn_array[i].t0_cs / 100.0,
+                        t1=turn_array[i].t1_cs / 100.0,
+                        speaker=int(turn_array[i].speaker),
+                    )
+                    for i in range(min(n_turns.value, turn_cap))
+                ]
+            break
+    else:
+        rc = lib.crispasr_diarize_segments_abi(
+            left_ptr, right_ptr, int(len(left_np)), 1 if is_stereo else 0,
+            ctypes.byref(seg_array), len(segs), ctypes.byref(opts),
+        )
     if rc == 0:
         for i, s in enumerate(segs):
             s.speaker = int(seg_array[i].speaker)
-    return rc == 0
+    return rc == 0, turns
 
 
 class Session:

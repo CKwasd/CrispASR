@@ -217,6 +217,17 @@ class DiarizeSegment {
   DiarizeSegment({required this.t0, required this.t1, this.speaker = -1});
 }
 
+/// One audio-derived speaker turn returned by FoxNose.
+///
+/// Times are seconds on the same absolute timeline as [DiarizeSegment].
+class DiarizeTurn {
+  final double t0;
+  final double t1;
+  final int speaker;
+  const DiarizeTurn(
+      {required this.t0, required this.t1, required this.speaker});
+}
+
 enum DiarizeMethod {
   /// Stereo only. |L| vs |R| energy per segment, 1.1× margin.
   energy,
@@ -258,6 +269,10 @@ enum DiarizeMethod {
 /// WeSpeaker embedder GGUF; [minSpeakers] / [maxSpeakers] bound the
 /// automatic speaker-count estimation (0 keeps the library defaults 1 / 8)
 /// and [numSpeakers] > 0 pins the count and skips estimation.
+///
+/// When [outTurns] is supplied, the function calls the CrispASR 0.8.30+
+/// turn-returning ABI and replaces that list with FoxNose's audio-derived
+/// turns. Other methods leave it empty.
 bool diarizeSegments({
   required List<DiarizeSegment> segs,
   required Float32List left,
@@ -271,8 +286,10 @@ bool diarizeSegments({
   int minSpeakers = 0,
   int maxSpeakers = 0,
   int numSpeakers = 0,
+  List<DiarizeTurn>? outTurns,
   DynamicLibrary? lib,
 }) {
+  outTurns?.clear();
   if (segs.isEmpty || left.isEmpty) return true;
   lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
 
@@ -329,13 +346,68 @@ bool diarizeSegments({
   (optsPtr + 40).cast<Int32>().value = numSpeakers;
   (optsPtr + 44).cast<Int32>().value = 0;
 
-  final fn = lib.lookupFunction<
-      Int32 Function(Pointer<Float>, Pointer<Float>, Int32, Int32,
-          Pointer<Uint8>, Int32, Pointer<Uint8>),
-      int Function(Pointer<Float>, Pointer<Float>, int, int, Pointer<Uint8>,
-          int, Pointer<Uint8>)>('crispasr_diarize_segments_abi');
-  final rc =
-      fn(leftPtr, rightPtr, n, isStereo ? 1 : 0, segsPtr, segs.length, optsPtr);
+  var rc = 0;
+  if (outTurns == null) {
+    final fn = lib.lookupFunction<
+        Int32 Function(Pointer<Float>, Pointer<Float>, Int32, Int32,
+            Pointer<Uint8>, Int32, Pointer<Uint8>),
+        int Function(Pointer<Float>, Pointer<Float>, int, int, Pointer<Uint8>,
+            int, Pointer<Uint8>)>('crispasr_diarize_segments_abi');
+    rc = fn(
+        leftPtr, rightPtr, n, isStereo ? 1 : 0, segsPtr, segs.length, optsPtr);
+  } else {
+    final fn = lib.lookupFunction<
+        Int32 Function(
+            Pointer<Float>,
+            Pointer<Float>,
+            Int32,
+            Int32,
+            Pointer<Uint8>,
+            Int32,
+            Pointer<Uint8>,
+            Pointer<Uint8>,
+            Int32,
+            Pointer<Int32>),
+        int Function(
+            Pointer<Float>,
+            Pointer<Float>,
+            int,
+            int,
+            Pointer<Uint8>,
+            int,
+            Pointer<Uint8>,
+            Pointer<Uint8>,
+            int,
+            Pointer<Int32>)>('crispasr_diarize_segments_turns_abi');
+    var turnCap = ((n + 7999) ~/ 8000) + segs.length + 16;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final turnsPtr = calloc<Uint8>(turnCap * 24);
+      final nTurnsPtr = calloc<Int32>();
+      rc = fn(leftPtr, rightPtr, n, isStereo ? 1 : 0, segsPtr, segs.length,
+          optsPtr, turnsPtr, turnCap, nTurnsPtr);
+      final required = nTurnsPtr.value;
+      if (rc == 2 && attempt == 0 && required > turnCap) {
+        calloc.free(turnsPtr);
+        calloc.free(nTurnsPtr);
+        turnCap = required;
+        continue;
+      }
+      if (rc == 0) {
+        final count = required < turnCap ? required : turnCap;
+        for (var i = 0; i < count; i++) {
+          final base = turnsPtr + i * 24;
+          outTurns.add(DiarizeTurn(
+            t0: base.cast<Int64>().value / 100.0,
+            t1: (base + 8).cast<Int64>().value / 100.0,
+            speaker: (base + 16).cast<Int32>().value,
+          ));
+        }
+      }
+      calloc.free(turnsPtr);
+      calloc.free(nTurnsPtr);
+      break;
+    }
+  }
 
   if (rc == 0) {
     for (var i = 0; i < segs.length; i++) {
