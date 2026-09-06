@@ -1,5 +1,15 @@
 # CrispASR — Pending work
 
+## NOW 2026-09-06 — Close post-merge gaps from #400 and #396
+
+Worktrees `.claude/worktrees/fix-400-reporting` and
+`.claude/worktrees/fix-pr427-parity-harness`. Rebase and finish the already
+implemented CUDA 12/13 self-identification fix from #400, prove both packaged
+Windows variants report the toolkit/runtime ABI they actually ship, and audit
+the #396 FoxNose turn-returning C ABI across every maintained binding. Port the
+turn result where the binding already exposes diarization, with model-free
+contract tests, then update stale plan/docs claims to match code.
+
 ## DONE 2026-09-03 — #422 segmentation evidence, measured
 
 Kernel `chr1s4/crispasr-melband-seg-evidence-v2`, source
