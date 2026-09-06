@@ -6,6 +6,21 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## PR #427 generic ASR environment-parity harness, fixed 2026-09-06
+
+Merged the contributed backend-agnostic harness for comparing baseline,
+individual environment gates, and their combined output across audio samples.
+The follow-up replaced display-derived artifact paths with numbered internal
+keys: an accepted `-e baseline` previously overwrote `baseline.stdout`, compared
+the file with itself, and falsely exited 0 for a changed transcript. Sample
+paths are numbered too, preserving diagnostics for filenames that sanitize to
+the same value. Existing nonempty output directories are rejected so stale
+diffs cannot be mistaken for current results, commands resolve through `PATH`,
+and GNU `sort -z` plus Bash-4 associative arrays were removed for macOS's system
+Bash. A model-free fake-CLI test covers mismatch and command-error accounting,
+environment scrubbing, aggregate gates, both collision classes, PATH lookup,
+and output-directory safety through CI's `unit` label.
+
 ## #411 Pocket-TTS official prepared voices, fixed 2026-09-01
 
 Added native loading of Kyutai `embeddings_v3/*.safetensors` prepared

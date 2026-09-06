@@ -1,12 +1,5 @@
 # CrispASR — Pending work
 
-## CLAIMED 2026-09-06 — PR #427 parity-harness correctness follow-up
-
-Worktree `.claude/worktrees/fix-pr427-parity-harness`, branch
-`fix/pr427-parity-harness`. Merge the contributed generic ASR environment
-parity harness, then add hermetic coverage and fix artifact-name collisions,
-stale output reuse, command lookup, and stated shell portability requirements.
-
 ## DONE 2026-09-03 — #422 segmentation evidence, measured
 
 Kernel `chr1s4/crispasr-melband-seg-evidence-v2`, source

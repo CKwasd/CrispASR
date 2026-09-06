@@ -4933,6 +4933,17 @@ set_tests_properties(test-help-stdout PROPERTIES
     LABELS "unit;cli"
     TIMEOUT 60)
 
+# ─── test-asr-env-parity — offline regression for the generic environment
+# parity harness. A fake CLI verifies mismatch/error classification, environment
+# scrubbing, aggregate variants, collision-free artifacts, and output-dir safety.
+add_test(NAME test-asr-env-parity
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-asr-env-parity.sh
+            ${PROJECT_SOURCE_DIR}/tools/asr-env-parity.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-asr-env-parity PROPERTIES
+    LABELS "unit;cli;parity"
+    TIMEOUT 60)
+
 # ─── test-input-exit-code — an undecodable input must reach the EXIT CODE.
 # cli.cpp's LEGACY whisper path (no --backend, a .bin model) printed to stderr
 # and `continue`d, so a run where every file failed still exited 0, against

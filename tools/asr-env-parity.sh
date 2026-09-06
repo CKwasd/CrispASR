@@ -11,9 +11,16 @@
 # Nemotron, CUDA/Vulkan/Metal, or individual optimization activation logs.
 # Everything after "--" is passed unchanged to the CrispASR command; the
 # harness only appends "-f <audio>" for each input file.
+#
+# Requires Bash 3.2 or newer (including the system Bash shipped by macOS).
 
 set -u
 set -o pipefail
+
+if ((BASH_VERSINFO[0] < 3 || (BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] < 2))); then
+  printf 'ERROR: Bash 3.2 or newer is required\n' >&2
+  exit 2
+fi
 
 SAMPLES="samples"
 PATTERN="*.wav"
@@ -30,6 +37,8 @@ usage() {
 Usage:
   tools/asr-env-parity.sh [harness options] -- CRISPASR [crispasr args ...]
 
+Requires Bash 3.2 or newer.
+
 For each matching audio file, runs:
   baseline
   each -e/--env setting individually
@@ -41,7 +50,8 @@ stdout from every run are retained for diagnosis.
 Harness options (before --):
   -s, --samples DIR      Input directory (default: samples)
   -p, --pattern GLOB     File-name glob (default: *.wav)
-  -o, --out DIR          Results directory (default: /tmp/asr-env-parity-$$)
+  -o, --out DIR          New or empty results directory
+                         (default: /tmp/asr-env-parity-$$)
   -n, --name NAME        Run/profile label shown in output (default: default)
 
   -e, --env SPEC         Test env. Repeatable.
@@ -119,6 +129,23 @@ safe_name() {
   printf '%s' "$1" | sed 's/[^A-Za-z0-9._-]/_/g'
 }
 
+array_contains() {
+  local needle=$1 item
+  shift
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+directory_empty() {
+  local entry
+  for entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+    [[ ! -e "$entry" && ! -L "$entry" ]] || return 1
+  done
+  return 0
+}
+
 variant_label() {
   local spec=$1 name value
   name=$(spec_name "$spec")
@@ -189,21 +216,29 @@ done
 [[ -d "$SAMPLES" ]] || die "samples directory not found: $SAMPLES"
 ((${#TEST_ENVS[@]} > 0)) || die "at least one -e/--env is required"
 ((${#CMD[@]} > 0)) || die "missing CrispASR command after --"
-[[ -x "${CMD[0]}" ]] || die "CrispASR command is not executable: ${CMD[0]}"
+if [[ "${CMD[0]}" == */* ]]; then
+  command_path=${CMD[0]}
+else
+  command_path=$(command -v "${CMD[0]}" 2>/dev/null) ||
+    die "CrispASR command not found in PATH: ${CMD[0]}"
+fi
+[[ -x "$command_path" ]] || die "CrispASR command is not executable: ${CMD[0]}"
+CMD[0]=$command_path
 
 # A test variable must represent one baseline-vs-variant dimension. Repeating
 # the same name (possibly with different values) makes the aggregate "all"
 # variant order-dependent, and using the same name as a base env means it is
 # already enabled in the baseline. Reject both cases.
-declare -A TEST_NAMES=()
+TEST_NAMES=()
 for spec in "${TEST_ENVS[@]}"; do
   name=$(spec_name "$spec")
-  [[ -z ${TEST_NAMES[$name]+x} ]] || die "duplicate test env name: $name"
-  TEST_NAMES[$name]=1
+  ! array_contains "$name" "${TEST_NAMES[@]}" || die "duplicate test env name: $name"
+  TEST_NAMES+=("$name")
 done
 for spec in "${BASE_ENVS[@]}"; do
   name=$(spec_name "$spec")
-  [[ -z ${TEST_NAMES[$name]+x} ]] || die "env cannot be both --base-env and --env: $name"
+  ! array_contains "$name" "${TEST_NAMES[@]}" ||
+    die "env cannot be both --base-env and --env: $name"
 done
 
 # Avoid ambiguous double input selection. Exact parsing of every CrispASR alias
@@ -217,13 +252,32 @@ done
 if [[ -z "$OUT" ]]; then
   OUT="/tmp/asr-env-parity-$$"
 fi
+if [[ -e "$OUT" && ! -d "$OUT" ]]; then
+  die "results path exists and is not a directory: $OUT"
+fi
+if [[ -d "$OUT" ]] && ! directory_empty "$OUT"; then
+  die "results directory is not empty: $OUT"
+fi
 mkdir -p "$OUT"
 
 FILES=()
 while IFS= read -r -d '' f; do
   FILES+=("$f")
-done < <(find "$SAMPLES" -maxdepth 1 -type f -name "$PATTERN" -print0 | sort -z)
+done < <(find "$SAMPLES" -maxdepth 1 -type f -name "$PATTERN" -print0)
 ((${#FILES[@]} > 0)) || die "no files matching '$PATTERN' in $SAMPLES"
+
+# Keep execution order deterministic without GNU sort's non-portable -z option.
+# The sample sets are small, so an in-shell insertion sort is sufficient and
+# continues to preserve names containing whitespace or newlines.
+for ((i = 1; i < ${#FILES[@]}; i++)); do
+  key=${FILES[i]}
+  j=$((i - 1))
+  while ((j >= 0)) && [[ "${FILES[j]}" > "$key" ]]; do
+    FILES[j + 1]=${FILES[j]}
+    j=$((j - 1))
+  done
+  FILES[j + 1]=$key
+done
 
 # Width for human-readable per-file output. Compute it from the actual variant
 # labels so long ENV=VALUE names never run into the status column.
@@ -241,18 +295,15 @@ fi
 # caller environment before baseline and each variant. Explicit -u entries are
 # for aggregate/related controls that the generic harness cannot know about.
 ALL_UNSETS=()
-declare -A SEEN_UNSET=()
 for spec in "${TEST_ENVS[@]}"; do
   name=$(spec_name "$spec")
-  if [[ -z ${SEEN_UNSET[$name]+x} ]]; then
+  if ! array_contains "$name" "${ALL_UNSETS[@]}"; then
     ALL_UNSETS+=("$name")
-    SEEN_UNSET[$name]=1
   fi
 done
 for name in "${UNSET_ENVS[@]}"; do
-  if [[ -z ${SEEN_UNSET[$name]+x} ]]; then
+  if ! array_contains "$name" "${ALL_UNSETS[@]}"; then
     ALL_UNSETS+=("$name")
-    SEEN_UNSET[$name]=1
   fi
 done
 
@@ -278,17 +329,15 @@ RUN_STDERR=""
 RUN_TSEC="-"
 
 run_one() {
-  local audio=$1 variant=$2
-  shift 2
+  local audio=$1 sample_key=$2 artifact_key=$3
+  shift 3
   local variant_envs=("$@")
-  local sample_name variant_safe dir stdout stderr rc tsec
+  local dir stdout stderr rc tsec
 
-  sample_name=$(safe_name "$(basename "$audio")")
-  variant_safe=$(safe_name "$variant")
-  dir="$OUT/$sample_name"
+  dir="$OUT/$sample_key"
   mkdir -p "$dir"
-  stdout="$dir/$variant_safe.stdout"
-  stderr="$dir/$variant_safe.stderr"
+  stdout="$dir/$artifact_key.stdout"
+  stderr="$dir/$artifact_key.stderr"
 
   local env_cmd=(env)
   local name
@@ -312,11 +361,14 @@ run_one() {
   RUN_TSEC=${tsec:--}
 }
 
+file_index=0
 for audio in "${FILES[@]}"; do
+  file_index=$((file_index + 1))
   sample=$(basename "$audio")
+  printf -v sample_key '%04d-%s' "$file_index" "$(safe_name "$sample")"
   printf '\n[%s] %s\n' "$RUN_LABEL" "$sample"
 
-  run_one "$audio" baseline
+  run_one "$audio" "$sample_key" baseline
   if ((RUN_RC != 0)); then
     printf '  %-*s  %-5s  rc=%d  log=%s\n' "$LABEL_WIDTH" baseline ERROR "$RUN_RC" "$RUN_STDERR"
     ((error_count++))
@@ -327,9 +379,12 @@ for audio in "${FILES[@]}"; do
   baseline_stdout=$RUN_STDOUT
   printf '  %-*s  %-5s  transcribe=%ss\n' "$LABEL_WIDTH" baseline REF "$RUN_TSEC"
 
+  variant_index=0
   for spec in "${TEST_ENVS[@]}"; do
+    variant_index=$((variant_index + 1))
     label=$(variant_label "$spec")
-    run_one "$audio" "$label" "$spec"
+    printf -v artifact_key 'variant-%04d' "$variant_index"
+    run_one "$audio" "$sample_key" "$artifact_key" "$spec"
 
     if ((RUN_RC != 0)); then
       status=ERROR
@@ -356,7 +411,7 @@ for audio in "${FILES[@]}"; do
   # independent test dimensions. With a single -e it would duplicate that
   # variant exactly and waste time.
   if ((${#TEST_ENVS[@]} > 1)); then
-    run_one "$audio" all "${TEST_ENVS[@]}"
+    run_one "$audio" "$sample_key" all "${TEST_ENVS[@]}"
     if ((RUN_RC != 0)); then
       status=ERROR
       diff_path=-
