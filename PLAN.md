@@ -8,7 +8,9 @@ implemented CUDA 12/13 self-identification fix from #400, prove both packaged
 Windows variants report the toolkit/runtime ABI they actually ship, and audit
 the #396 FoxNose turn-returning C ABI across every maintained binding. Port the
 turn result where the binding already exposes diarization, with model-free
-contract tests, then update stale plan/docs claims to match code.
+contract tests, verify #300's structured streaming speaker behavior including
+mixed labelled/unlabelled segments, then update stale plan/docs claims to
+match code.
 
 ## DONE 2026-09-03 — #422 segmentation evidence, measured
 
