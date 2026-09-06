@@ -2266,7 +2266,7 @@ static std::string crispasr_stream_common_speaker(const std::vector<crispasr_seg
     std::string spk;
     for (const auto& s : segs) {
         if (s.speaker.empty())
-            continue;
+            return "";
         if (spk.empty())
             spk = s.speaker;
         else if (spk != s.speaker)
