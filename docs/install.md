@@ -130,6 +130,11 @@ the CUDA 13 package prints `13.0...` and ABI `13`. This identifies the binary,
 not a separately installed toolkit. The self-contained zip loads its matching
 major-version DLLs from beside `crispasr.exe`.
 
+The Windows CUDA 12 executable also imports the NVIDIA driver DLL for ggml's
+VMM allocator, so these commands require an installed NVIDIA driver even when
+no GPU work is requested. The archive name and bundled `*64_12.dll` filenames
+remain sufficient to identify it before installation.
+
 Each trio is published **once** per release and shared by that major's
 packages — sound only because every CUDA-bundling job of the same major pins
 the same toolkit (12.8.0 for the CUDA 12 packages, 13.0.0 for CUDA 13).

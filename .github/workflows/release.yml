@@ -2146,22 +2146,20 @@ jobs:
           }
           $hashLines | Set-Content release\crispasr-windows-x86_64-cuda-runtime-sha256.txt
 
-          # The hosted runner has no NVIDIA device.  Keep ggml's startup probe
-          # from emitting a CUDA-driver warning on stderr: pwsh under Actions
-          # promotes native stderr to ErrorRecord and can abort the capture
-          # before the diagnostic text is assigned (#400 proof run 33477050379).
-          $env:CUDA_VISIBLE_DEVICES = "-1"
-          $stdout = Join-Path $env:RUNNER_TEMP 'crispasr-cuda12-version.stdout.txt'
-          $stderr = Join-Path $env:RUNNER_TEMP 'crispasr-cuda12-version.stderr.txt'
-          $probe = Start-Process -FilePath "$full\crispasr.exe" -ArgumentList '--version' `
-            -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-          $version = (Get-Content -Raw $stdout) + (Get-Content -Raw $stderr)
-          Write-Host $version
-          Write-Host "CUDA 12 version probe exit code: $($probe.ExitCode)"
-          if ($probe.ExitCode -ne 0 -or $version -notmatch 'cuda toolkit\s*:\s*12\.' -or
-              $version -notmatch 'cuda runtime ABI\s*:\s*12\b') {
-            throw "Packaged CUDA 12 executable does not identify its CUDA 12 toolkit/runtime ABI (exit $($probe.ExitCode))"
+          # Windows CUDA 12 links nvcuda.dll for ggml's VMM allocator, so the
+          # hosted runner (which has no NVIDIA driver) cannot load the process
+          # far enough to run --version. Verify the actual packaged executable's
+          # compile-time report strings instead. The CUDA 13 verification job
+          # additionally runs both reporting surfaces end to end.
+          $exeStrings = [Text.Encoding]::ASCII.GetString(
+            [IO.File]::ReadAllBytes((Resolve-Path "$full\crispasr.exe")))
+          if ($exeStrings -notmatch 'cuda toolkit\s*:\s*12\.') {
+            throw 'Packaged CUDA 12 executable omits its CUDA 12 toolkit report'
           }
+          if ($exeStrings -notmatch 'cuda runtime ABI:\s*12\b') {
+            throw 'Packaged CUDA 12 executable omits CUDA runtime ABI 12'
+          }
+          Write-Host 'WIN_CUDA12_REPORT_OK — packaged executable identifies CUDA toolkit/runtime ABI 12'
 
       - uses: actions/upload-artifact@v4
         with:
