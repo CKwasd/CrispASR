@@ -339,6 +339,16 @@ if (NOT TARGET ggml)
         endif()
 
         add_subdirectory(ggml)
+        if(WIN32 AND MSVC AND GGML_CUDA AND TARGET ggml-cuda AND NOT GGML_CUDA_NO_VMM)
+            # CUDA 12's CUDA::cuda_driver target normally gives ggml-cuda.dll a
+            # process-start import of nvcuda.dll. That prevents even --version
+            # (and CPU fallback) from running on a driverless Windows host.
+            # Delay-load the driver API: cudaGetDeviceCount can reject the
+            # unavailable backend cleanly, while VMM's cuMem* entry points load
+            # nvcuda.dll on first use when an NVIDIA device is actually present.
+            target_link_options(ggml-cuda PRIVATE "/DELAYLOAD:nvcuda.dll")
+            target_link_libraries(ggml-cuda PRIVATE delayimp)
+        endif()
         if(WIN32)
             # The following adds a _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR macro and is a workaround for
             # the Windows C++ standard library which does not support constexpr mutexes.
