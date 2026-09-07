@@ -1,16 +1,37 @@
 # CrispASR — Pending work
 
-## NOW 2026-09-06 — Close post-merge gaps from #400 and #396
+## DONE 2026-09-07 — #427 merge hardening and issue follow-up audit
 
-Worktrees `.claude/worktrees/fix-400-reporting` and
-`.claude/worktrees/fix-pr427-parity-harness`. Rebase and finish the already
-implemented CUDA 12/13 self-identification fix from #400, prove both packaged
-Windows variants report the toolkit/runtime ABI they actually ship, and audit
-the #396 FoxNose turn-returning C ABI across every maintained binding. Port the
-turn result where the binding already exposes diarization, with model-free
-contract tests, verify #300's structured streaming speaker behavior including
-mixed labelled/unlabelled segments, then update stale plan/docs claims to
-match code.
+Merged #427 (`593881a3`) and followed with `fde5614e`: the ASR environment
+parity harness now cannot pass on stale/missing outputs, resolves the binary
+without relying on the caller's PATH, runs on macOS Bash 3.2, avoids GNU-only
+sort behavior and covers those failure modes with a 14-case contract test.
+
+Closed the three concrete gaps found in the linked follow-ups:
+
+- #396: `34d96130` exposes FoxNose speaker turns in Python and Dart, adds the
+  missing Java JNA symbol, corrects Python's undersized ABI struct, and adds
+  model-free sizing/retry tests. Go and Rust were already complete; the docs no
+  longer claim unsupported JavaScript/Ruby convenience APIs.
+- #300: the existing VibeVoice streaming session already propagates structured
+  speaker/timing data. `224ab32f` fixes its only uncovered edge: a window with
+  labelled and unlabelled segments no longer assigns the labelled speaker to
+  the whole window.
+- #400: the Windows CUDA packages now report both the build/link toolkit and
+  required runtime ABI major on `--version` and `--diagnostics`. CUDA discovery
+  is repeated in the CLI CMake scope so the field cannot silently compile
+  empty. CUDA 12 delay-loads `nvcuda.dll`, preserving VMM on NVIDIA systems
+  while allowing diagnostics and CPU fallback on driverless hosts. Release CI
+  asserts the packaged binaries, and its optional one-architecture dry-run
+  probe cannot reduce a tagged release's full architecture matrix.
+
+Proof: main CI at `224ab32f` passed all 1821 tests plus lint, deep lint, Docker,
+Ruby and hosted Dart binding checks. The exact CUDA 13 package recipe passed
+build, DLL linkage, both reporting surfaces and driverless CPU transcription in
+run 34060354617. The CUDA 12 full architecture build and packaging completed in
+run 34060926291; its driverless startup failure identified the eager
+`nvcuda.dll` import fixed here. The post-fix package run is queued behind the
+account's two occupied hosted-runner slots.
 
 ## DONE 2026-09-03 — #422 segmentation evidence, measured
 

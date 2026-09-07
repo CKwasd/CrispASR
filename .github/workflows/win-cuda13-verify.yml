@@ -25,6 +25,7 @@ on:
     paths:
       - '.github/workflows/win-cuda13-verify.yml'
       - '.github/workflows/release.yml'
+      - 'CMakeLists.txt'
       - 'examples/cli/CMakeLists.txt'
       - 'examples/cli/crispasr_diagnostics.cpp'
 

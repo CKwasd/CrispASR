@@ -2196,7 +2196,7 @@ jobs:
             release/crispasr-windows-x86_64-cuda-runtime-sha256.txt
           fail_on_unmatched_files: true
 
-  # ── Windows CUDA 13 (dynamic, requires NVIDIA driver on target machine) ──────
+  # ── Windows CUDA 13 (dynamic, driverless CPU fallback) ───────────────────────
   # #400: CUDA-13-native companion to build-windows-cuda above. CUDA 13 ships
   # cudart64_13.dll / cublas64_13.dll / cublasLt64_13.dll — NOT ABI-compatible
   # with the *_12 runtime — so users on a CUDA-13-era driver/toolkit get a
